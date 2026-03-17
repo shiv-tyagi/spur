@@ -15,3 +15,6 @@ anyhow = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
 prost-types = { workspace = true }
+jsonwebtoken = { workspace = true }
+whoami = "2"
+nix = { workspace = true }

@@ -48,6 +48,18 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
         let assignments = scheduler.schedule(&pending, &cluster_state);
 
+        // Preemption: if high-priority jobs couldn't be scheduled,
+        // cancel lower-priority running jobs to free resources.
+        if assignments.len() < pending.len() {
+            let unscheduled: Vec<_> = pending.iter()
+                .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                .collect();
+
+            if !unscheduled.is_empty() {
+                try_preempt(&cluster, &unscheduled);
+            }
+        }
+
         for assignment in assignments {
             let job = match cluster.get_job(assignment.job_id) {
                 Some(j) => j,
@@ -103,6 +115,55 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                     node = %first_node,
                     "no agent address for node, job will not execute"
                 );
+            }
+        }
+    }
+}
+
+/// Try to preempt lower-priority running jobs to make room for higher-priority pending jobs.
+fn try_preempt(
+    cluster: &Arc<ClusterManager>,
+    unscheduled: &[&spur_core::job::Job],
+) {
+    use spur_core::job::JobState;
+
+    // Get running jobs sorted by priority (lowest first = best preemption candidates)
+    let mut running: Vec<spur_core::job::Job> = cluster
+        .get_jobs(
+            &[JobState::Running],
+            None,
+            None,
+            None,
+            &[],
+        )
+        .into_iter()
+        .collect();
+    running.sort_by_key(|j| j.priority);
+
+    for pending in unscheduled {
+        // Only preempt if pending job has significantly higher priority
+        for candidate in &running {
+            if candidate.priority < pending.priority / 2 {
+                // Preempt: cancel the lower-priority job
+                info!(
+                    preempted_job = candidate.job_id,
+                    preempted_priority = candidate.priority,
+                    pending_job = pending.job_id,
+                    pending_priority = pending.priority,
+                    "preempting lower-priority job"
+                );
+                if let Err(e) = cluster.complete_job(
+                    candidate.job_id,
+                    -1,
+                    JobState::Preempted,
+                ) {
+                    warn!(
+                        job_id = candidate.job_id,
+                        error = %e,
+                        "failed to preempt job"
+                    );
+                }
+                break; // One preemption per cycle, re-evaluate next cycle
             }
         }
     }

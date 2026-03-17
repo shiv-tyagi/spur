@@ -44,3 +44,5 @@ pub mod t52_config;
 pub mod t53_state;
 pub mod t55_format;
 pub mod t56_deps;
+pub mod t57_auth;
+pub mod t28b_array_expand;

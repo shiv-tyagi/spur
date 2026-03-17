@@ -1,3 +1,5 @@
+pub mod array;
+pub mod auth;
 pub mod config;
 pub mod dependency;
 pub mod hostlist;

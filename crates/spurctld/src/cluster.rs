@@ -89,8 +89,13 @@ impl ClusterManager {
         })
     }
 
-    /// Submit a new job.
+    /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, spec: JobSpec) -> anyhow::Result<JobId> {
+        // Check for array job
+        if let Some(ref array_spec) = spec.array_spec {
+            return self.submit_array_job(spec.clone(), array_spec);
+        }
+
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let job = Job::new(job_id, spec.clone());
 
@@ -110,6 +115,50 @@ impl ClusterManager {
         info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
         self.maybe_snapshot();
         Ok(job_id)
+    }
+
+    /// Submit an array job — expands the spec into individual task jobs.
+    fn submit_array_job(&self, spec: JobSpec, array_spec_str: &str) -> anyhow::Result<JobId> {
+        use spur_core::array::parse_array_spec;
+
+        let array = parse_array_spec(array_spec_str)
+            .map_err(|e| anyhow::anyhow!("invalid array spec: {}", e))?;
+
+        let array_job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let mut jobs = self.jobs.write();
+
+        info!(
+            array_job_id,
+            tasks = array.task_ids.len(),
+            max_concurrent = array.max_concurrent,
+            name = %spec.name,
+            "array job submitted"
+        );
+
+        for &task_id in &array.task_ids {
+            let task_job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+            let mut task_spec = spec.clone();
+            task_spec.array_spec = None; // Don't recurse
+
+            let mut job = Job::new(task_job_id, task_spec);
+            job.array_job_id = Some(array_job_id);
+            job.array_task_id = Some(task_id);
+
+            self.append_wal(WalOperation::JobSubmit {
+                job_id: task_job_id,
+                name: spec.name.clone(),
+                user: spec.user.clone(),
+                partition: spec.partition.clone(),
+                num_nodes: spec.num_nodes,
+                num_tasks: spec.num_tasks,
+                cpus_per_task: spec.cpus_per_task,
+            });
+
+            jobs.insert(task_job_id, job);
+        }
+
+        // Return the array job ID (first task IDs are array_job_id + 1, +2, ...)
+        Ok(array_job_id)
     }
 
     /// Get a job by ID.
