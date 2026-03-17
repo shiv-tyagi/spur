@@ -95,9 +95,33 @@ impl SlurmController for ControllerService {
 
     async fn update_job(
         &self,
-        _request: Request<UpdateJobRequest>,
+        request: Request<UpdateJobRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("update_job not yet implemented"))
+        let req = request.into_inner();
+
+        // Handle hold/release via priority
+        if let Some(hold) = req.hold {
+            if hold {
+                self.cluster.hold_job(req.job_id)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            } else {
+                self.cluster.release_job(req.job_id)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            return Ok(Response::new(()));
+        }
+
+        let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
+
+        self.cluster.update_job(
+            req.job_id,
+            time_limit,
+            req.priority,
+            req.partition,
+            req.comment,
+        ).map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
     }
 
     async fn get_nodes(
@@ -124,9 +148,17 @@ impl SlurmController for ControllerService {
 
     async fn update_node(
         &self,
-        _request: Request<UpdateNodeRequest>,
+        request: Request<UpdateNodeRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("update_node not yet implemented"))
+        let req = request.into_inner();
+        if let Some(state) = req.state {
+            let node_state = proto_to_node_state(state)
+                .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
+            self.cluster
+                .update_node_state(&req.name, node_state, req.reason)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(()))
     }
 
     async fn get_partitions(
@@ -357,6 +389,20 @@ fn proto_to_job_state(s: i32) -> Option<spur_core::job::JobState> {
         7 => Some(spur_core::job::JobState::NodeFail),
         8 => Some(spur_core::job::JobState::Preempted),
         9 => Some(spur_core::job::JobState::Suspended),
+        _ => None,
+    }
+}
+
+fn proto_to_node_state(s: i32) -> Option<spur_core::node::NodeState> {
+    match s {
+        0 => Some(spur_core::node::NodeState::Idle),
+        1 => Some(spur_core::node::NodeState::Allocated),
+        2 => Some(spur_core::node::NodeState::Mixed),
+        3 => Some(spur_core::node::NodeState::Down),
+        4 => Some(spur_core::node::NodeState::Drain),
+        5 => Some(spur_core::node::NodeState::Draining),
+        6 => Some(spur_core::node::NodeState::Error),
+        7 => Some(spur_core::node::NodeState::Unknown),
         _ => None,
     }
 }

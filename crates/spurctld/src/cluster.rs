@@ -315,16 +315,185 @@ impl ClusterManager {
         self.partitions.read().clone()
     }
 
-    /// Get pending jobs sorted by priority (highest first).
+    /// Hold a job (prevent scheduling).
+    pub fn hold_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.state != JobState::Pending {
+            anyhow::bail!("can only hold pending jobs (job {} is {:?})", job_id, job.state);
+        }
+        job.pending_reason = PendingReason::Held;
+        job.priority = 0;
+        self.append_wal(WalOperation::JobPriorityChange {
+            job_id,
+            old_priority: job.priority,
+            new_priority: 0,
+        });
+        info!(job_id, "job held");
+        Ok(())
+    }
+
+    /// Release a held job.
+    pub fn release_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.pending_reason != PendingReason::Held {
+            anyhow::bail!("job {} is not held", job_id);
+        }
+        job.pending_reason = PendingReason::Priority;
+        job.priority = 1000; // Restore default priority
+        self.append_wal(WalOperation::JobPriorityChange {
+            job_id,
+            old_priority: 0,
+            new_priority: 1000,
+        });
+        info!(job_id, "job released");
+        Ok(())
+    }
+
+    /// Update job properties.
+    pub fn update_job(
+        &self,
+        job_id: JobId,
+        time_limit: Option<chrono::Duration>,
+        priority: Option<u32>,
+        partition: Option<String>,
+        comment: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+
+        if let Some(tl) = time_limit {
+            job.spec.time_limit = Some(tl);
+        }
+        if let Some(p) = priority {
+            let old = job.priority;
+            job.priority = p;
+            self.append_wal(WalOperation::JobPriorityChange {
+                job_id,
+                old_priority: old,
+                new_priority: p,
+            });
+        }
+        if let Some(part) = partition {
+            job.spec.partition = Some(part);
+        }
+        if let Some(c) = comment {
+            job.spec.comment = Some(c);
+        }
+        info!(job_id, "job updated");
+        Ok(())
+    }
+
+    /// Update node state (admin: drain, resume, etc.)
+    pub fn update_node_state(
+        &self,
+        name: &str,
+        state: NodeState,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut nodes = self.nodes.write();
+        let node = nodes
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
+        let old_state = node.state;
+        node.state = state;
+        node.state_reason = reason.clone();
+        self.append_wal(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state,
+            new_state: state,
+            reason,
+        });
+        info!(node = %name, old = ?old_state, new = ?state, "node state updated");
+        Ok(())
+    }
+
+    /// Check for stale nodes (no heartbeat within timeout) and mark them DOWN.
+    pub fn check_node_health(&self, timeout_secs: u64) {
+        let now = Utc::now();
+        let threshold = chrono::Duration::seconds(timeout_secs as i64);
+        let mut nodes = self.nodes.write();
+
+        for node in nodes.values_mut() {
+            if node.state == NodeState::Down || node.state == NodeState::Drain {
+                continue;
+            }
+            if let Some(last_hb) = node.last_heartbeat {
+                if now - last_hb > threshold {
+                    let old_state = node.state;
+                    node.state = NodeState::Down;
+                    node.state_reason = Some("Not responding".into());
+                    warn!(
+                        node = %node.name,
+                        last_heartbeat = %last_hb,
+                        "node marked DOWN (heartbeat timeout)"
+                    );
+                    self.append_wal(WalOperation::NodeStateChange {
+                        name: node.name.clone(),
+                        old_state,
+                        new_state: NodeState::Down,
+                        reason: Some("Not responding".into()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
     pub fn pending_jobs(&self) -> Vec<Job> {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
             .values()
-            .filter(|j| j.state == JobState::Pending)
+            .filter(|j| j.state == JobState::Pending && j.pending_reason != PendingReason::Held)
             .cloned()
             .collect();
+
+        // Check dependencies
+        let get_job = |id: JobId| -> Option<Job> {
+            jobs.get(&id).cloned()
+        };
+        let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
+            jobs.values()
+                .filter(|j| j.spec.name == name && j.spec.user == user)
+                .cloned()
+                .collect()
+        };
+
+        pending.retain(|job| {
+            if job.spec.dependency.is_empty() {
+                return true;
+            }
+            use spur_core::dependency::{check_dependencies, DependencyResult};
+            match check_dependencies(job, &get_job, &get_jobs_by_name_user) {
+                DependencyResult::Satisfied => true,
+                DependencyResult::Waiting => false,
+                DependencyResult::Failed => {
+                    // Dependency can never be satisfied — cancel the job
+                    // (can't mutate here since we hold a read lock; mark for later)
+                    false
+                }
+            }
+        });
+
         pending.sort_by(|a, b| b.priority.cmp(&a.priority));
         pending
+    }
+
+    /// Find jobs by name and user (for singleton dependency).
+    pub fn get_jobs_by_name_user(&self, name: &str, user: &str) -> Vec<Job> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| j.spec.name == name && j.spec.user == user)
+            .cloned()
+            .collect()
     }
 
     fn append_wal(&self, op: WalOperation) {

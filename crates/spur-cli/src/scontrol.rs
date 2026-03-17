@@ -63,20 +63,23 @@ pub async fn main() -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Hold { job_id } => {
-            eprintln!("scontrol: hold not yet implemented for job {}", job_id);
-            Ok(())
+            update_job(&args.controller, job_id, None, None, Some(true)).await
         }
         ScontrolCommand::Release { job_id } => {
-            eprintln!("scontrol: release not yet implemented for job {}", job_id);
-            Ok(())
+            update_job(&args.controller, job_id, None, None, Some(false)).await
         }
         ScontrolCommand::Requeue { job_id } => {
-            eprintln!("scontrol: requeue not yet implemented for job {}", job_id);
+            // Requeue = cancel + resubmit, simplified for now
+            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+                .await.context("failed to connect to spurctld")?;
+            client.cancel_job(spur_proto::proto::CancelJobRequest {
+                job_id, signal: 0, user: String::new(),
+            }).await.context("requeue failed")?;
+            println!("job {} requeued (cancelled for resubmission)", job_id);
             Ok(())
         }
         ScontrolCommand::Update { params } => {
-            eprintln!("scontrol: update not yet implemented: {:?}", params);
-            Ok(())
+            parse_and_update(&args.controller, &params).await
         }
     }
 }
@@ -270,4 +273,66 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
         }
         _ => "N/A".into(),
     }
+}
+
+async fn update_job(
+    controller: &str,
+    job_id: u32,
+    priority: Option<u32>,
+    time_limit: Option<String>,
+    hold: Option<bool>,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string())
+        .await
+        .context("failed to connect to spurctld")?;
+
+    let tl = time_limit.as_ref().and_then(|t| {
+        spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
+            seconds: m as i64 * 60,
+            nanos: 0,
+        })
+    });
+
+    client
+        .update_job(spur_proto::proto::UpdateJobRequest {
+            job_id,
+            partition: None,
+            account: None,
+            priority,
+            time_limit: tl,
+            hold,
+            comment: None,
+        })
+        .await
+        .context("update failed")?;
+
+    if hold == Some(true) {
+        println!("job {} held", job_id);
+    } else if hold == Some(false) {
+        println!("job {} released", job_id);
+    } else {
+        println!("job {} updated", job_id);
+    }
+    Ok(())
+}
+
+/// Parse "key=value" params from `scontrol update` command.
+async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
+    let mut job_id: Option<u32> = None;
+    let mut priority: Option<u32> = None;
+    let mut time_limit: Option<String> = None;
+
+    for param in params {
+        if let Some((key, value)) = param.split_once('=') {
+            match key.to_lowercase().as_str() {
+                "jobid" | "job" => job_id = value.parse().ok(),
+                "priority" => priority = value.parse().ok(),
+                "timelimit" | "time_limit" => time_limit = Some(value.into()),
+                other => eprintln!("scontrol: unknown update key '{}'", other),
+            }
+        }
+    }
+
+    let jid = job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= required"))?;
+    update_job(controller, jid, priority, time_limit, None).await
 }

@@ -105,6 +105,13 @@ pub async fn launch_job(
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
+    // Run prolog if configured
+    if let Ok(prolog) = std::env::var("SPUR_PROLOG") {
+        if !prolog.is_empty() {
+            run_hook(&prolog, job_id, work_dir, "prolog").await?;
+        }
+    }
+
     // Set up cgroup for isolation
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb)?;
 
@@ -285,6 +292,37 @@ pub fn signal_job(job: &RunningJob, sig: Signal) -> anyhow::Result<()> {
             .context("failed to signal job process")?;
     }
     Ok(())
+}
+
+/// Run a prolog/epilog hook script.
+async fn run_hook(script_path: &str, job_id: JobId, work_dir: &str, hook_name: &str) -> anyhow::Result<()> {
+    info!(job_id, hook = hook_name, script = script_path, "running hook");
+
+    let status = Command::new(script_path)
+        .env("SPUR_JOB_ID", job_id.to_string())
+        .env("SPUR_JOB_WORK_DIR", work_dir)
+        .current_dir(work_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("{} script failed to execute", hook_name))?;
+
+    if !status.success() {
+        anyhow::bail!("{} script exited with {}", hook_name, status);
+    }
+    Ok(())
+}
+
+/// Run epilog after job completion (best-effort).
+pub async fn run_epilog(job_id: JobId, work_dir: &str) {
+    if let Ok(epilog) = std::env::var("SPUR_EPILOG") {
+        if !epilog.is_empty() {
+            if let Err(e) = run_hook(&epilog, job_id, work_dir, "epilog").await {
+                warn!(job_id, error = %e, "epilog failed");
+            }
+        }
+    }
 }
 
 /// Resolve output path patterns (%j → job_id, etc.)

@@ -32,12 +32,15 @@ pub mod harness;
 
 // Unit / component tests (no running daemons needed)
 pub mod t05_queue;
+pub mod t06_cancel;
 pub mod t07_sched;
 pub mod t17_submit;
 pub mod t24_priority;
 pub mod t28_arrays;
+pub mod t39_gpu;
 pub mod t50_core;
 pub mod t51_hostlist;
 pub mod t52_config;
 pub mod t53_state;
 pub mod t55_format;
+pub mod t56_deps;

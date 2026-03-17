@@ -190,10 +190,35 @@ fn job_resource_request(job: &Job) -> ResourceSet {
         })
         .unwrap_or(0);
 
+    // Parse GRES into GPU count for scheduling
+    let mut gpu_count = 0u32;
+    let mut gpu_type = String::new();
+    for gres in &job.spec.gres {
+        if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
+            if name == "gpu" {
+                gpu_count += count;
+                if let Some(t) = gtype {
+                    gpu_type = t;
+                }
+            }
+        }
+    }
+
+    // Create placeholder GPU resources for matching
+    let gpus: Vec<spur_core::resource::GpuResource> = (0..gpu_count)
+        .map(|i| spur_core::resource::GpuResource {
+            device_id: i,
+            gpu_type: if gpu_type.is_empty() { "any".into() } else { gpu_type.clone() },
+            memory_mb: 0,
+            peer_gpus: Vec::new(),
+            link_type: spur_core::resource::GpuLinkType::PCIe,
+        })
+        .collect();
+
     ResourceSet {
         cpus,
         memory_mb: memory,
-        gpus: Vec::new(), // TODO: parse GRES into GPU resources
+        gpus,
         ..Default::default()
     }
 }

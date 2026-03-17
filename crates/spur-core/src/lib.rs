@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dependency;
 pub mod hostlist;
 pub mod job;
 pub mod node;

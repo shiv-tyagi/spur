@@ -330,6 +330,67 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_
 }
 
 // ============================================================
+// Error Handling
+// ============================================================
+
+use std::sync::Mutex;
+
+static LAST_ERRNO: Mutex<c_int> = Mutex::new(0);
+
+static ERROR_STRINGS: &[&str] = &[
+    "Success",                          // 0
+    "Unspecified error",                // -1
+    "Invalid job id",                   // -2
+    "Invalid job id specified",         // -3
+    "Invalid node name specified",      // -4
+    "Invalid partition name specified", // -5
+    "Job already completed",            // -6
+    "Job already completing",           // -7
+    "Communication failure",            // -8
+    "Out of memory",                    // -9
+    "Permission denied",                // -10
+    "Node not available",               // -11
+    "Already done",                     // -12
+    "Requested node config unavailable",// -13
+    "Job pending",                      // -14
+];
+
+/// Get a human-readable error string for a Slurm error code.
+#[no_mangle]
+pub extern "C" fn slurm_strerror(errnum: c_int) -> *const c_char {
+    let idx = if errnum == 0 {
+        0
+    } else if errnum < 0 && (-errnum as usize) < ERROR_STRINGS.len() {
+        (-errnum) as usize
+    } else {
+        1 // "Unspecified error"
+    };
+    // These are static strings, safe to return as pointers
+    ERROR_STRINGS[idx].as_ptr() as *const c_char
+}
+
+/// Get the last Slurm error code.
+#[no_mangle]
+pub extern "C" fn slurm_get_errno() -> c_int {
+    *LAST_ERRNO.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set the Slurm error code.
+#[no_mangle]
+pub extern "C" fn slurm_seterrno(errnum: c_int) {
+    *LAST_ERRNO.lock().unwrap_or_else(|e| e.into_inner()) = errnum;
+}
+
+/// Print a Slurm error message to stderr.
+#[no_mangle]
+pub extern "C" fn slurm_perror(msg: *const c_char) {
+    let prefix = c_str_to_string(msg);
+    let errno = slurm_get_errno();
+    let idx = if errno == 0 { 0 } else if errno < 0 && (-errno as usize) < ERROR_STRINGS.len() { (-errno) as usize } else { 1 };
+    eprintln!("{}: {}", prefix, ERROR_STRINGS[idx]);
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 

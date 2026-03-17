@@ -72,6 +72,16 @@ async fn main() -> anyhow::Result<()> {
         scheduler_loop::run(sched_cluster).await;
     });
 
+    // Start node health checker (90s timeout)
+    let health_cluster = cluster.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            health_cluster.check_node_health(90);
+        }
+    });
+
     // Start gRPC server
     let addr = args.listen.parse()?;
     info!(%addr, "gRPC server listening");

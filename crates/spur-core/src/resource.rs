@@ -36,9 +36,15 @@ impl ResourceSet {
         }
         // Check GPU count by type
         let avail_gpus = self.gpu_counts();
+        let total_avail: u32 = avail_gpus.values().sum();
         let req_gpus = request.gpu_counts();
         for (gpu_type, count) in &req_gpus {
-            if avail_gpus.get(gpu_type).copied().unwrap_or(0) < *count {
+            if gpu_type == "any" {
+                // "any" type matches total GPU count regardless of type
+                if total_avail < *count {
+                    return false;
+                }
+            } else if avail_gpus.get(gpu_type).copied().unwrap_or(0) < *count {
                 return false;
             }
         }
