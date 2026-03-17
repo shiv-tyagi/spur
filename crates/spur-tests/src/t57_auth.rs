@@ -47,7 +47,12 @@ mod tests {
             iat: now - 200,
             admin: false,
         };
-        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
         let result = verify_token(&token, SECRET);
         assert!(matches!(result, Err(AuthError::Expired)));
     }
@@ -56,13 +61,23 @@ mod tests {
 
     #[test]
     fn t57_5_user_can_cancel_own_job() {
-        let id = Identity { user: "alice".into(), uid: 1000, gid: 1000, is_admin: false };
+        let id = Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
         assert!(id.can_cancel_job("alice").is_ok());
     }
 
     #[test]
     fn t57_6_user_cannot_cancel_others_job() {
-        let id = Identity { user: "alice".into(), uid: 1000, gid: 1000, is_admin: false };
+        let id = Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
         let result = id.can_cancel_job("bob");
         assert!(result.is_err());
         assert!(matches!(result, Err(AuthError::NotJobOwner { .. })));
@@ -77,14 +92,24 @@ mod tests {
 
     #[test]
     fn t57_8_user_can_modify_own_job() {
-        let id = Identity { user: "alice".into(), uid: 1000, gid: 1000, is_admin: false };
+        let id = Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
         assert!(id.can_modify_job("alice").is_ok());
         assert!(id.can_modify_job("bob").is_err());
     }
 
     #[test]
     fn t57_9_require_admin() {
-        let user = Identity { user: "alice".into(), uid: 1000, gid: 1000, is_admin: false };
+        let user = Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+        };
         assert!(user.require_admin().is_err());
         assert!(Identity::admin().require_admin().is_ok());
     }

@@ -54,13 +54,16 @@ pub struct SacctArgs {
     pub limit: u32,
 
     /// Accounting daemon address
-    #[arg(long, env = "SPUR_ACCOUNTING_ADDR", default_value = "http://localhost:6819")]
+    #[arg(
+        long,
+        env = "SPUR_ACCOUNTING_ADDR",
+        default_value = "http://localhost:6819"
+    )]
     pub accounting: String,
 }
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
-const SACCT_LONG_FORMAT: &str =
-    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.19S %.19E %.10l";
+const SACCT_LONG_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.19S %.19E %.10l";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
 pub fn sacct_header(spec: char) -> &'static str {

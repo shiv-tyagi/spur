@@ -57,14 +57,18 @@ mod tests {
     #[test]
     fn t51_8_compress_contiguous() {
         let hosts: Vec<String> = vec!["node001", "node002", "node003"]
-            .into_iter().map(String::from).collect();
+            .into_iter()
+            .map(String::from)
+            .collect();
         assert_eq!(hostlist::compress(&hosts), "node[001-003]");
     }
 
     #[test]
     fn t51_9_compress_with_gap() {
         let hosts: Vec<String> = vec!["node001", "node002", "node003", "node005"]
-            .into_iter().map(String::from).collect();
+            .into_iter()
+            .map(String::from)
+            .collect();
         assert_eq!(hostlist::compress(&hosts), "node[001-003,005]");
     }
 

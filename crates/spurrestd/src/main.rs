@@ -15,7 +15,11 @@ struct Args {
     listen: String,
 
     /// spurctl gRPC address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     controller: String,
 
     /// Log level

@@ -250,7 +250,10 @@ mod tests {
         assert_eq!(CpuBind::from_str("cores"), CpuBind::Cores);
         assert_eq!(CpuBind::from_str("threads"), CpuBind::Threads);
         assert_eq!(CpuBind::from_str("none"), CpuBind::None);
-        assert!(matches!(CpuBind::from_str("map_cpu:0,1,2,3"), CpuBind::Map(_)));
+        assert!(matches!(
+            CpuBind::from_str("map_cpu:0,1,2,3"),
+            CpuBind::Map(_)
+        ));
     }
 
     #[test]
@@ -262,7 +265,10 @@ mod tests {
 
     #[test]
     fn test_task_distribution_from_str() {
-        assert_eq!(TaskDistribution::from_str("cyclic"), TaskDistribution::Cyclic);
+        assert_eq!(
+            TaskDistribution::from_str("cyclic"),
+            TaskDistribution::Cyclic
+        );
         assert_eq!(TaskDistribution::from_str("block"), TaskDistribution::Block);
         assert_eq!(TaskDistribution::from_str("plane"), TaskDistribution::Plane);
     }

@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use spur_sched::priority;
     use chrono::{Duration, Utc};
+    use spur_sched::priority;
 
     // ── T24.1: Fair-share with no usage ──────────────────────────
 
@@ -20,9 +20,7 @@ mod tests {
     #[test]
     fn t24_2_fair_share_heavy_usage() {
         let now = Utc::now();
-        let records: Vec<_> = (0..14)
-            .map(|d| (now - Duration::days(d), 100.0))
-            .collect();
+        let records: Vec<_> = (0..14).map(|d| (now - Duration::days(d), 100.0)).collect();
         let factor = priority::fair_share_factor(1.0, &records, 14, now);
         assert!(factor < 1.0, "heavy usage → low factor");
     }

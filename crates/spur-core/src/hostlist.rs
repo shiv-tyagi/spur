@@ -109,12 +109,7 @@ fn format_range(start: u64, end: u64, width: usize) -> String {
     if start == end {
         format!("{:0>width$}", start, width = width)
     } else {
-        format!(
-            "{:0>width$}-{:0>width$}",
-            start,
-            end,
-            width = width
-        )
+        format!("{:0>width$}-{:0>width$}", start, end, width = width)
     }
 }
 
@@ -163,10 +158,7 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
                     .map_err(|_| HostlistError::InvalidRange(range_part.into()))?;
 
                 if start > end {
-                    return Err(HostlistError::InvalidRange(format!(
-                        "{} > {}",
-                        start, end
-                    )));
+                    return Err(HostlistError::InvalidRange(format!("{} > {}", start, end)));
                 }
 
                 for i in start..=end {

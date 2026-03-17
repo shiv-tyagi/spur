@@ -144,7 +144,9 @@ impl SpankHost {
             {
                 // Look up the symbol
                 let func: Result<
-                    libloading::Symbol<unsafe extern "C" fn(*mut SpankHandle, c_int, *mut *mut c_char) -> c_int>,
+                    libloading::Symbol<
+                        unsafe extern "C" fn(*mut SpankHandle, c_int, *mut *mut c_char) -> c_int,
+                    >,
                     _,
                 > = unsafe { plugin.lib.get(symbol.as_bytes()) };
 

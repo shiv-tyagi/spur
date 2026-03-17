@@ -39,7 +39,12 @@ impl SnapshotStore {
     }
 
     /// Save a full snapshot of jobs and nodes.
-    pub fn save(&self, jobs: &[Job], nodes: &[Node], wal_sequence: u64) -> Result<(), SnapshotError> {
+    pub fn save(
+        &self,
+        jobs: &[Job],
+        nodes: &[Node],
+        wal_sequence: u64,
+    ) -> Result<(), SnapshotError> {
         let txn = self.db.begin_write()?;
 
         {
@@ -69,7 +74,12 @@ impl SnapshotStore {
         }
 
         txn.commit()?;
-        debug!(jobs = jobs.len(), nodes = nodes.len(), wal_sequence, "snapshot saved");
+        debug!(
+            jobs = jobs.len(),
+            nodes = nodes.len(),
+            wal_sequence,
+            "snapshot saved"
+        );
         Ok(())
     }
 
@@ -143,12 +153,31 @@ mod tests {
         let store = SnapshotStore::open(tmp.path()).unwrap();
 
         let jobs = vec![
-            Job::new(1, JobSpec { name: "job1".into(), user: "alice".into(), ..Default::default() }),
-            Job::new(2, JobSpec { name: "job2".into(), user: "bob".into(), ..Default::default() }),
+            Job::new(
+                1,
+                JobSpec {
+                    name: "job1".into(),
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+            ),
+            Job::new(
+                2,
+                JobSpec {
+                    name: "job2".into(),
+                    user: "bob".into(),
+                    ..Default::default()
+                },
+            ),
         ];
-        let nodes = vec![
-            Node::new("node001".into(), ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() }),
-        ];
+        let nodes = vec![Node::new(
+            "node001".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        )];
 
         store.save(&jobs, &nodes, 42).unwrap();
 

@@ -72,11 +72,21 @@ pub struct ControllerConfig {
     pub first_job_id: u32,
 }
 
-fn default_listen_addr() -> String { "[::]:6817".into() }
-fn default_rest_addr() -> String { "[::]:6820".into() }
-fn default_hosts() -> Vec<String> { vec!["localhost".into()] }
-fn default_state_dir() -> String { "/var/spool/spur".into() }
-fn default_max_job_id() -> u32 { 999_999_999 }
+fn default_listen_addr() -> String {
+    "[::]:6817".into()
+}
+fn default_rest_addr() -> String {
+    "[::]:6820".into()
+}
+fn default_hosts() -> Vec<String> {
+    vec!["localhost".into()]
+}
+fn default_state_dir() -> String {
+    "/var/spool/spur".into()
+}
+fn default_max_job_id() -> u32 {
+    999_999_999
+}
 
 impl Default for ControllerConfig {
     fn default() -> Self {
@@ -104,9 +114,15 @@ pub struct AccountingConfig {
     pub purge_after_days: u32,
 }
 
-fn default_accounting_host() -> String { "localhost:6819".into() }
-fn default_database_url() -> String { "postgresql://spur:spur@localhost/spur".into() }
-fn default_purge_days() -> u32 { 365 }
+fn default_accounting_host() -> String {
+    "localhost:6819".into()
+}
+fn default_database_url() -> String {
+    "postgresql://spur:spur@localhost/spur".into()
+}
+fn default_purge_days() -> u32 {
+    365
+}
 
 impl Default for AccountingConfig {
     fn default() -> Self {
@@ -137,10 +153,18 @@ pub struct SchedulerConfig {
     pub default_time_limit_minutes: u32,
 }
 
-fn default_scheduler_plugin() -> String { "backfill".into() }
-fn default_max_jobs() -> u32 { 10000 }
-fn default_halflife() -> u32 { 14 }
-fn default_time_limit() -> u32 { 60 }
+fn default_scheduler_plugin() -> String {
+    "backfill".into()
+}
+fn default_max_jobs() -> u32 {
+    10000
+}
+fn default_halflife() -> u32 {
+    14
+}
+fn default_time_limit() -> u32 {
+    60
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -235,10 +259,18 @@ pub struct NetworkConfig {
     pub agent_port: u16,
 }
 
-fn default_wg_cidr() -> String { "10.44.0.0/16".into() }
-fn default_wg_interface() -> String { "spur0".into() }
-fn default_wg_port() -> u16 { 51820 }
-fn default_agent_port() -> u16 { 6818 }
+fn default_wg_cidr() -> String {
+    "10.44.0.0/16".into()
+}
+fn default_wg_interface() -> String {
+    "spur0".into()
+}
+fn default_wg_port() -> u16 {
+    51820
+}
+fn default_agent_port() -> u16 {
+    6818
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -307,10 +339,7 @@ impl SlurmConfig {
                 is_default: pc.default,
                 nodes: pc.nodes.clone(),
                 max_time_minutes: pc.max_time.as_ref().and_then(|t| parse_time_minutes(t)),
-                default_time_minutes: pc
-                    .default_time
-                    .as_ref()
-                    .and_then(|t| parse_time_minutes(t)),
+                default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,
                 min_nodes: pc.min_nodes,
                 priority_tier: pc.priority_tier,

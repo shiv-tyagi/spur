@@ -50,7 +50,11 @@ pub async fn job_execution_loop(reporter: Arc<NodeReporter>) {
 }
 
 /// Report job completion back to the controller.
-async fn report_completion(controller_addr: &str, job_id: JobId, exit_code: i32) -> anyhow::Result<()> {
+async fn report_completion(
+    controller_addr: &str,
+    job_id: JobId,
+    exit_code: i32,
+) -> anyhow::Result<()> {
     // For now, the controller handles this via the heartbeat/status update path.
     // Full implementation in Phase 5 with streaming heartbeats.
     debug!(job_id, exit_code, "would report completion to controller");
@@ -222,7 +226,10 @@ fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Opti
 
     // Try to create cgroup (may fail without root)
     if std::fs::create_dir_all(&cgroup_path).is_err() {
-        debug!(job_id, "cgroup creation failed (not root?), running without isolation");
+        debug!(
+            job_id,
+            "cgroup creation failed (not root?), running without isolation"
+        );
         return Ok(None);
     }
 
@@ -237,10 +244,7 @@ fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Opti
     // Set memory limit
     if memory_mb > 0 {
         let memory_bytes = memory_mb * 1024 * 1024;
-        if let Err(e) = std::fs::write(
-            cgroup_path.join("memory.max"),
-            memory_bytes.to_string(),
-        ) {
+        if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             debug!(error = %e, "failed to set memory.max");
         }
     }
@@ -288,15 +292,24 @@ fn cleanup_cgroup(cgroup_path: &Path) {
 /// Send a signal to a running job.
 pub fn signal_job(job: &RunningJob, sig: Signal) -> anyhow::Result<()> {
     if let Some(pid) = job.child.id() {
-        signal::kill(Pid::from_raw(pid as i32), sig)
-            .context("failed to signal job process")?;
+        signal::kill(Pid::from_raw(pid as i32), sig).context("failed to signal job process")?;
     }
     Ok(())
 }
 
 /// Run a prolog/epilog hook script.
-async fn run_hook(script_path: &str, job_id: JobId, work_dir: &str, hook_name: &str) -> anyhow::Result<()> {
-    info!(job_id, hook = hook_name, script = script_path, "running hook");
+async fn run_hook(
+    script_path: &str,
+    job_id: JobId,
+    work_dir: &str,
+    hook_name: &str,
+) -> anyhow::Result<()> {
+    info!(
+        job_id,
+        hook = hook_name,
+        script = script_path,
+        "running hook"
+    );
 
     let status = Command::new(script_path)
         .env("SPUR_JOB_ID", job_id.to_string())
@@ -359,9 +372,6 @@ mod tests {
             resolve_output_path("/var/log/job-%j.log", 42, "/home/user"),
             "/var/log/job-42.log"
         );
-        assert_eq!(
-            resolve_output_path("", 42, "/tmp"),
-            "/tmp/spur-42.out"
-        );
+        assert_eq!(resolve_output_path("", 42, "/tmp"), "/tmp/spur-42.out");
     }
 }

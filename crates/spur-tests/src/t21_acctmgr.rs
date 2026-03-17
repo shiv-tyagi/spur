@@ -6,8 +6,8 @@
 #[cfg(test)]
 mod tests {
     use spur_core::accounting::*;
-    use spur_core::qos::*;
     use spur_core::job::*;
+    use spur_core::qos::*;
 
     // ── T21.1: TRES records ──────────────────────────────────────
 
@@ -106,13 +106,16 @@ mod tests {
     #[test]
     fn t21_10_qos_no_limits_allowed() {
         let qos = Qos::default();
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            num_tasks: 4,
-            cpus_per_task: 1,
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                num_tasks: 4,
+                cpus_per_task: 1,
+                ..Default::default()
+            },
+        );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
         assert_eq!(result, QosCheckResult::Allowed);
     }
@@ -127,14 +130,20 @@ mod tests {
             },
             ..Default::default()
         };
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                ..Default::default()
+            },
+        );
         // User already has 2 running
         let result = check_qos_limits(&job, &qos, 2, 2, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser));
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser)
+        );
     }
 
     #[test]
@@ -147,14 +156,20 @@ mod tests {
             },
             ..Default::default()
         };
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            time_limit: Some(chrono::Duration::hours(4)),
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                time_limit: Some(chrono::Duration::hours(4)),
+                ..Default::default()
+            },
+        );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::PartitionTimeLimit));
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::PartitionTimeLimit)
+        );
     }
 
     #[test]
@@ -169,13 +184,16 @@ mod tests {
             },
             ..Default::default()
         };
-        let job = Job::new(1, JobSpec {
-            name: "big".into(),
-            user: "alice".into(),
-            num_tasks: 16,
-            cpus_per_task: 1,
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "big".into(),
+                user: "alice".into(),
+                num_tasks: 16,
+                cpus_per_task: 1,
+                ..Default::default()
+            },
+        );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
         assert_eq!(result, QosCheckResult::Blocked(PendingReason::Resources));
     }
@@ -184,19 +202,28 @@ mod tests {
 
     #[test]
     fn t21_14_qos_priority_boost() {
-        let qos = Qos { priority: 1000, ..Default::default() };
+        let qos = Qos {
+            priority: 1000,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(500, &qos), 1500);
     }
 
     #[test]
     fn t21_15_qos_priority_penalty() {
-        let qos = Qos { priority: -200, ..Default::default() };
+        let qos = Qos {
+            priority: -200,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(1000, &qos), 800);
     }
 
     #[test]
     fn t21_16_qos_priority_floor() {
-        let qos = Qos { priority: -5000, ..Default::default() };
+        let qos = Qos {
+            priority: -5000,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1);
     }
 }

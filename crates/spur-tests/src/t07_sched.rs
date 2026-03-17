@@ -5,15 +5,15 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::*;
+    use chrono::{Duration, Utc};
     use spur_core::job::*;
     use spur_core::node::*;
     use spur_core::partition::*;
     use spur_core::resource::*;
     use spur_sched::backfill::BackfillScheduler;
-    use spur_sched::traits::*;
     use spur_sched::timeline::NodeTimeline;
-    use chrono::{Duration, Utc};
-    use crate::harness::*;
+    use spur_sched::traits::*;
 
     // ── T07.1: Single job scheduling ─────────────────────────────
 
@@ -25,7 +25,10 @@ mod tests {
         let partitions = vec![make_partition("default", 4)];
         let pending = vec![make_job_with_resources("train", 2, 64, 1, Some(60))];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 1);
@@ -45,7 +48,10 @@ mod tests {
             make_job_with_resources("job2", 2, 32, 1, Some(60)),
         ];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 2);
@@ -64,7 +70,10 @@ mod tests {
         let partitions = vec![make_partition("default", 2)];
         let pending = vec![make_job_with_resources("big", 4, 128, 1, Some(60))];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 0);
@@ -74,12 +83,15 @@ mod tests {
     fn t07_4_insufficient_cpus() {
         reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
-        let nodes = make_nodes(4, 32, 256_000);  // Only 32 CPUs per node
+        let nodes = make_nodes(4, 32, 256_000); // Only 32 CPUs per node
         let partitions = vec![make_partition("default", 4)];
         // Request 64 CPUs per node
         let pending = vec![make_job_with_resources("cpu_heavy", 1, 64, 1, Some(60))];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 0);
@@ -97,7 +109,10 @@ mod tests {
         let partitions = vec![make_partition("default", 4)];
         let pending = vec![make_job_with_resources("job", 2, 32, 1, Some(60))];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 1);
@@ -118,7 +133,10 @@ mod tests {
         let partitions = vec![make_partition("default", 3)];
         let pending = vec![make_job_with_resources("job", 1, 32, 1, Some(60))];
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&pending, &cluster);
 
         assert_eq!(assignments.len(), 1);
@@ -138,15 +156,15 @@ mod tests {
         nodes[2].partitions = vec!["cpu".into()];
         nodes[3].partitions = vec!["cpu".into()];
 
-        let partitions = vec![
-            make_partition("gpu", 2),
-            make_partition("cpu", 2),
-        ];
+        let partitions = vec![make_partition("gpu", 2), make_partition("cpu", 2)];
 
         let mut job = make_job_with_resources("gpu_job", 2, 32, 1, Some(60));
         job.spec.partition = Some("gpu".into());
 
-        let cluster = ClusterState { nodes: &nodes, partitions: &partitions };
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
         let assignments = sched.schedule(&[job], &cluster);
 
         assert_eq!(assignments.len(), 1);
@@ -161,7 +179,11 @@ mod tests {
     fn t07_8_timeline_empty() {
         let tl = NodeTimeline::new(
             "node001".into(),
-            ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
         );
         let now = Utc::now();
         let avail = tl.available_at(now);
@@ -172,12 +194,22 @@ mod tests {
     fn t07_9_timeline_reservation() {
         let mut tl = NodeTimeline::new(
             "node001".into(),
-            ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
         );
         let now = Utc::now();
-        tl.reserve(now, now + Duration::hours(4), ResourceSet {
-            cpus: 32, memory_mb: 128_000, ..Default::default()
-        });
+        tl.reserve(
+            now,
+            now + Duration::hours(4),
+            ResourceSet {
+                cpus: 32,
+                memory_mb: 128_000,
+                ..Default::default()
+            },
+        );
 
         let avail = tl.available_at(now + Duration::hours(1));
         assert_eq!(avail.cpus, 32);
@@ -190,15 +222,27 @@ mod tests {
     fn t07_10_timeline_earliest_start() {
         let mut tl = NodeTimeline::new(
             "node001".into(),
-            ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
         );
         let now = Utc::now();
 
-        tl.reserve(now, now + Duration::hours(4), ResourceSet {
-            cpus: 48, ..Default::default()
-        });
+        tl.reserve(
+            now,
+            now + Duration::hours(4),
+            ResourceSet {
+                cpus: 48,
+                ..Default::default()
+            },
+        );
 
-        let req = ResourceSet { cpus: 32, ..Default::default() };
+        let req = ResourceSet {
+            cpus: 32,
+            ..Default::default()
+        };
         let start = tl.earliest_start(&req, Duration::hours(2), now);
         assert!(start >= now + Duration::hours(4));
     }
@@ -207,16 +251,29 @@ mod tests {
     fn t07_11_timeline_gc() {
         let mut tl = NodeTimeline::new(
             "node001".into(),
-            ResourceSet { cpus: 64, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                ..Default::default()
+            },
         );
         let now = Utc::now();
 
-        tl.reserve(now - Duration::hours(2), now - Duration::hours(1), ResourceSet {
-            cpus: 32, ..Default::default()
-        });
-        tl.reserve(now, now + Duration::hours(1), ResourceSet {
-            cpus: 16, ..Default::default()
-        });
+        tl.reserve(
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            ResourceSet {
+                cpus: 32,
+                ..Default::default()
+            },
+        );
+        tl.reserve(
+            now,
+            now + Duration::hours(1),
+            ResourceSet {
+                cpus: 16,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(tl.intervals.len(), 2);
         tl.gc(now);

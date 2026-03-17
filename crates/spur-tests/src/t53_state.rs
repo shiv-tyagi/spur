@@ -10,7 +10,7 @@ mod tests {
     use spur_core::wal::*;
     use spur_state::snapshot::SnapshotStore;
     use spur_state::wal_store::FileWalStore;
-    use tempfile::{TempDir, NamedTempFile};
+    use tempfile::{NamedTempFile, TempDir};
 
     // ── T53.1: WAL basic operations ──────────────────────────────
 
@@ -19,15 +19,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = FileWalStore::new(dir.path()).unwrap();
 
-        let entry = WalEntry::new(1, WalOperation::JobSubmit {
-            job_id: 42,
-            name: "test".into(),
-            user: "alice".into(),
-            partition: Some("gpu".into()),
-            num_nodes: 2,
-            num_tasks: 16,
-            cpus_per_task: 1,
-        });
+        let entry = WalEntry::new(
+            1,
+            WalOperation::JobSubmit {
+                job_id: 42,
+                name: "test".into(),
+                user: "alice".into(),
+                partition: Some("gpu".into()),
+                num_nodes: 2,
+                num_tasks: 16,
+                cpus_per_task: 1,
+            },
+        );
 
         store.append(&entry).unwrap();
         assert_eq!(store.latest_sequence(), 1);
@@ -43,15 +46,20 @@ mod tests {
         let mut store = FileWalStore::new(dir.path()).unwrap();
 
         for i in 1..=10 {
-            store.append(&WalEntry::new(i, WalOperation::JobSubmit {
-                job_id: i as u32,
-                name: format!("job{}", i),
-                user: "alice".into(),
-                partition: None,
-                num_nodes: 1,
-                num_tasks: 1,
-                cpus_per_task: 1,
-            })).unwrap();
+            store
+                .append(&WalEntry::new(
+                    i,
+                    WalOperation::JobSubmit {
+                        job_id: i as u32,
+                        name: format!("job{}", i),
+                        user: "alice".into(),
+                        partition: None,
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                    },
+                ))
+                .unwrap();
         }
 
         assert_eq!(store.latest_sequence(), 10);
@@ -65,11 +73,16 @@ mod tests {
         let mut store = FileWalStore::new(dir.path()).unwrap();
 
         for i in 1..=5 {
-            store.append(&WalEntry::new(i, WalOperation::NodeHeartbeat {
-                name: "node001".into(),
-                cpu_load: 50,
-                free_memory_mb: 100_000,
-            })).unwrap();
+            store
+                .append(&WalEntry::new(
+                    i,
+                    WalOperation::NodeHeartbeat {
+                        name: "node001".into(),
+                        cpu_load: 50,
+                        free_memory_mb: 100_000,
+                    },
+                ))
+                .unwrap();
         }
 
         let entries = store.read_from(3).unwrap();
@@ -87,15 +100,20 @@ mod tests {
         {
             let mut store = FileWalStore::new(dir.path()).unwrap();
             for i in 1..=5 {
-                store.append(&WalEntry::new(i, WalOperation::JobSubmit {
-                    job_id: i as u32,
-                    name: format!("job{}", i),
-                    user: "alice".into(),
-                    partition: None,
-                    num_nodes: 1,
-                    num_tasks: 1,
-                    cpus_per_task: 1,
-                })).unwrap();
+                store
+                    .append(&WalEntry::new(
+                        i,
+                        WalOperation::JobSubmit {
+                            job_id: i as u32,
+                            name: format!("job{}", i),
+                            user: "alice".into(),
+                            partition: None,
+                            num_nodes: 1,
+                            num_tasks: 1,
+                            cpus_per_task: 1,
+                        },
+                    ))
+                    .unwrap();
             }
         }
 
@@ -114,11 +132,16 @@ mod tests {
         let mut store = FileWalStore::new(dir.path()).unwrap();
 
         for i in 1..=10 {
-            store.append(&WalEntry::new(i, WalOperation::NodeHeartbeat {
-                name: "node001".into(),
-                cpu_load: 50,
-                free_memory_mb: 100_000,
-            })).unwrap();
+            store
+                .append(&WalEntry::new(
+                    i,
+                    WalOperation::NodeHeartbeat {
+                        name: "node001".into(),
+                        cpu_load: 50,
+                        free_memory_mb: 100_000,
+                    },
+                ))
+                .unwrap();
         }
 
         store.truncate_before(6).unwrap();
@@ -135,12 +158,31 @@ mod tests {
         let store = SnapshotStore::open(tmp.path()).unwrap();
 
         let jobs = vec![
-            Job::new(1, JobSpec { name: "job1".into(), user: "alice".into(), ..Default::default() }),
-            Job::new(2, JobSpec { name: "job2".into(), user: "bob".into(), ..Default::default() }),
+            Job::new(
+                1,
+                JobSpec {
+                    name: "job1".into(),
+                    user: "alice".into(),
+                    ..Default::default()
+                },
+            ),
+            Job::new(
+                2,
+                JobSpec {
+                    name: "job2".into(),
+                    user: "bob".into(),
+                    ..Default::default()
+                },
+            ),
         ];
-        let nodes = vec![
-            Node::new("node001".into(), ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() }),
-        ];
+        let nodes = vec![Node::new(
+            "node001".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        )];
 
         store.save(&jobs, &nodes, 42).unwrap();
 
@@ -174,15 +216,34 @@ mod tests {
         let store = SnapshotStore::open(tmp.path()).unwrap();
 
         // First snapshot
-        let jobs = vec![
-            Job::new(1, JobSpec { name: "old".into(), user: "a".into(), ..Default::default() }),
-        ];
+        let jobs = vec![Job::new(
+            1,
+            JobSpec {
+                name: "old".into(),
+                user: "a".into(),
+                ..Default::default()
+            },
+        )];
         store.save(&jobs, &[], 10).unwrap();
 
         // Second snapshot with more jobs
         let jobs = vec![
-            Job::new(1, JobSpec { name: "new".into(), user: "a".into(), ..Default::default() }),
-            Job::new(2, JobSpec { name: "added".into(), user: "b".into(), ..Default::default() }),
+            Job::new(
+                1,
+                JobSpec {
+                    name: "new".into(),
+                    user: "a".into(),
+                    ..Default::default()
+                },
+            ),
+            Job::new(
+                2,
+                JobSpec {
+                    name: "added".into(),
+                    user: "b".into(),
+                    ..Default::default()
+                },
+            ),
         ];
         store.save(&jobs, &[], 20).unwrap();
 

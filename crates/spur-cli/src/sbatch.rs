@@ -117,7 +117,11 @@ pub struct SbatchArgs {
     pub export: String,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     pub controller: String,
 
     /// The batch script file
@@ -146,10 +150,7 @@ pub fn parse_sbatch_directives(script: &str) -> Vec<String> {
             }
         }
         // Stop at first non-comment, non-blank, non-shebang line
-        if !trimmed.is_empty()
-            && !trimmed.starts_with('#')
-            && !trimmed.starts_with("#!/")
-        {
+        if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("#!/") {
             break;
         }
     }
@@ -290,12 +291,9 @@ pub async fn main() -> Result<()> {
         .chdir
         .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
 
-    let name = args.job_name.unwrap_or_else(|| {
-        args.script
-            .as_deref()
-            .unwrap_or("sbatch")
-            .to_string()
-    });
+    let name = args
+        .job_name
+        .unwrap_or_else(|| args.script.as_deref().unwrap_or("sbatch").to_string());
 
     // Build GRES list
     let mut gres = args.gres;

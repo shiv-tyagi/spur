@@ -16,9 +16,7 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 
 /// Run database migrations (create tables if they don't exist).
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query(SCHEMA)
-        .execute(pool)
-        .await?;
+    sqlx::query(SCHEMA).execute(pool).await?;
     Ok(())
 }
 
@@ -432,7 +430,9 @@ pub async fn upsert_account(
 /// Delete an account.
 pub async fn delete_account(pool: &PgPool, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM accounts WHERE name = $1")
-        .bind(name).execute(pool).await?;
+        .bind(name)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -442,14 +442,17 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
         "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
-    Ok(rows.iter().map(|r| AccountRecord {
-        name: r.get("name"),
-        description: r.get("description"),
-        organization: r.get("organization"),
-        parent: r.get("parent_account"),
-        fairshare_weight: r.get("fairshare_weight"),
-        max_running_jobs: r.get("max_running_jobs"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| AccountRecord {
+            name: r.get("name"),
+            description: r.get("description"),
+            organization: r.get("organization"),
+            parent: r.get("parent_account"),
+            fairshare_weight: r.get("fairshare_weight"),
+            max_running_jobs: r.get("max_running_jobs"),
+        })
+        .collect())
 }
 
 #[derive(Debug)]
@@ -477,8 +480,12 @@ pub async fn add_user(
         ON CONFLICT (name, account) DO UPDATE SET admin_level = $3
         "#,
     )
-    .bind(user).bind(account).bind(admin_level).bind(is_default)
-    .execute(pool).await?;
+    .bind(user)
+    .bind(account)
+    .bind(admin_level)
+    .bind(is_default)
+    .execute(pool)
+    .await?;
 
     // Also create association
     sqlx::query(
@@ -488,8 +495,11 @@ pub async fn add_user(
         ON CONFLICT (user_name, account, partition_name) DO UPDATE SET is_default = $3
         "#,
     )
-    .bind(user).bind(account).bind(is_default)
-    .execute(pool).await?;
+    .bind(user)
+    .bind(account)
+    .bind(is_default)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -497,9 +507,15 @@ pub async fn add_user(
 /// Remove a user from an account.
 pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM users WHERE name = $1 AND account = $2")
-        .bind(user).bind(account).execute(pool).await?;
+        .bind(user)
+        .bind(account)
+        .execute(pool)
+        .await?;
     sqlx::query("DELETE FROM associations WHERE user_name = $1 AND account = $2")
-        .bind(user).bind(account).execute(pool).await?;
+        .bind(user)
+        .bind(account)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -509,16 +525,22 @@ pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<
         sqlx::query("SELECT name, account, admin_level, default_account FROM users WHERE account = $1 ORDER BY name")
             .bind(acct).fetch_all(pool).await?
     } else {
-        sqlx::query("SELECT name, account, admin_level, default_account FROM users ORDER BY name, account")
-            .fetch_all(pool).await?
+        sqlx::query(
+            "SELECT name, account, admin_level, default_account FROM users ORDER BY name, account",
+        )
+        .fetch_all(pool)
+        .await?
     };
 
-    Ok(rows.iter().map(|r| UserRecord {
-        name: r.get("name"),
-        account: r.get("account"),
-        admin_level: r.get("admin_level"),
-        default_account: r.get("default_account"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| UserRecord {
+            name: r.get("name"),
+            account: r.get("account"),
+            admin_level: r.get("admin_level"),
+            default_account: r.get("default_account"),
+        })
+        .collect())
 }
 
 #[derive(Debug)]
@@ -551,17 +573,25 @@ pub async fn upsert_qos(
             max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8
         "#,
     )
-    .bind(name).bind(description).bind(priority).bind(preempt_mode)
-    .bind(usage_factor).bind(max_jobs_per_user).bind(max_wall_min)
+    .bind(name)
+    .bind(description)
+    .bind(priority)
+    .bind(preempt_mode)
+    .bind(usage_factor)
+    .bind(max_jobs_per_user)
+    .bind(max_wall_min)
     .bind(max_tres_per_job)
-    .execute(pool).await?;
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Delete a QOS.
 pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM qos WHERE name = $1")
-        .bind(name).execute(pool).await?;
+        .bind(name)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -571,16 +601,19 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
         "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
-    Ok(rows.iter().map(|r| QosRecord {
-        name: r.get("name"),
-        description: r.get("description"),
-        priority: r.get("priority"),
-        preempt_mode: r.get("preempt_mode"),
-        usage_factor: r.get("usage_factor"),
-        max_jobs_per_user: r.get("max_jobs_per_user"),
-        max_wall_min: r.get("max_wall_min"),
-        max_tres_per_job: r.get("max_tres_per_job"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| QosRecord {
+            name: r.get("name"),
+            description: r.get("description"),
+            priority: r.get("priority"),
+            preempt_mode: r.get("preempt_mode"),
+            usage_factor: r.get("usage_factor"),
+            max_jobs_per_user: r.get("max_jobs_per_user"),
+            max_wall_min: r.get("max_wall_min"),
+            max_tres_per_job: r.get("max_tres_per_job"),
+        })
+        .collect())
 }
 
 #[derive(Debug)]

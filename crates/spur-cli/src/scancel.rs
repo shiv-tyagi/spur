@@ -47,7 +47,11 @@ pub struct ScancelArgs {
     pub interactive: bool,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     pub controller: String,
 }
 
@@ -60,7 +64,9 @@ pub async fn main() -> Result<()> {
 
     let signal = parse_signal(args.signal.as_deref())?;
 
-    let user = args.user.unwrap_or_else(|| whoami::username().unwrap_or_else(|_| "unknown".into()));
+    let user = args
+        .user
+        .unwrap_or_else(|| whoami::username().unwrap_or_else(|_| "unknown".into()));
 
     let mut client = SlurmControllerClient::connect(args.controller)
         .await

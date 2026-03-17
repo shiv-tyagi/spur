@@ -8,11 +8,14 @@ mod tests {
     use spur_core::job::*;
 
     fn make_job_state(id: JobId, state: JobState) -> Job {
-        let mut job = Job::new(id, JobSpec {
-            name: "dep".into(),
-            user: "alice".into(),
-            ..Default::default()
-        });
+        let mut job = Job::new(
+            id,
+            JobSpec {
+                name: "dep".into(),
+                user: "alice".into(),
+                ..Default::default()
+            },
+        );
         if state != JobState::Pending {
             let _ = job.transition(JobState::Running);
             if state != JobState::Running {
@@ -66,15 +69,26 @@ mod tests {
     #[test]
     fn t56_7_afterok_completed() {
         let dep = make_job_state(100, JobState::Completed);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afterok:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Satisfied);
     }
 
@@ -83,15 +97,26 @@ mod tests {
     #[test]
     fn t56_8_afterok_running() {
         let dep = make_job_state(100, JobState::Running);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afterok:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Waiting);
     }
 
@@ -100,15 +125,26 @@ mod tests {
     #[test]
     fn t56_9_afterok_dep_failed() {
         let dep = make_job_state(100, JobState::Failed);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afterok:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Failed);
     }
 
@@ -117,15 +153,26 @@ mod tests {
     #[test]
     fn t56_10_afterany_failed_is_ok() {
         let dep = make_job_state(100, JobState::Failed);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afterany:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterany:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Satisfied);
     }
 
@@ -134,15 +181,26 @@ mod tests {
     #[test]
     fn t56_11_afternotok_failed() {
         let dep = make_job_state(100, JobState::Failed);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afternotok:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afternotok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Satisfied);
     }
 
@@ -151,15 +209,26 @@ mod tests {
     #[test]
     fn t56_12_afternotok_completed() {
         let dep = make_job_state(100, JobState::Completed);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afternotok:100".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| {
-            if id == 100 { Some(dep.clone()) } else { None }
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afternotok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Failed);
     }
 
@@ -172,12 +241,15 @@ mod tests {
         running_named.spec.name = "train".into();
         running_named.spec.user = "alice".into();
 
-        let job = Job::new(1, JobSpec {
-            name: "train".into(),
-            user: "alice".into(),
-            dependency: vec!["singleton".into()],
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "train".into(),
+                user: "alice".into(),
+                dependency: vec!["singleton".into()],
+                ..Default::default()
+            },
+        );
 
         let result = check_dependencies(&job, &|_| None, &|name, user| {
             if name == "train" && user == "alice" {
@@ -193,12 +265,15 @@ mod tests {
 
     #[test]
     fn t56_14_singleton_satisfied() {
-        let job = Job::new(1, JobSpec {
-            name: "train".into(),
-            user: "alice".into(),
-            dependency: vec!["singleton".into()],
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "train".into(),
+                user: "alice".into(),
+                dependency: vec!["singleton".into()],
+                ..Default::default()
+            },
+        );
 
         let result = check_dependencies(&job, &|_| None, &|_, _| Vec::new());
         assert_eq!(result, DependencyResult::Satisfied);
@@ -208,11 +283,14 @@ mod tests {
 
     #[test]
     fn t56_15_no_deps() {
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                ..Default::default()
+            },
+        );
         let result = check_dependencies(&job, &|_| None, &|_, _| Vec::new());
         assert_eq!(result, DependencyResult::Satisfied);
     }
@@ -223,17 +301,24 @@ mod tests {
     fn t56_16_multiple_deps_one_waiting() {
         let done = make_job_state(100, JobState::Completed);
         let running = make_job_state(200, JobState::Running);
-        let job = Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            dependency: vec!["afterok:100,afterok:200".into()],
-            ..Default::default()
-        });
-        let result = check_dependencies(&job, &|id| match id {
-            100 => Some(done.clone()),
-            200 => Some(running.clone()),
-            _ => None,
-        }, &|_, _| Vec::new());
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100,afterok:200".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| match id {
+                100 => Some(done.clone()),
+                200 => Some(running.clone()),
+                _ => None,
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Waiting);
     }
 }

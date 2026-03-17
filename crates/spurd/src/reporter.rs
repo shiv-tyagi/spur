@@ -87,11 +87,7 @@ impl NodeReporter {
                         })
                         .await
                     {
-                        Ok(_) => debug!(
-                            load,
-                            free_mem,
-                            "heartbeat sent"
-                        ),
+                        Ok(_) => debug!(load, free_mem, "heartbeat sent"),
                         Err(e) => warn!(error = %e, "heartbeat failed"),
                     }
                 }

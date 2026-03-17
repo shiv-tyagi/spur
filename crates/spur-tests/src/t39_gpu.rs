@@ -40,13 +40,15 @@ mod tests {
         let node = ResourceSet {
             cpus: 128,
             memory_mb: 512_000,
-            gpus: (0..8).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            }).collect(),
+            gpus: (0..8)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -54,13 +56,15 @@ mod tests {
         let req = ResourceSet {
             cpus: 64,
             memory_mb: 256_000,
-            gpus: (0..4).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
-            }).collect(),
+            gpus: (0..4)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::PCIe,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -72,13 +76,15 @@ mod tests {
         let node = ResourceSet {
             cpus: 128,
             memory_mb: 512_000,
-            gpus: (0..4).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            }).collect(),
+            gpus: (0..4)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -86,13 +92,15 @@ mod tests {
         let req = ResourceSet {
             cpus: 64,
             memory_mb: 256_000,
-            gpus: (0..8).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
-            }).collect(),
+            gpus: (0..8)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::PCIe,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -104,13 +112,15 @@ mod tests {
         let node = ResourceSet {
             cpus: 128,
             memory_mb: 512_000,
-            gpus: (0..8).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            }).collect(),
+            gpus: (0..8)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -136,13 +146,15 @@ mod tests {
         let node = ResourceSet {
             cpus: 128,
             memory_mb: 512_000,
-            gpus: (0..8).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            }).collect(),
+            gpus: (0..8)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -150,13 +162,15 @@ mod tests {
         let req = ResourceSet {
             cpus: 64,
             memory_mb: 256_000,
-            gpus: (0..4).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "any".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::PCIe,
-            }).collect(),
+            gpus: (0..4)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "any".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::PCIe,
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -168,13 +182,15 @@ mod tests {
     #[test]
     fn t39_8_gpu_count() {
         let r = ResourceSet {
-            gpus: (0..8).map(|i| GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            }).collect(),
+            gpus: (0..8)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                })
+                .collect(),
             ..Default::default()
         };
         assert_eq!(r.total_gpus(), 8);

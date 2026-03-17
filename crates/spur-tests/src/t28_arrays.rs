@@ -11,22 +11,28 @@ mod tests {
 
     #[test]
     fn t28_1_array_spec_stored() {
-        let job = Job::new(1, JobSpec {
-            name: "array".into(),
-            user: "test".into(),
-            array_spec: Some("0-99%10".into()),
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "array".into(),
+                user: "test".into(),
+                array_spec: Some("0-99%10".into()),
+                ..Default::default()
+            },
+        );
         assert_eq!(job.spec.array_spec, Some("0-99%10".into()));
     }
 
     #[test]
     fn t28_2_array_spec_none_for_regular_job() {
-        let job = Job::new(1, JobSpec {
-            name: "regular".into(),
-            user: "test".into(),
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "regular".into(),
+                user: "test".into(),
+                ..Default::default()
+            },
+        );
         assert!(job.spec.array_spec.is_none());
     }
 
@@ -34,12 +40,15 @@ mod tests {
 
     #[test]
     fn t28_3_array_path_with_task_id() {
-        let mut job = Job::new(100, JobSpec {
-            name: "array_job".into(),
-            user: "test".into(),
-            stdout_path: Some("output_%A_%a.log".into()),
-            ..Default::default()
-        });
+        let mut job = Job::new(
+            100,
+            JobSpec {
+                name: "array_job".into(),
+                user: "test".into(),
+                stdout_path: Some("output_%A_%a.log".into()),
+                ..Default::default()
+            },
+        );
         job.array_job_id = Some(100);
         job.array_task_id = Some(5);
 
@@ -48,12 +57,15 @@ mod tests {
 
     #[test]
     fn t28_4_array_path_without_task_id() {
-        let job = Job::new(42, JobSpec {
-            name: "regular".into(),
-            user: "test".into(),
-            stdout_path: Some("output_%A_%a.log".into()),
-            ..Default::default()
-        });
+        let job = Job::new(
+            42,
+            JobSpec {
+                name: "regular".into(),
+                user: "test".into(),
+                stdout_path: Some("output_%A_%a.log".into()),
+                ..Default::default()
+            },
+        );
         // %A and %a should not be substituted for non-array jobs
         assert_eq!(job.resolved_stdout(), "output_%A_%a.log");
     }
@@ -62,11 +74,14 @@ mod tests {
 
     #[test]
     fn t28_5_array_job_id_tracking() {
-        let mut job = Job::new(200, JobSpec {
-            name: "array".into(),
-            user: "test".into(),
-            ..Default::default()
-        });
+        let mut job = Job::new(
+            200,
+            JobSpec {
+                name: "array".into(),
+                user: "test".into(),
+                ..Default::default()
+            },
+        );
         job.array_job_id = Some(200);
         job.array_task_id = Some(42);
 
@@ -78,19 +93,25 @@ mod tests {
 
     #[test]
     fn t28_6_array_tasks_independent_state() {
-        let mut task1 = Job::new(201, JobSpec {
-            name: "array".into(),
-            user: "test".into(),
-            ..Default::default()
-        });
+        let mut task1 = Job::new(
+            201,
+            JobSpec {
+                name: "array".into(),
+                user: "test".into(),
+                ..Default::default()
+            },
+        );
         task1.array_job_id = Some(200);
         task1.array_task_id = Some(0);
 
-        let mut task2 = Job::new(202, JobSpec {
-            name: "array".into(),
-            user: "test".into(),
-            ..Default::default()
-        });
+        let mut task2 = Job::new(
+            202,
+            JobSpec {
+                name: "array".into(),
+                user: "test".into(),
+                ..Default::default()
+            },
+        );
         task2.array_job_id = Some(200);
         task2.array_task_id = Some(1);
 

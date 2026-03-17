@@ -5,9 +5,9 @@
 
 #[cfg(test)]
 mod tests {
+    use spur_core::resource::*;
     use spur_core::step::*;
     use spur_sched::cons_tres::*;
-    use spur_core::resource::*;
 
     // ── T01.1: Task distribution block ───────────────────────────
 
@@ -81,13 +81,15 @@ mod tests {
 
     #[test]
     fn t01_9_cons_tres_basic_alloc() {
-        let gpus: Vec<GpuResource> = (0..8).map(|i| GpuResource {
-            device_id: i,
-            gpu_type: "mi300x".into(),
-            memory_mb: 192_000,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-        }).collect();
+        let gpus: Vec<GpuResource> = (0..8)
+            .map(|i| GpuResource {
+                device_id: i,
+                gpu_type: "mi300x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+            })
+            .collect();
 
         let resources = ResourceSet {
             cpus: 128,

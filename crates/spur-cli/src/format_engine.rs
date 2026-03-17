@@ -202,7 +202,7 @@ pub fn sinfo_header(spec: char) -> &'static str {
         'n' => "HOSTNAMES",
         'O' => "CPU_LOAD",
         'e' => "FREE_MEM",
-        '#' => "",  // Special: partition name with * for default
+        '#' => "", // Special: partition name with * for default
         _ => "?",
     }
 }

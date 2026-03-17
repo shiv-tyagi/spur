@@ -66,7 +66,12 @@ impl ResourceSet {
             generic: self
                 .generic
                 .iter()
-                .map(|(k, v)| (k.clone(), v.saturating_sub(used.generic.get(k).copied().unwrap_or(0))))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.saturating_sub(used.generic.get(k).copied().unwrap_or(0)),
+                    )
+                })
                 .collect(),
         }
     }

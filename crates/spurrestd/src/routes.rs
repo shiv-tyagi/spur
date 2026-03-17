@@ -225,10 +225,7 @@ struct SubmitJobFields {
 async fn submit_job(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SubmitRequest>,
-) -> Result<
-    Json<ApiResponse<SubmitResponse>>,
-    (StatusCode, Json<ApiResponse<serde_json::Value>>),
-> {
+) -> Result<Json<ApiResponse<SubmitResponse>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
     let mut client = SlurmControllerClient::connect(state.controller_addr.clone())
         .await
         .map_err(|e| error_response(&format!("connection failed: {}", e)))?;
@@ -344,10 +341,7 @@ async fn get_node(
 
 async fn get_partitions(
     State(state): State<Arc<AppState>>,
-) -> Result<
-    Json<ApiResponse<PartitionsData>>,
-    (StatusCode, Json<ApiResponse<serde_json::Value>>),
-> {
+) -> Result<Json<ApiResponse<PartitionsData>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
     let mut client = SlurmControllerClient::connect(state.controller_addr.clone())
         .await
         .map_err(|e| error_response(&format!("connection failed: {}", e)))?;

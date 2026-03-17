@@ -268,22 +268,12 @@ impl Job {
 
     /// Resolve stdout path, substituting %j/%N patterns.
     pub fn resolved_stdout(&self) -> String {
-        self.resolve_path(
-            self.spec
-                .stdout_path
-                .as_deref()
-                .unwrap_or("spur-%j.out"),
-        )
+        self.resolve_path(self.spec.stdout_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
     /// Resolve stderr path.
     pub fn resolved_stderr(&self) -> String {
-        self.resolve_path(
-            self.spec
-                .stderr_path
-                .as_deref()
-                .unwrap_or("spur-%j.out"),
-        )
+        self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
     fn resolve_path(&self, pattern: &str) -> String {
@@ -293,10 +283,7 @@ impl Job {
         result = result.replace("%x", &self.spec.name);
         if let Some(tid) = self.array_task_id {
             result = result.replace("%a", &tid.to_string());
-            result = result.replace(
-                "%A",
-                &self.array_job_id.unwrap_or(self.job_id).to_string(),
-            );
+            result = result.replace("%A", &self.array_job_id.unwrap_or(self.job_id).to_string());
         }
         if let Some(node) = self.allocated_nodes.first() {
             result = result.replace("%N", node);

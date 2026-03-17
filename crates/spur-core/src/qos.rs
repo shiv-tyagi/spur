@@ -101,14 +101,17 @@ mod tests {
     }
 
     fn make_test_job() -> Job {
-        Job::new(1, JobSpec {
-            name: "test".into(),
-            user: "alice".into(),
-            num_tasks: 4,
-            cpus_per_task: 1,
-            time_limit: Some(chrono::Duration::hours(2)),
-            ..Default::default()
-        })
+        Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                num_tasks: 4,
+                cpus_per_task: 1,
+                time_limit: Some(chrono::Duration::hours(2)),
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
@@ -124,7 +127,10 @@ mod tests {
         let qos = make_qos(Some(5), None);
         let job = make_test_job();
         let result = check_qos_limits(&job, &qos, 5, 5, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser));
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser)
+        );
     }
 
     #[test]
@@ -140,7 +146,10 @@ mod tests {
         let qos = make_qos(None, Some(60)); // 1 hour max
         let job = make_test_job(); // 2 hour job
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::PartitionTimeLimit));
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::PartitionTimeLimit)
+        );
     }
 
     #[test]
@@ -162,16 +171,25 @@ mod tests {
 
     #[test]
     fn test_qos_priority_adjustment() {
-        let qos = Qos { priority: 500, ..Default::default() };
+        let qos = Qos {
+            priority: 500,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1500);
 
-        let qos_neg = Qos { priority: -200, ..Default::default() };
+        let qos_neg = Qos {
+            priority: -200,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(1000, &qos_neg), 800);
     }
 
     #[test]
     fn test_qos_priority_floor() {
-        let qos = Qos { priority: -2000, ..Default::default() };
+        let qos = Qos {
+            priority: -2000,
+            ..Default::default()
+        };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1); // Floor at 1
     }
 }

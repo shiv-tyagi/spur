@@ -76,7 +76,10 @@ fn resolve_hostname(hostname: &str) -> String {
             if let Some(addr) = addrs.next() {
                 addr.ip().to_string()
             } else {
-                warn!(hostname, "hostname resolved to no addresses, using 127.0.0.1");
+                warn!(
+                    hostname,
+                    "hostname resolved to no addresses, using 127.0.0.1"
+                );
                 "127.0.0.1".to_string()
             }
         }

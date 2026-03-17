@@ -7,11 +7,11 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TresType {
     Cpu,
-    Memory,    // MB
-    Energy,    // Joules
+    Memory, // MB
+    Energy, // Joules
     Node,
     Gpu,
-    Billing,   // Weighted composite
+    Billing, // Weighted composite
 }
 
 impl TresType {
@@ -47,7 +47,9 @@ pub struct TresRecord {
 
 impl TresRecord {
     pub fn new() -> Self {
-        Self { values: HashMap::new() }
+        Self {
+            values: HashMap::new(),
+        }
     }
 
     pub fn set(&mut self, tres: TresType, value: u64) {
@@ -66,7 +68,9 @@ impl TresRecord {
 
     /// Format as "cpu=N,mem=N,gres/gpu=N" string.
     pub fn format(&self) -> String {
-        let mut parts: Vec<String> = self.values.iter()
+        let mut parts: Vec<String> = self
+            .values
+            .iter()
             .filter(|(_, v)| **v > 0)
             .map(|(k, v)| format!("{}={}", k.name(), v))
             .collect();
@@ -80,7 +84,9 @@ impl TresRecord {
         for part in s.split(',') {
             let part = part.trim();
             if let Some((key, val)) = part.split_once('=') {
-                if let (Some(tres), Ok(v)) = (TresType::from_name(key.trim()), val.trim().parse::<u64>()) {
+                if let (Some(tres), Ok(v)) =
+                    (TresType::from_name(key.trim()), val.trim().parse::<u64>())
+                {
                     rec.set(tres, v);
                 }
             }

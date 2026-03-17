@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::{JobSpec as ProtoJobSpec, LaunchJobRequest, ResourceSet as ProtoResourceSet};
+use spur_proto::proto::{
+    JobSpec as ProtoJobSpec, LaunchJobRequest, ResourceSet as ProtoResourceSet,
+};
 use spur_sched::backfill::BackfillScheduler;
 use spur_sched::traits::{ClusterState, Scheduler};
 
@@ -51,7 +53,8 @@ pub async fn run(cluster: Arc<ClusterManager>) {
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
         if assignments.len() < pending.len() {
-            let unscheduled: Vec<_> = pending.iter()
+            let unscheduled: Vec<_> = pending
+                .iter()
                 .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
                 .collect();
 
@@ -74,17 +77,14 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
             let resources = spur_core::resource::ResourceSet {
                 cpus: per_node_cpus * assignment.nodes.len() as u32,
-                memory_mb: job.spec.memory_per_node_mb.unwrap_or(0)
-                    * assignment.nodes.len() as u64,
+                memory_mb: job.spec.memory_per_node_mb.unwrap_or(0) * assignment.nodes.len() as u64,
                 ..Default::default()
             };
 
             // Transition job to Running
-            if let Err(e) = cluster.start_job(
-                assignment.job_id,
-                assignment.nodes.clone(),
-                resources,
-            ) {
+            if let Err(e) =
+                cluster.start_job(assignment.job_id, assignment.nodes.clone(), resources)
+            {
                 debug!(
                     job_id = assignment.job_id,
                     error = %e,
@@ -102,9 +102,9 @@ pub async fn run(cluster: Arc<ClusterManager>) {
             let peer_addrs: Vec<String> = all_nodes
                 .iter()
                 .filter_map(|name| {
-                    cluster.get_node(name).and_then(|n| {
-                        n.address.as_ref().map(|a| format!("{}:{}", a, n.port))
-                    })
+                    cluster
+                        .get_node(name)
+                        .and_then(|n| n.address.as_ref().map(|a| format!("{}:{}", a, n.port)))
                 })
                 .collect();
 
@@ -117,9 +117,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
             for (node_idx, node_name) in all_nodes.iter().enumerate() {
                 let node_info = cluster.get_node(node_name);
                 let (addr, port) = match node_info {
-                    Some(ref n) if n.address.is_some() => {
-                        (n.address.clone().unwrap(), n.port)
-                    }
+                    Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
                     _ => {
                         warn!(
                             job_id,
@@ -136,14 +134,9 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let task_offset = node_idx as u32 * tasks_per_node;
 
                 tokio::spawn(async move {
-                    if let Err(e) = dispatch_to_agent(
-                        &agent_addr,
-                        job_id,
-                        &spec,
-                        &peer_addrs,
-                        task_offset,
-                    )
-                    .await
+                    if let Err(e) =
+                        dispatch_to_agent(&agent_addr, job_id, &spec, &peer_addrs, task_offset)
+                            .await
                     {
                         error!(
                             job_id,
@@ -159,21 +152,12 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 }
 
 /// Try to preempt lower-priority running jobs to make room for higher-priority pending jobs.
-fn try_preempt(
-    cluster: &Arc<ClusterManager>,
-    unscheduled: &[&spur_core::job::Job],
-) {
+fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Job]) {
     use spur_core::job::JobState;
 
     // Get running jobs sorted by priority (lowest first = best preemption candidates)
     let mut running: Vec<spur_core::job::Job> = cluster
-        .get_jobs(
-            &[JobState::Running],
-            None,
-            None,
-            None,
-            &[],
-        )
+        .get_jobs(&[JobState::Running], None, None, None, &[])
         .into_iter()
         .collect();
     running.sort_by_key(|j| j.priority);
@@ -190,11 +174,7 @@ fn try_preempt(
                     pending_priority = pending.priority,
                     "preempting lower-priority job"
                 );
-                if let Err(e) = cluster.complete_job(
-                    candidate.job_id,
-                    -1,
-                    JobState::Preempted,
-                ) {
+                if let Err(e) = cluster.complete_job(candidate.job_id, -1, JobState::Preempted) {
                     warn!(
                         job_id = candidate.job_id,
                         error = %e,

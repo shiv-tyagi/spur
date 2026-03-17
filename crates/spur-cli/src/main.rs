@@ -13,9 +13,7 @@ use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     // Multi-call binary: dispatch based on argv[0] (symlink name).
-    let argv0 = std::env::args()
-        .next()
-        .unwrap_or_else(|| "spur".into());
+    let argv0 = std::env::args().next().unwrap_or_else(|| "spur".into());
     let bin_name = Path::new(&argv0)
         .file_name()
         .and_then(|s| s.to_str())

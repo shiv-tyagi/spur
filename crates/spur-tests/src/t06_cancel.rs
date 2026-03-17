@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 mod tests {
-    use spur_core::job::*;
     use crate::harness::*;
+    use spur_core::job::*;
 
     // ── T06.1: Cancel pending job ────────────────────────────────
 
@@ -44,12 +44,15 @@ mod tests {
 
     #[test]
     fn t06_4_hold_job() {
-        let job = Job::new(1, JobSpec {
-            name: "held".into(),
-            user: "test".into(),
-            hold: true,
-            ..Default::default()
-        });
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "held".into(),
+                user: "test".into(),
+                hold: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.pending_reason, PendingReason::Held);
     }
@@ -65,7 +68,8 @@ mod tests {
         let normal = make_job("normal");
 
         let jobs = vec![held.clone(), normal.clone()];
-        let schedulable: Vec<_> = jobs.iter()
+        let schedulable: Vec<_> = jobs
+            .iter()
             .filter(|j| j.state == JobState::Pending && j.pending_reason != PendingReason::Held)
             .collect();
         assert_eq!(schedulable.len(), 1);

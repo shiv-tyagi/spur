@@ -9,7 +9,11 @@ use tracing::info;
 #[command(name = "spurdbd", about = "Spur accounting daemon (spurdbd)")]
 struct Args {
     /// Database URL
-    #[arg(long, env = "DATABASE_URL", default_value = "postgresql://spur:spur@localhost/spur")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "postgresql://spur:spur@localhost/spur"
+    )]
     database_url: String,
 
     /// gRPC listen address

@@ -69,10 +69,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
 
-    async fn get_job(
-        &self,
-        request: Request<GetJobRequest>,
-    ) -> Result<Response<JobInfo>, Status> {
+    async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
         let job_id = request.into_inner().job_id;
         let job = self
             .cluster
@@ -82,10 +79,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(job_to_proto(&job)))
     }
 
-    async fn cancel_job(
-        &self,
-        request: Request<CancelJobRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         self.cluster
             .cancel_job(req.job_id, &req.user)
@@ -93,19 +87,18 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
-    async fn update_job(
-        &self,
-        request: Request<UpdateJobRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
 
         // Handle hold/release via priority
         if let Some(hold) = req.hold {
             if hold {
-                self.cluster.hold_job(req.job_id)
+                self.cluster
+                    .hold_job(req.job_id)
                     .map_err(|e| Status::internal(e.to_string()))?;
             } else {
-                self.cluster.release_job(req.job_id)
+                self.cluster
+                    .release_job(req.job_id)
                     .map_err(|e| Status::internal(e.to_string()))?;
             }
             return Ok(Response::new(()));
@@ -113,13 +106,15 @@ impl SlurmController for ControllerService {
 
         let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
 
-        self.cluster.update_job(
-            req.job_id,
-            time_limit,
-            req.priority,
-            req.partition,
-            req.comment,
-        ).map_err(|e| Status::internal(e.to_string()))?;
+        self.cluster
+            .update_job(
+                req.job_id,
+                time_limit,
+                req.priority,
+                req.partition,
+                req.comment,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(()))
     }
@@ -167,15 +162,10 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<GetPartitionsResponse>, Status> {
         let partitions = self.cluster.get_partitions();
         let proto: Vec<PartitionInfo> = partitions.iter().map(partition_to_proto).collect();
-        Ok(Response::new(GetPartitionsResponse {
-            partitions: proto,
-        }))
+        Ok(Response::new(GetPartitionsResponse { partitions: proto }))
     }
 
-    async fn ping(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
         let hostname: String = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".into());
@@ -192,7 +182,8 @@ impl SlurmController for ControllerService {
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
         // Extract the remote IP from the gRPC connection as fallback
-        let remote_addr = request.remote_addr()
+        let remote_addr = request
+            .remote_addr()
             .map(|a| {
                 let ip = a.ip();
                 match ip {
@@ -209,19 +200,15 @@ impl SlurmController for ControllerService {
             .unwrap_or_default();
 
         let req = request.into_inner();
-        let resources = req
-            .resources
-            .map(proto_to_resource_set)
-            .unwrap_or_default();
+        let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
         // Prefer agent's self-reported address (e.g. WireGuard IP),
         // fall back to remote TCP address
         let agent_addr = if !req.address.is_empty() {
             req.address.clone()
         } else {
-            let is_loopback = remote_addr.is_empty()
-                || remote_addr == "127.0.0.1"
-                || remote_addr == "::1";
+            let is_loopback =
+                remote_addr.is_empty() || remote_addr == "127.0.0.1" || remote_addr == "::1";
             if is_loopback {
                 "127.0.0.1".to_string()
             } else {
@@ -332,12 +319,10 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.stderr_path)
         },
         environment: spec.environment,
-        time_limit: spec.time_limit.map(|d| {
-            chrono::Duration::seconds(d.seconds)
-        }),
-        time_min: spec.time_min.map(|d| {
-            chrono::Duration::seconds(d.seconds)
-        }),
+        time_limit: spec
+            .time_limit
+            .map(|d| chrono::Duration::seconds(d.seconds)),
+        time_min: spec.time_min.map(|d| chrono::Duration::seconds(d.seconds)),
         qos: if spec.qos.is_empty() {
             None
         } else {

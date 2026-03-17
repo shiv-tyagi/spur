@@ -58,9 +58,8 @@ mod tests {
     #[test]
     fn test_fair_share_heavy_usage() {
         let now = Utc::now();
-        let records: Vec<(DateTime<Utc>, f64)> = (0..14)
-            .map(|d| (now - Duration::days(d), 100.0))
-            .collect();
+        let records: Vec<(DateTime<Utc>, f64)> =
+            (0..14).map(|d| (now - Duration::days(d), 100.0)).collect();
 
         let factor = fair_share_factor(1.0, &records, 14, now);
         // Heavy recent usage → low factor

@@ -46,7 +46,11 @@ pub struct SqueueArgs {
     pub sort: Option<String>,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     pub controller: String,
 }
 
@@ -236,8 +240,8 @@ fn format_duration_hms(total_seconds: i64) -> String {
 fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
     match ts {
         Some(t) if t.seconds > 0 => {
-            let dt = chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32)
-                .unwrap_or_default();
+            let dt =
+                chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default();
             dt.format("%Y-%m-%dT%H:%M:%S").to_string()
         }
         _ => "N/A".into(),

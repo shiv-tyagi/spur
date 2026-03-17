@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 mod tests {
-    use spur_core::job::*;
     use crate::harness::*;
+    use spur_core::job::*;
 
     // ── T05.1: Job state classification ──────────────────────────
 
@@ -44,12 +44,14 @@ mod tests {
         ];
         jobs[2].transition(JobState::Running).unwrap();
 
-        let pending: Vec<_> = jobs.iter()
+        let pending: Vec<_> = jobs
+            .iter()
             .filter(|j| j.state == JobState::Pending)
             .collect();
         assert_eq!(pending.len(), 2);
 
-        let running: Vec<_> = jobs.iter()
+        let running: Vec<_> = jobs
+            .iter()
             .filter(|j| j.state == JobState::Running)
             .collect();
         assert_eq!(running.len(), 1);
@@ -66,9 +68,7 @@ mod tests {
         j3.spec.user = "alice".into();
 
         let jobs = vec![j1, j2, j3];
-        let alice_jobs: Vec<_> = jobs.iter()
-            .filter(|j| j.spec.user == "alice")
-            .collect();
+        let alice_jobs: Vec<_> = jobs.iter().filter(|j| j.spec.user == "alice").collect();
         assert_eq!(alice_jobs.len(), 2);
     }
 
@@ -83,7 +83,8 @@ mod tests {
         j3.spec.partition = Some("gpu".into());
 
         let jobs = vec![j1, j2, j3];
-        let gpu_jobs: Vec<_> = jobs.iter()
+        let gpu_jobs: Vec<_> = jobs
+            .iter()
             .filter(|j| j.spec.partition.as_deref() == Some("gpu"))
             .collect();
         assert_eq!(gpu_jobs.len(), 2);

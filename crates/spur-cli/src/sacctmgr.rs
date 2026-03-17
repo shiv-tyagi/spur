@@ -9,7 +9,12 @@ pub struct SacctmgrArgs {
     pub command: SacctmgrCommand,
 
     /// Accounting daemon address
-    #[arg(long, env = "SPUR_ACCOUNTING_ADDR", default_value = "http://localhost:6819", global = true)]
+    #[arg(
+        long,
+        env = "SPUR_ACCOUNTING_ADDR",
+        default_value = "http://localhost:6819",
+        global = true
+    )]
     pub accounting: String,
 
     /// Immediate mode (no confirmation)
@@ -98,7 +103,9 @@ async fn add(entity: &str, params: &[String]) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" => {
-            let name = p.get("name").or_else(|| p.get("account"))
+            let name = p
+                .get("name")
+                .or_else(|| p.get("account"))
                 .ok_or_else(|| anyhow::anyhow!("name= required"))?;
             let desc = p.get("description").cloned().unwrap_or_default();
             let org = p.get("organization").cloned().unwrap_or_default();
@@ -115,11 +122,18 @@ async fn add(entity: &str, params: &[String]) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let name = p.get("name").or_else(|| p.get("user"))
+            let name = p
+                .get("name")
+                .or_else(|| p.get("user"))
                 .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-            let account = p.get("account").or_else(|| p.get("defaultaccount"))
+            let account = p
+                .get("account")
+                .or_else(|| p.get("defaultaccount"))
                 .ok_or_else(|| anyhow::anyhow!("account= required"))?;
-            let admin = p.get("adminlevel").cloned().unwrap_or_else(|| "none".into());
+            let admin = p
+                .get("adminlevel")
+                .cloned()
+                .unwrap_or_else(|| "none".into());
 
             println!(
                 " Adding User(s)\n  Name       = {}\n  Account    = {}\n  Admin      = {}",
@@ -129,10 +143,15 @@ async fn add(entity: &str, params: &[String]) -> Result<()> {
             Ok(())
         }
         "qos" => {
-            let name = p.get("name").or_else(|| p.get("qos"))
+            let name = p
+                .get("name")
+                .or_else(|| p.get("qos"))
                 .ok_or_else(|| anyhow::anyhow!("name= required"))?;
             let priority: i32 = p.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let preempt = p.get("preemptmode").cloned().unwrap_or_else(|| "off".into());
+            let preempt = p
+                .get("preemptmode")
+                .cloned()
+                .unwrap_or_else(|| "off".into());
             let max_wall = p.get("maxwall").cloned();
             let max_jobs = p.get("maxjobsperuser").and_then(|v| v.parse::<u32>().ok());
 
@@ -149,14 +168,21 @@ async fn add(entity: &str, params: &[String]) -> Result<()> {
             println!(" QOS added.");
             Ok(())
         }
-        other => bail!("sacctmgr: unknown entity type '{}'. Use: account, user, qos", other),
+        other => bail!(
+            "sacctmgr: unknown entity type '{}'. Use: account, user, qos",
+            other
+        ),
     }
 }
 
 async fn delete(entity: &str, params: &[String]) -> Result<()> {
     let p = parse_params(params);
 
-    let name = p.get("name").or_else(|| p.get("account")).or_else(|| p.get("user")).or_else(|| p.get("qos"))
+    let name = p
+        .get("name")
+        .or_else(|| p.get("account"))
+        .or_else(|| p.get("user"))
+        .or_else(|| p.get("qos"))
         .ok_or_else(|| anyhow::anyhow!("name= required"))?;
 
     match entity.to_lowercase().as_str() {
@@ -188,34 +214,45 @@ async fn modify(entity: &str, params: &[String]) -> Result<()> {
 async fn show(entity: &str, _params: &[String]) -> Result<()> {
     match entity.to_lowercase().as_str() {
         "account" | "accounts" => {
-            println!("{:<20} {:<30} {:<15} {:<10} {:<10}",
-                "Account", "Descr", "Org", "Parent", "Share");
+            println!(
+                "{:<20} {:<30} {:<15} {:<10} {:<10}",
+                "Account", "Descr", "Org", "Parent", "Share"
+            );
             println!("{}", "-".repeat(85));
             // Would query accounting DB here
-            println!("{:<20} {:<30} {:<15} {:<10} {:<10}",
-                "(no accounts configured — use 'sacctmgr add account')", "", "", "", "");
+            println!(
+                "{:<20} {:<30} {:<15} {:<10} {:<10}",
+                "(no accounts configured — use 'sacctmgr add account')", "", "", "", ""
+            );
         }
         "user" | "users" => {
-            println!("{:<15} {:<20} {:<10} {:<20}",
-                "User", "Account", "Admin", "Default Acct");
+            println!(
+                "{:<15} {:<20} {:<10} {:<20}",
+                "User", "Account", "Admin", "Default Acct"
+            );
             println!("{}", "-".repeat(65));
         }
         "qos" => {
-            println!("{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                "Name", "Prio", "Preempt", "UsageFactor", "MaxJobsPU", "MaxWall");
+            println!(
+                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
+                "Name", "Prio", "Preempt", "UsageFactor", "MaxJobsPU", "MaxWall"
+            );
             println!("{}", "-".repeat(65));
             // Default "normal" QOS
-            println!("{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                "normal", "0", "off", "1.0", "", "");
+            println!(
+                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
+                "normal", "0", "off", "1.0", "", ""
+            );
         }
         "association" | "associations" => {
-            println!("{:<15} {:<20} {:<15} {:<10} {:<10}",
-                "User", "Account", "Partition", "Share", "Default");
+            println!(
+                "{:<15} {:<20} {:<15} {:<10} {:<10}",
+                "User", "Account", "Partition", "Share", "Default"
+            );
             println!("{}", "-".repeat(70));
         }
         "tres" => {
-            println!("{:<5} {:<15} {:<10}",
-                "ID", "Type", "Name");
+            println!("{:<5} {:<15} {:<10}", "ID", "Type", "Name");
             println!("{}", "-".repeat(30));
             println!("{:<5} {:<15} {:<10}", "1", "cpu", "");
             println!("{:<5} {:<15} {:<10}", "2", "mem", "");
@@ -224,7 +261,10 @@ async fn show(entity: &str, _params: &[String]) -> Result<()> {
             println!("{:<5} {:<15} {:<10}", "1001", "gres/gpu", "");
             println!("{:<5} {:<15} {:<10}", "1002", "billing", "");
         }
-        other => bail!("sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres", other),
+        other => bail!(
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
+            other
+        ),
     }
     Ok(())
 }

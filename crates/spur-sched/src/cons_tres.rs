@@ -45,7 +45,8 @@ impl NodeAllocation {
 
     /// Available memory.
     pub fn free_memory_mb(&self) -> u64 {
-        self.total_memory_mb.saturating_sub(self.allocated_memory_mb)
+        self.total_memory_mb
+            .saturating_sub(self.allocated_memory_mb)
     }
 
     /// Available GPU count (optionally filtered by type).
@@ -58,7 +59,9 @@ impl NodeAllocation {
                     return false;
                 }
                 if let Some(gtype) = gpu_type {
-                    if gtype != "any" && self.gpus.get(*i).map(|g| g.gpu_type.as_str()) != Some(gtype) {
+                    if gtype != "any"
+                        && self.gpus.get(*i).map(|g| g.gpu_type.as_str()) != Some(gtype)
+                    {
                         return false;
                     }
                 }
@@ -258,7 +261,11 @@ mod tests {
         assert_eq!(node.free_gpus(None), 4);
 
         // CPU IDs should not overlap
-        let overlap: Vec<_> = a1.cpu_ids.iter().filter(|id| a2.cpu_ids.contains(id)).collect();
+        let overlap: Vec<_> = a1
+            .cpu_ids
+            .iter()
+            .filter(|id| a2.cpu_ids.contains(id))
+            .collect();
         assert!(overlap.is_empty());
     }
 

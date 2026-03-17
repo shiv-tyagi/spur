@@ -341,12 +341,7 @@ impl ClusterManager {
     }
 
     /// Update node heartbeat data.
-    pub fn update_heartbeat(
-        &self,
-        name: &str,
-        cpu_load: u32,
-        free_memory_mb: u64,
-    ) {
+    pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) {
         let mut nodes = self.nodes.write();
         if let Some(node) = nodes.get_mut(name) {
             node.cpu_load = cpu_load;
@@ -377,7 +372,11 @@ impl ClusterManager {
             .get_mut(&job_id)
             .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
         if job.state != JobState::Pending {
-            anyhow::bail!("can only hold pending jobs (job {} is {:?})", job_id, job.state);
+            anyhow::bail!(
+                "can only hold pending jobs (job {} is {:?})",
+                job_id,
+                job.state
+            );
         }
         job.pending_reason = PendingReason::Held;
         job.priority = 0;
@@ -511,9 +510,7 @@ impl ClusterManager {
             .collect();
 
         // Check dependencies
-        let get_job = |id: JobId| -> Option<Job> {
-            jobs.get(&id).cloned()
-        };
+        let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
         let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
             jobs.values()
                 .filter(|j| j.spec.name == name && j.spec.user == user)
@@ -616,9 +613,7 @@ fn replay_entry(
             *next_id = (*next_id).max(job_id + 1);
         }
         WalOperation::JobStateChange {
-            job_id,
-            new_state,
-            ..
+            job_id, new_state, ..
         } => {
             if let Some(job) = jobs.get_mut(job_id) {
                 let _ = job.transition(*new_state);
@@ -636,9 +631,7 @@ fn replay_entry(
             }
         }
         WalOperation::JobComplete {
-            job_id,
-            exit_code,
-            ..
+            job_id, exit_code, ..
         } => {
             if let Some(job) = jobs.get_mut(job_id) {
                 job.exit_code = Some(*exit_code);
@@ -675,7 +668,11 @@ fn replay_entry(
                 node.state_reason = reason.clone();
             }
         }
-        WalOperation::NodeHeartbeat { name, cpu_load, free_memory_mb } => {
+        WalOperation::NodeHeartbeat {
+            name,
+            cpu_load,
+            free_memory_mb,
+        } => {
             if let Some(node) = nodes.get_mut(name) {
                 node.cpu_load = *cpu_load;
                 node.free_memory_mb = *free_memory_mb;

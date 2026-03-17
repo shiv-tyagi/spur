@@ -125,10 +125,7 @@ pub extern "C" fn slurm_load_jobs(
             .await
             .ok()?;
 
-        let resp = client
-            .get_jobs(GetJobsRequest::default())
-            .await
-            .ok()?;
+        let resp = client.get_jobs(GetJobsRequest::default()).await.ok()?;
 
         Some(resp.into_inner().jobs)
     });
@@ -204,10 +201,7 @@ pub extern "C" fn slurm_load_node(
             .await
             .ok()?;
 
-        let resp = client
-            .get_nodes(GetNodesRequest::default())
-            .await
-            .ok()?;
+        let resp = client.get_nodes(GetNodesRequest::default()).await.ok()?;
 
         Some(resp.into_inner().nodes)
     });
@@ -221,11 +215,7 @@ pub extern "C" fn slurm_load_node(
                     name: string_to_c_str(&n.name),
                     node_state: n.state as u32,
                     cpus: n.total_resources.as_ref().map(|r| r.cpus).unwrap_or(0),
-                    real_memory: n
-                        .total_resources
-                        .as_ref()
-                        .map(|r| r.memory_mb)
-                        .unwrap_or(0),
+                    real_memory: n.total_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0),
                     reason: string_to_c_str(&n.state_reason),
                 })
                 .collect();
@@ -338,21 +328,21 @@ use std::sync::Mutex;
 static LAST_ERRNO: Mutex<c_int> = Mutex::new(0);
 
 static ERROR_STRINGS: &[&str] = &[
-    "Success",                          // 0
-    "Unspecified error",                // -1
-    "Invalid job id",                   // -2
-    "Invalid job id specified",         // -3
-    "Invalid node name specified",      // -4
-    "Invalid partition name specified", // -5
-    "Job already completed",            // -6
-    "Job already completing",           // -7
-    "Communication failure",            // -8
-    "Out of memory",                    // -9
-    "Permission denied",                // -10
-    "Node not available",               // -11
-    "Already done",                     // -12
-    "Requested node config unavailable",// -13
-    "Job pending",                      // -14
+    "Success",                           // 0
+    "Unspecified error",                 // -1
+    "Invalid job id",                    // -2
+    "Invalid job id specified",          // -3
+    "Invalid node name specified",       // -4
+    "Invalid partition name specified",  // -5
+    "Job already completed",             // -6
+    "Job already completing",            // -7
+    "Communication failure",             // -8
+    "Out of memory",                     // -9
+    "Permission denied",                 // -10
+    "Node not available",                // -11
+    "Already done",                      // -12
+    "Requested node config unavailable", // -13
+    "Job pending",                       // -14
 ];
 
 /// Get a human-readable error string for a Slurm error code.
@@ -386,7 +376,13 @@ pub extern "C" fn slurm_seterrno(errnum: c_int) {
 pub extern "C" fn slurm_perror(msg: *const c_char) {
     let prefix = c_str_to_string(msg);
     let errno = slurm_get_errno();
-    let idx = if errno == 0 { 0 } else if errno < 0 && (-errno as usize) < ERROR_STRINGS.len() { (-errno) as usize } else { 1 };
+    let idx = if errno == 0 {
+        0
+    } else if errno < 0 && (-errno as usize) < ERROR_STRINGS.len() {
+        (-errno) as usize
+    } else {
+        1
+    };
     eprintln!("{}: {}", prefix, ERROR_STRINGS[idx]);
 }
 
@@ -398,11 +394,7 @@ fn c_str_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    unsafe {
-        CStr::from_ptr(ptr)
-            .to_string_lossy()
-            .into_owned()
-    }
+    unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
 }
 
 fn string_to_c_str(s: &str) -> *mut c_char {

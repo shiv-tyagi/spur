@@ -89,7 +89,7 @@ impl AddressPool {
     pub fn allocate(&mut self) -> Result<Ipv4Addr, AddressError> {
         let host_bits = 32 - self.prefix_len;
         let max_host = (1u32 << host_bits) - 1; // broadcast
-        // Start from .1 (skip .0 network)
+                                                // Start from .1 (skip .0 network)
         for offset in 1..max_host {
             let candidate = self.base + offset;
             if !self.allocated.contains(&candidate) {

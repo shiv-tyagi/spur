@@ -5,11 +5,11 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::*;
     use spur_core::job::*;
     use spur_core::node::*;
     use spur_core::partition::*;
     use spur_core::resource::*;
-    use crate::harness::*;
 
     // ── T50.1: Job state machine ──────────────────────────────────
 
@@ -197,7 +197,11 @@ mod tests {
     fn t50_21_node_state_from_alloc() {
         let mut node = Node::new(
             "node001".into(),
-            ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
         );
         node.state = NodeState::Idle;
         node.update_state_from_alloc();
@@ -216,7 +220,10 @@ mod tests {
     fn t50_22_node_admin_state_not_overridden() {
         let mut node = Node::new(
             "node001".into(),
-            ResourceSet { cpus: 64, ..Default::default() },
+            ResourceSet {
+                cpus: 64,
+                ..Default::default()
+            },
         );
         node.state = NodeState::Drain;
         node.alloc_resources.cpus = 0;
@@ -238,29 +245,61 @@ mod tests {
 
     #[test]
     fn t50_24_resource_can_satisfy() {
-        let avail = ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() };
-        let req = ResourceSet { cpus: 32, memory_mb: 128_000, ..Default::default() };
+        let avail = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        let req = ResourceSet {
+            cpus: 32,
+            memory_mb: 128_000,
+            ..Default::default()
+        };
         assert!(avail.can_satisfy(&req));
     }
 
     #[test]
     fn t50_25_resource_cannot_satisfy_cpu() {
-        let avail = ResourceSet { cpus: 32, memory_mb: 256_000, ..Default::default() };
-        let req = ResourceSet { cpus: 64, memory_mb: 128_000, ..Default::default() };
+        let avail = ResourceSet {
+            cpus: 32,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        let req = ResourceSet {
+            cpus: 64,
+            memory_mb: 128_000,
+            ..Default::default()
+        };
         assert!(!avail.can_satisfy(&req));
     }
 
     #[test]
     fn t50_26_resource_cannot_satisfy_memory() {
-        let avail = ResourceSet { cpus: 64, memory_mb: 100_000, ..Default::default() };
-        let req = ResourceSet { cpus: 32, memory_mb: 200_000, ..Default::default() };
+        let avail = ResourceSet {
+            cpus: 64,
+            memory_mb: 100_000,
+            ..Default::default()
+        };
+        let req = ResourceSet {
+            cpus: 32,
+            memory_mb: 200_000,
+            ..Default::default()
+        };
         assert!(!avail.can_satisfy(&req));
     }
 
     #[test]
     fn t50_27_resource_subtract() {
-        let total = ResourceSet { cpus: 64, memory_mb: 256_000, ..Default::default() };
-        let used = ResourceSet { cpus: 24, memory_mb: 100_000, ..Default::default() };
+        let total = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        let used = ResourceSet {
+            cpus: 24,
+            memory_mb: 100_000,
+            ..Default::default()
+        };
         let avail = total.subtract(&used);
         assert_eq!(avail.cpus, 40);
         assert_eq!(avail.memory_mb, 156_000);

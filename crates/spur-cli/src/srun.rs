@@ -65,7 +65,11 @@ pub struct SrunArgs {
     pub label: bool,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     pub controller: String,
 
     /// Command and arguments
@@ -81,16 +85,11 @@ pub async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let name = args
-        .job_name
-        .unwrap_or_else(|| args.command[0].clone());
+    let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
 
-    let work_dir = args.chdir.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap()
-            .to_string_lossy()
-            .into()
-    });
+    let work_dir = args
+        .chdir
+        .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
 
     // Build a wrapper script from the command
     let cmd_line = args.command.join(" ");
@@ -120,7 +119,12 @@ pub async fn main() -> Result<()> {
         environment.insert("SPUR_GPU_BIND".into(), gpu_bind.clone());
     }
 
-    let memory_mb = args.mem.as_ref().map(|m| parse_memory_mb(m)).transpose()?.unwrap_or(0);
+    let memory_mb = args
+        .mem
+        .as_ref()
+        .map(|m| parse_memory_mb(m))
+        .transpose()?
+        .unwrap_or(0);
 
     // Submit as a batch job
     let mut client = SlurmControllerClient::connect(args.controller.clone())
@@ -163,9 +167,7 @@ pub async fn main() -> Result<()> {
     loop {
         poll_interval.tick().await;
 
-        let resp = client
-            .get_job(GetJobRequest { job_id })
-            .await;
+        let resp = client.get_job(GetJobRequest { job_id }).await;
 
         match resp {
             Ok(resp) => {
@@ -191,7 +193,10 @@ pub async fn main() -> Result<()> {
                     4 => {
                         // FAILED
                         print_job_output(&work_dir, job_id).await;
-                        eprintln!("srun: job {} failed with exit code {}", job_id, job.exit_code);
+                        eprintln!(
+                            "srun: job {} failed with exit code {}",
+                            job_id, job.exit_code
+                        );
                         std::process::exit(job.exit_code.max(1));
                     }
                     5 => {

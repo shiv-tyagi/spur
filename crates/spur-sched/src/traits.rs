@@ -21,11 +21,7 @@ pub trait Scheduler: Send + Sync {
     ///
     /// Jobs are provided sorted by priority (highest first).
     /// The scheduler should return assignments for jobs it can schedule now.
-    fn schedule(
-        &mut self,
-        pending: &[Job],
-        cluster: &ClusterState,
-    ) -> Vec<Assignment>;
+    fn schedule(&mut self, pending: &[Job], cluster: &ClusterState) -> Vec<Assignment>;
 
     /// Name of this scheduler plugin.
     fn name(&self) -> &str;

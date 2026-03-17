@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use spur_net::wireguard::{self, WgConfig, WgPeer};
 use spur_net::address::AddressPool;
+use spur_net::wireguard::{self, WgConfig, WgPeer};
 
 /// Network mesh management.
 #[derive(Parser, Debug)]
@@ -101,7 +101,14 @@ pub async fn main() -> Result<()> {
             prefix_len,
             interface,
             config_dir,
-        } => cmd_join(&endpoint, &server_key, &address, prefix_len, &interface, &config_dir),
+        } => cmd_join(
+            &endpoint,
+            &server_key,
+            &address,
+            prefix_len,
+            &interface,
+            &config_dir,
+        ),
         NetCommand::Status { interface } => cmd_status(&interface),
         NetCommand::AddPeer {
             key,
@@ -116,8 +123,7 @@ fn cmd_init(cidr: &str, interface: &str, port: u16, config_dir: &Path) -> Result
     eprintln!("Initializing WireGuard mesh...");
 
     // Generate keypair
-    let keypair = wireguard::generate_keypair()
-        .context("failed to generate WireGuard keypair")?;
+    let keypair = wireguard::generate_keypair().context("failed to generate WireGuard keypair")?;
 
     // Allocate .1 for the controller
     let mut pool = AddressPool::new(cidr)?;
@@ -169,8 +175,7 @@ fn cmd_join(
     eprintln!("Joining WireGuard mesh...");
 
     // Generate local keypair
-    let keypair = wireguard::generate_keypair()
-        .context("failed to generate WireGuard keypair")?;
+    let keypair = wireguard::generate_keypair().context("failed to generate WireGuard keypair")?;
 
     let config = WgConfig {
         private_key: keypair.private_key,
@@ -202,7 +207,10 @@ fn cmd_join(
     eprintln!("  Public key: {}", keypair.public_key);
     eprintln!();
     eprintln!("Add this node as a peer on the controller:");
-    eprintln!("  spur net add-peer --key {} --allowed-ip {}/32", keypair.public_key, address);
+    eprintln!(
+        "  spur net add-peer --key {} --allowed-ip {}/32",
+        keypair.public_key, address
+    );
 
     Ok(())
 }
@@ -216,7 +224,10 @@ fn cmd_status(interface: &str) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("No such device") {
-            eprintln!("Interface {} is not up. Run `spur net init` or `spur net join` first.", interface);
+            eprintln!(
+                "Interface {} is not up. Run `spur net init` or `spur net join` first.",
+                interface
+            );
             return Ok(());
         }
         bail!("wg show failed: {}", stderr);
@@ -226,7 +237,12 @@ fn cmd_status(interface: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add_peer(key: &str, allowed_ip: &str, endpoint: Option<&str>, interface: &str) -> Result<()> {
+fn cmd_add_peer(
+    key: &str,
+    allowed_ip: &str,
+    endpoint: Option<&str>,
+    interface: &str,
+) -> Result<()> {
     let peer = WgPeer {
         public_key: key.to_string(),
         allowed_ips: allowed_ip.to_string(),

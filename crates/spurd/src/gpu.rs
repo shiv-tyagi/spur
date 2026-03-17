@@ -136,9 +136,7 @@ fn normalize_gpu_name(name: &str) -> String {
     } else if lower.contains("9070") {
         "rx9070".into()
     } else {
-        name.trim()
-            .to_lowercase()
-            .replace(' ', "-")
+        name.trim().to_lowercase().replace(' ', "-")
     }
 }
 

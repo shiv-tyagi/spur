@@ -36,10 +36,7 @@ pub fn compute_fairshare(
     let mut factors = std::collections::HashMap::new();
 
     for ((user, account), usage) in &user_usage {
-        let target_share = account_weights
-            .get(account)
-            .copied()
-            .unwrap_or(1.0);
+        let target_share = account_weights.get(account).copied().unwrap_or(1.0);
 
         // Normalize: actual_share = user_usage / total_usage
         let actual_share = usage / total_usage.max(epsilon);

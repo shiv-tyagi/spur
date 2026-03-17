@@ -38,7 +38,11 @@ pub struct SinfoArgs {
     pub noheader: bool,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817")]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
     pub controller: String,
 }
 
@@ -100,10 +104,7 @@ pub async fn main() -> Result<()> {
         // One line per partition (summarized)
         for part in &partitions {
             // Count nodes by state for this partition
-            let part_nodes: Vec<_> = nodes
-                .iter()
-                .filter(|n| n.partition == part.name)
-                .collect();
+            let part_nodes: Vec<_> = nodes.iter().filter(|n| n.partition == part.name).collect();
             let total = part_nodes.len();
 
             let row = format_engine::format_row(&fields, &|spec| {

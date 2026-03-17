@@ -10,7 +10,12 @@ pub struct ScontrolArgs {
     pub command: ScontrolCommand,
 
     /// Controller address
-    #[arg(long, env = "SPUR_CONTROLLER_ADDR", default_value = "http://localhost:6817", global = true)]
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817",
+        global = true
+    )]
     pub controller: String,
 }
 
@@ -71,16 +76,20 @@ pub async fn main() -> Result<()> {
         ScontrolCommand::Requeue { job_id } => {
             // Requeue = cancel + resubmit, simplified for now
             let mut client = SlurmControllerClient::connect(args.controller.to_string())
-                .await.context("failed to connect to spurctld")?;
-            client.cancel_job(spur_proto::proto::CancelJobRequest {
-                job_id, signal: 0, user: String::new(),
-            }).await.context("requeue failed")?;
+                .await
+                .context("failed to connect to spurctld")?;
+            client
+                .cancel_job(spur_proto::proto::CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: String::new(),
+                })
+                .await
+                .context("requeue failed")?;
             println!("job {} requeued (cancelled for resubmission)", job_id);
             Ok(())
         }
-        ScontrolCommand::Update { params } => {
-            parse_and_update(&args.controller, &params).await
-        }
+        ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
     }
 }
 
@@ -187,7 +196,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 );
                 println!("   State={}", part.state);
                 println!("   Nodes={}", part.nodes);
-                println!("   TotalNodes={} TotalCPUs={}", part.total_nodes, part.total_cpus);
+                println!(
+                    "   TotalNodes={} TotalCPUs={}",
+                    part.total_nodes, part.total_cpus
+                );
                 println!(
                     "   MaxTime={} DefaultTime={}",
                     part.max_time
@@ -209,7 +221,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             println!("Version={}", env!("CARGO_PKG_VERSION"));
         }
         other => {
-            bail!("scontrol: unknown entity type '{}'. Use: job, node, partition, config", other);
+            bail!(
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, config",
+                other
+            );
         }
     }
 
@@ -221,10 +236,7 @@ async fn ping(controller: &str) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
 
-    let resp = client
-        .ping(())
-        .await
-        .context("ping failed")?;
+    let resp = client.ping(()).await.context("ping failed")?;
 
     let inner = resp.into_inner();
     println!(

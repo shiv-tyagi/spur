@@ -33,10 +33,7 @@ impl AgentService {
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
-    pub fn start_monitor(
-        &self,
-        controller_addr: String,
-    ) {
+    pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -102,7 +99,9 @@ impl SlurmAgent for AgentService {
         let job_id = req.job_id;
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
-        let spec = req.spec.ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
         info!(
             job_id,
@@ -156,9 +155,12 @@ impl SlurmAgent for AgentService {
         {
             Ok(running_job) => {
                 let mut jobs = self.running.lock().await;
-                jobs.insert(job_id, TrackedJob {
-                    child: running_job.into_child(),
-                });
+                jobs.insert(
+                    job_id,
+                    TrackedJob {
+                        child: running_job.into_child(),
+                    },
+                );
                 info!(job_id, "job launched successfully");
                 Ok(Response::new(LaunchJobResponse {
                     success: true,

@@ -72,11 +72,7 @@ impl BackfillScheduler {
 }
 
 impl Scheduler for BackfillScheduler {
-    fn schedule(
-        &mut self,
-        pending: &[Job],
-        cluster: &ClusterState,
-    ) -> Vec<Assignment> {
+    fn schedule(&mut self, pending: &[Job], cluster: &ClusterState) -> Vec<Assignment> {
         let now = Utc::now();
         self.init_timelines(cluster.nodes);
 
@@ -107,10 +103,7 @@ impl Scheduler for BackfillScheduler {
             }
 
             let required = job_resource_request(job);
-            let duration = job
-                .spec
-                .time_limit
-                .unwrap_or(Duration::hours(1));
+            let duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
             let needed_nodes = job.spec.num_nodes as usize;
 
             // Find earliest start across needed_nodes
@@ -183,11 +176,7 @@ fn job_resource_request(job: &Job) -> ResourceSet {
     let memory = job
         .spec
         .memory_per_node_mb
-        .or_else(|| {
-            job.spec
-                .memory_per_cpu_mb
-                .map(|m| m * cpus as u64)
-        })
+        .or_else(|| job.spec.memory_per_cpu_mb.map(|m| m * cpus as u64))
         .unwrap_or(0);
 
     // Parse GRES into GPU count for scheduling
@@ -208,7 +197,11 @@ fn job_resource_request(job: &Job) -> ResourceSet {
     let gpus: Vec<spur_core::resource::GpuResource> = (0..gpu_count)
         .map(|i| spur_core::resource::GpuResource {
             device_id: i,
-            gpu_type: if gpu_type.is_empty() { "any".into() } else { gpu_type.clone() },
+            gpu_type: if gpu_type.is_empty() {
+                "any".into()
+            } else {
+                gpu_type.clone()
+            },
             memory_mb: 0,
             peer_gpus: Vec::new(),
             link_type: spur_core::resource::GpuLinkType::PCIe,
@@ -294,10 +287,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let pending = vec![
-            make_job(1, 2, 32),
-            make_job(2, 2, 32),
-        ];
+        let pending = vec![make_job(1, 2, 32), make_job(2, 2, 32)];
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,

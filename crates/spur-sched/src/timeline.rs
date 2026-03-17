@@ -97,12 +97,7 @@ impl NodeTimeline {
     }
 
     /// Reserve resources on this node for a time window.
-    pub fn reserve(
-        &mut self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        resources: ResourceSet,
-    ) {
+    pub fn reserve(&mut self, start: DateTime<Utc>, end: DateTime<Utc>, resources: ResourceSet) {
         self.intervals.push(Interval {
             start,
             end,
@@ -114,7 +109,8 @@ impl NodeTimeline {
 
     /// Remove a reservation (when a job completes or is cancelled).
     pub fn release(&mut self, start: DateTime<Utc>, end: DateTime<Utc>) {
-        self.intervals.retain(|i| !(i.start == start && i.end == end));
+        self.intervals
+            .retain(|i| !(i.start == start && i.end == end));
     }
 
     /// Clean up expired intervals.

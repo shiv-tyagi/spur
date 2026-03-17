@@ -1,1 +1,27 @@
+# Build
 /target
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# WireGuard configs (contain private keys)
+*.conf
+!/proto/**
+
+# Test artifacts
+/tmp/
+*.profraw

@@ -15,7 +15,12 @@ mod tests {
     #[test]
     fn t17_1_parse_basic_directives() {
         let script = test_script(
-            &["--job-name=test", "-N 4", "--time=4:00:00", "--gres=gpu:mi300x:8"],
+            &[
+                "--job-name=test",
+                "-N 4",
+                "--time=4:00:00",
+                "--gres=gpu:mi300x:8",
+            ],
             "echo hello",
         );
 
@@ -28,10 +33,7 @@ mod tests {
 
     #[test]
     fn t17_2_script_body_after_directives() {
-        let script = test_script(
-            &["--job-name=test"],
-            "echo hello\necho world",
-        );
+        let script = test_script(&["--job-name=test"], "echo hello\necho world");
 
         let lines: Vec<&str> = script.lines().collect();
         assert_eq!(lines[0], "#!/bin/bash");
