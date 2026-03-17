@@ -1,0 +1,7 @@
+[package]
+name = "spur-k8s"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spur-core = { path = "../spur-core" }

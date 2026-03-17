@@ -1,0 +1,9 @@
+[package]
+name = "spur-sched"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spur-core = { path = "../spur-core" }
+tracing = { workspace = true }
+chrono = { workspace = true }

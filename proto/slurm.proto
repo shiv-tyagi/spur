@@ -1,0 +1,405 @@
+syntax = "proto3";
+
+package slurm;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+
+// ============================================================
+// Core Types
+// ============================================================
+
+message ResourceSet {
+  uint32 cpus = 1;
+  uint64 memory_mb = 2;
+  repeated GpuResource gpus = 3;
+  map<string, uint64> generic = 4;  // licenses, etc.
+}
+
+message GpuResource {
+  uint32 device_id = 1;
+  string gpu_type = 2;       // "mi300x", "h100"
+  uint64 memory_mb = 3;
+  repeated uint32 peer_gpus = 4;
+  GpuLinkType link_type = 5;
+}
+
+enum GpuLinkType {
+  GPU_LINK_PCIE = 0;
+  GPU_LINK_XGMI = 1;
+  GPU_LINK_NVLINK = 2;
+}
+
+enum JobState {
+  JOB_PENDING = 0;
+  JOB_RUNNING = 1;
+  JOB_COMPLETING = 2;
+  JOB_COMPLETED = 3;
+  JOB_FAILED = 4;
+  JOB_CANCELLED = 5;
+  JOB_TIMEOUT = 6;
+  JOB_NODE_FAIL = 7;
+  JOB_PREEMPTED = 8;
+  JOB_SUSPENDED = 9;
+}
+
+enum NodeState {
+  NODE_IDLE = 0;
+  NODE_ALLOCATED = 1;
+  NODE_MIXED = 2;
+  NODE_DOWN = 3;
+  NODE_DRAIN = 4;
+  NODE_DRAINING = 5;
+  NODE_ERROR = 6;
+  NODE_UNKNOWN = 7;
+}
+
+message JobSpec {
+  string name = 1;
+  string partition = 2;
+  string account = 3;
+  string user = 4;
+  uint32 uid = 5;
+  uint32 gid = 6;
+
+  // Resources
+  uint32 num_nodes = 10;
+  uint32 num_tasks = 11;
+  uint32 tasks_per_node = 12;
+  uint32 cpus_per_task = 13;
+  uint64 memory_per_node_mb = 14;
+  uint64 memory_per_cpu_mb = 15;
+  repeated string gres = 16;  // "gpu:mi300x:4"
+
+  // Execution
+  string script = 20;
+  repeated string argv = 21;
+  string work_dir = 22;
+  string stdout_path = 23;
+  string stderr_path = 24;
+  map<string, string> environment = 25;
+
+  // Time limits
+  google.protobuf.Duration time_limit = 30;
+  google.protobuf.Duration time_min = 31;
+
+  // Scheduling hints
+  string qos = 40;
+  uint32 priority = 41;
+  string reservation = 42;
+  repeated string dependency = 43;  // "afterok:123,afterany:456"
+  string nodelist = 44;             // "node[001-010]"
+  string exclude = 45;
+
+  // Array
+  string array_spec = 50;  // "0-99%10"
+
+  // Misc
+  bool requeue = 60;
+  bool exclusive = 61;
+  bool hold = 62;
+  string comment = 63;
+  string wckey = 64;
+}
+
+message JobInfo {
+  uint32 job_id = 1;
+  string name = 2;
+  string user = 3;
+  uint32 uid = 4;
+  string partition = 5;
+  string account = 6;
+  JobState state = 7;
+  string state_reason = 8;
+
+  google.protobuf.Timestamp submit_time = 10;
+  google.protobuf.Timestamp start_time = 11;
+  google.protobuf.Timestamp end_time = 12;
+  google.protobuf.Duration time_limit = 13;
+  google.protobuf.Duration run_time = 14;
+
+  uint32 num_nodes = 20;
+  uint32 num_tasks = 21;
+  uint32 cpus_per_task = 22;
+  string nodelist = 23;
+  string work_dir = 24;
+  string command = 25;
+
+  int32 exit_code = 30;
+  string stdout_path = 31;
+  string stderr_path = 32;
+
+  ResourceSet resources = 40;
+  uint32 priority = 41;
+  string qos = 42;
+
+  // Array jobs
+  uint32 array_job_id = 50;
+  uint32 array_task_id = 51;
+}
+
+message NodeInfo {
+  string name = 1;
+  NodeState state = 2;
+  string state_reason = 3;
+  string partition = 4;
+
+  ResourceSet total_resources = 10;
+  ResourceSet alloc_resources = 11;
+
+  string arch = 20;
+  string os = 21;
+  uint32 cpu_load = 22;    // load * 100
+  uint64 free_memory_mb = 23;
+
+  google.protobuf.Timestamp boot_time = 30;
+  google.protobuf.Timestamp last_busy = 31;
+  google.protobuf.Timestamp slurmd_start_time = 32;
+}
+
+message PartitionInfo {
+  string name = 1;
+  string state = 2;          // UP, DOWN, DRAIN, INACTIVE
+  bool is_default = 3;
+
+  uint32 total_nodes = 10;
+  uint32 total_cpus = 11;
+  string nodes = 12;         // hostlist
+
+  google.protobuf.Duration max_time = 20;
+  google.protobuf.Duration default_time = 21;
+  uint32 max_nodes = 22;
+  uint32 min_nodes = 23;
+
+  bool allow_root = 30;
+  bool exclusive_user = 31;
+  string allow_accounts = 32;
+  string allow_groups = 33;
+  string allow_qos = 34;
+
+  string preempt_mode = 40;
+  uint32 priority_tier = 41;
+}
+
+// ============================================================
+// Services
+// ============================================================
+
+// -- Controller service (slurmctld) --
+
+service SlurmController {
+  // Job management
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
+  rpc GetJob(GetJobRequest) returns (JobInfo);
+  rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
+  rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
+
+  // Node management
+  rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (NodeInfo);
+  rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
+
+  // Partition management
+  rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse);
+
+  // Health
+  rpc Ping(google.protobuf.Empty) returns (PingResponse);
+
+  // Agent registration
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+}
+
+// -- Agent service (slurmd) --
+
+service SlurmAgent {
+  rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
+  rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
+  rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
+}
+
+// -- Accounting service (slurmdbd) --
+
+service SlurmAccounting {
+  rpc RecordJobStart(RecordJobStartRequest) returns (google.protobuf.Empty);
+  rpc RecordJobEnd(RecordJobEndRequest) returns (google.protobuf.Empty);
+  rpc GetJobHistory(GetJobHistoryRequest) returns (GetJobHistoryResponse);
+  rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+}
+
+// ============================================================
+// Request/Response Messages
+// ============================================================
+
+// -- Controller --
+
+message SubmitJobRequest {
+  JobSpec spec = 1;
+}
+
+message SubmitJobResponse {
+  uint32 job_id = 1;
+}
+
+message GetJobsRequest {
+  repeated JobState states = 1;
+  string user = 2;
+  string partition = 3;
+  string account = 4;
+  repeated uint32 job_ids = 5;
+}
+
+message GetJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message GetJobRequest {
+  uint32 job_id = 1;
+}
+
+message CancelJobRequest {
+  uint32 job_id = 1;
+  int32 signal = 2;  // 0 = cancel, else signal number
+  string user = 3;   // For authorization
+}
+
+message UpdateJobRequest {
+  uint32 job_id = 1;
+  optional string partition = 2;
+  optional string account = 3;
+  optional uint32 priority = 4;
+  optional google.protobuf.Duration time_limit = 5;
+  optional bool hold = 6;
+  optional string comment = 7;
+}
+
+message GetNodesRequest {
+  repeated NodeState states = 1;
+  string partition = 2;
+  string nodelist = 3;  // hostlist pattern
+}
+
+message GetNodesResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message GetNodeRequest {
+  string name = 1;
+}
+
+message UpdateNodeRequest {
+  string name = 1;
+  optional NodeState state = 2;
+  optional string reason = 3;
+}
+
+message GetPartitionsRequest {
+  string name = 1;  // empty = all
+}
+
+message GetPartitionsResponse {
+  repeated PartitionInfo partitions = 1;
+}
+
+message PingResponse {
+  string hostname = 1;
+  google.protobuf.Timestamp server_time = 2;
+  string version = 3;
+}
+
+message RegisterAgentRequest {
+  string hostname = 1;
+  ResourceSet resources = 2;
+  string version = 3;
+}
+
+message RegisterAgentResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string hostname = 1;
+  uint32 cpu_load = 2;
+  uint64 free_memory_mb = 3;
+  repeated RunningJobStatus running_jobs = 4;
+}
+
+message RunningJobStatus {
+  uint32 job_id = 1;
+  JobState state = 2;
+  int32 exit_code = 3;
+}
+
+message HeartbeatResponse {
+  repeated LaunchJobRequest launch_jobs = 1;
+  repeated uint32 cancel_jobs = 2;
+}
+
+// -- Agent --
+
+message LaunchJobRequest {
+  uint32 job_id = 1;
+  JobSpec spec = 2;
+  ResourceSet allocated = 3;
+}
+
+message LaunchJobResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message AgentCancelJobRequest {
+  uint32 job_id = 1;
+  int32 signal = 2;
+}
+
+message NodeResourcesResponse {
+  ResourceSet total = 1;
+  ResourceSet used = 2;
+}
+
+// -- Accounting --
+
+message RecordJobStartRequest {
+  uint32 job_id = 1;
+  string user = 2;
+  string account = 3;
+  string partition = 4;
+  ResourceSet resources = 5;
+  google.protobuf.Timestamp start_time = 6;
+}
+
+message RecordJobEndRequest {
+  uint32 job_id = 1;
+  JobState final_state = 2;
+  int32 exit_code = 3;
+  google.protobuf.Timestamp end_time = 4;
+}
+
+message GetJobHistoryRequest {
+  string user = 1;
+  string account = 2;
+  google.protobuf.Timestamp start_after = 3;
+  google.protobuf.Timestamp start_before = 4;
+  repeated JobState states = 5;
+  uint32 limit = 6;
+}
+
+message GetJobHistoryResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message GetUsageRequest {
+  string user = 1;
+  string account = 2;
+  google.protobuf.Timestamp since = 3;
+}
+
+message GetUsageResponse {
+  map<string, double> cpu_hours = 1;    // per account
+  map<string, double> gpu_hours = 2;
+  map<string, uint64> job_count = 3;
+}

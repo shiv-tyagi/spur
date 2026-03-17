@@ -1,0 +1,11 @@
+[package]
+name = "spur-spank"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spur-core = { path = "../spur-core" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+libloading = "0.9.0"
+thiserror.workspace = true

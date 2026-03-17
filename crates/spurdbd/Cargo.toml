@@ -1,0 +1,24 @@
+[package]
+name = "spurdbd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "spurdbd"
+path = "src/main.rs"
+
+[dependencies]
+spur-proto = { path = "../spur-proto" }
+spur-core = { path = "../spur-core" }
+spur-sched = { path = "../spur-sched" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

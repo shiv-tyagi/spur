@@ -1,0 +1,15 @@
+[package]
+name = "spur-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "spur_compat"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+spur-proto = { path = "../spur-proto" }
+spur-core = { path = "../spur-core" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }

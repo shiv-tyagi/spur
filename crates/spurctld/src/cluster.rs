@@ -1,0 +1,461 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use chrono::Utc;
+use parking_lot::RwLock;
+use tracing::{debug, info, warn};
+
+use spur_core::config::SlurmConfig;
+use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
+use spur_core::node::{Node, NodeState};
+use spur_core::partition::Partition;
+use spur_core::resource::ResourceSet;
+use spur_core::wal::{WalEntry, WalOperation, WalStore};
+use spur_state::snapshot::SnapshotStore;
+use spur_state::wal_store::FileWalStore;
+
+/// Central cluster state manager.
+///
+/// Thread-safe via RwLock. The scheduler and gRPC server both access this.
+pub struct ClusterManager {
+    pub config: SlurmConfig,
+    jobs: RwLock<HashMap<JobId, Job>>,
+    nodes: RwLock<HashMap<String, Node>>,
+    partitions: RwLock<Vec<Partition>>,
+    next_job_id: AtomicU32,
+    wal: RwLock<FileWalStore>,
+    snapshot: RwLock<Option<SnapshotStore>>,
+    wal_since_snapshot: AtomicU32,
+}
+
+impl ClusterManager {
+    pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
+        let wal = FileWalStore::new(&state_dir.join("wal"))?;
+        let snapshot = if state_dir.join("snapshot.redb").exists() {
+            Some(SnapshotStore::open(&state_dir.join("snapshot.redb"))?)
+        } else {
+            std::fs::create_dir_all(state_dir)?;
+            Some(SnapshotStore::open(&state_dir.join("snapshot.redb"))?)
+        };
+
+        let partitions = config.build_partitions();
+
+        // Recover state from snapshot + WAL replay
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let mut next_id = config.controller.first_job_id;
+
+        if let Some(ref snap) = snapshot {
+            let snap_seq = snap.wal_sequence().unwrap_or(0);
+            for job in snap.load_jobs().unwrap_or_default() {
+                next_id = next_id.max(job.job_id + 1);
+                jobs.insert(job.job_id, job);
+            }
+            for node in snap.load_nodes().unwrap_or_default() {
+                nodes.insert(node.name.clone(), node);
+            }
+
+            // Replay WAL entries after snapshot
+            let wal_entries = wal.read_from(snap_seq + 1).unwrap_or_default();
+            if !wal_entries.is_empty() {
+                info!(
+                    count = wal_entries.len(),
+                    from_seq = snap_seq + 1,
+                    "replaying WAL entries"
+                );
+                for entry in &wal_entries {
+                    replay_entry(entry, &mut jobs, &mut nodes, &mut next_id);
+                }
+            }
+        }
+
+        info!(
+            jobs = jobs.len(),
+            nodes = nodes.len(),
+            next_job_id = next_id,
+            "cluster state recovered"
+        );
+
+        Ok(Self {
+            config,
+            jobs: RwLock::new(jobs),
+            nodes: RwLock::new(nodes),
+            partitions: RwLock::new(partitions),
+            next_job_id: AtomicU32::new(next_id),
+            wal: RwLock::new(wal),
+            snapshot: RwLock::new(snapshot),
+            wal_since_snapshot: AtomicU32::new(0),
+        })
+    }
+
+    /// Submit a new job.
+    pub fn submit_job(&self, spec: JobSpec) -> anyhow::Result<JobId> {
+        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let job = Job::new(job_id, spec.clone());
+
+        // WAL
+        self.append_wal(WalOperation::JobSubmit {
+            job_id,
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            partition: spec.partition.clone(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+        });
+
+        self.jobs.write().insert(job_id, job);
+
+        info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
+        self.maybe_snapshot();
+        Ok(job_id)
+    }
+
+    /// Get a job by ID.
+    pub fn get_job(&self, job_id: JobId) -> Option<Job> {
+        self.jobs.read().get(&job_id).cloned()
+    }
+
+    /// Get jobs matching filters.
+    pub fn get_jobs(
+        &self,
+        states: &[JobState],
+        user: Option<&str>,
+        partition: Option<&str>,
+        account: Option<&str>,
+        job_ids: &[JobId],
+    ) -> Vec<Job> {
+        let jobs = self.jobs.read();
+        jobs.values()
+            .filter(|j| {
+                if !states.is_empty() && !states.contains(&j.state) {
+                    return false;
+                }
+                if let Some(u) = user {
+                    if !u.is_empty() && j.spec.user != u {
+                        return false;
+                    }
+                }
+                if let Some(p) = partition {
+                    if !p.is_empty() && j.spec.partition.as_deref() != Some(p) {
+                        return false;
+                    }
+                }
+                if let Some(a) = account {
+                    if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
+                        return false;
+                    }
+                }
+                if !job_ids.is_empty() && !job_ids.contains(&j.job_id) {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Cancel a job.
+    pub fn cancel_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+
+        let old_state = job.state;
+        job.transition(JobState::Cancelled)?;
+
+        self.append_wal(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Cancelled,
+        });
+
+        info!(job_id, "job cancelled");
+        Ok(())
+    }
+
+    /// Start a job on specific nodes.
+    pub fn start_job(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceSet,
+    ) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+
+        let old_state = job.state;
+        job.transition(JobState::Running)?;
+        job.start_time = Some(Utc::now());
+        job.allocated_nodes = node_names.clone();
+        job.allocated_resources = Some(resources.clone());
+        job.pending_reason = PendingReason::None;
+
+        self.append_wal(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Running,
+        });
+        self.append_wal(WalOperation::JobStart {
+            job_id,
+            nodes: node_names,
+            resources,
+        });
+
+        debug!(job_id, "job started");
+        Ok(())
+    }
+
+    /// Complete a job.
+    pub fn complete_job(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+    ) -> anyhow::Result<()> {
+        let mut jobs = self.jobs.write();
+        let job = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+
+        let old_state = job.state;
+        job.transition(state)?;
+        job.exit_code = Some(exit_code);
+
+        // Free node allocations
+        let freed_nodes = job.allocated_nodes.clone();
+        drop(jobs);
+
+        self.append_wal(WalOperation::JobComplete {
+            job_id,
+            exit_code,
+            state,
+        });
+
+        // Update node states
+        let mut nodes = self.nodes.write();
+        for name in &freed_nodes {
+            if let Some(node) = nodes.get_mut(name) {
+                node.alloc_resources = ResourceSet::default();
+                node.update_state_from_alloc();
+            }
+        }
+
+        debug!(job_id, exit_code, "job completed");
+        self.maybe_snapshot();
+        Ok(())
+    }
+
+    /// Register a node agent.
+    pub fn register_node(
+        &self,
+        name: String,
+        resources: ResourceSet,
+        address: String,
+        version: String,
+    ) {
+        let mut node = Node::new(name.clone(), resources.clone());
+        node.state = NodeState::Idle;
+        node.address = Some(address.clone());
+        node.version = Some(version);
+        node.agent_start_time = Some(Utc::now());
+        node.last_heartbeat = Some(Utc::now());
+
+        // Assign to partitions based on config
+        let partitions = self.partitions.read();
+        for part in partitions.iter() {
+            if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
+                if hosts.contains(&name) {
+                    node.partitions.push(part.name.clone());
+                }
+            }
+        }
+
+        self.append_wal(WalOperation::NodeRegister {
+            name: name.clone(),
+            resources,
+            address,
+        });
+
+        info!(node = %name, partitions = ?node.partitions, "node registered");
+        self.nodes.write().insert(name, node);
+    }
+
+    /// Update node heartbeat data.
+    pub fn update_heartbeat(
+        &self,
+        name: &str,
+        cpu_load: u32,
+        free_memory_mb: u64,
+    ) {
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.get_mut(name) {
+            node.cpu_load = cpu_load;
+            node.free_memory_mb = free_memory_mb;
+            node.last_heartbeat = Some(Utc::now());
+        }
+    }
+
+    /// Get all nodes.
+    pub fn get_nodes(&self) -> Vec<Node> {
+        self.nodes.read().values().cloned().collect()
+    }
+
+    /// Get a node by name.
+    pub fn get_node(&self, name: &str) -> Option<Node> {
+        self.nodes.read().get(name).cloned()
+    }
+
+    /// Get all partitions.
+    pub fn get_partitions(&self) -> Vec<Partition> {
+        self.partitions.read().clone()
+    }
+
+    /// Get pending jobs sorted by priority (highest first).
+    pub fn pending_jobs(&self) -> Vec<Job> {
+        let jobs = self.jobs.read();
+        let mut pending: Vec<Job> = jobs
+            .values()
+            .filter(|j| j.state == JobState::Pending)
+            .cloned()
+            .collect();
+        pending.sort_by(|a, b| b.priority.cmp(&a.priority));
+        pending
+    }
+
+    fn append_wal(&self, op: WalOperation) {
+        let mut wal = self.wal.write();
+        let seq = wal.latest_sequence() + 1;
+        let entry = WalEntry::new(seq, op);
+        if let Err(e) = wal.append(&entry) {
+            warn!(error = %e, "failed to append WAL entry");
+        }
+        self.wal_since_snapshot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn maybe_snapshot(&self) {
+        let count = self.wal_since_snapshot.load(Ordering::Relaxed);
+        if count >= 10_000 {
+            self.take_snapshot();
+        }
+    }
+
+    pub fn take_snapshot(&self) {
+        let snap = self.snapshot.read();
+        if let Some(ref store) = *snap {
+            let jobs: Vec<Job> = self.jobs.read().values().cloned().collect();
+            let nodes: Vec<Node> = self.nodes.read().values().cloned().collect();
+            let seq = self.wal.read().latest_sequence();
+
+            match store.save(&jobs, &nodes, seq) {
+                Ok(()) => {
+                    self.wal_since_snapshot.store(0, Ordering::Relaxed);
+                    debug!(wal_sequence = seq, "snapshot taken");
+                }
+                Err(e) => warn!(error = %e, "failed to take snapshot"),
+            }
+        }
+    }
+}
+
+/// Replay a single WAL entry into state.
+fn replay_entry(
+    entry: &WalEntry,
+    jobs: &mut HashMap<JobId, Job>,
+    nodes: &mut HashMap<String, Node>,
+    next_id: &mut u32,
+) {
+    match &entry.operation {
+        WalOperation::JobSubmit {
+            job_id,
+            name,
+            user,
+            partition,
+            num_nodes,
+            num_tasks,
+            cpus_per_task,
+        } => {
+            let spec = JobSpec {
+                name: name.clone(),
+                user: user.clone(),
+                partition: partition.clone(),
+                num_nodes: *num_nodes,
+                num_tasks: *num_tasks,
+                cpus_per_task: *cpus_per_task,
+                ..Default::default()
+            };
+            jobs.insert(*job_id, Job::new(*job_id, spec));
+            *next_id = (*next_id).max(job_id + 1);
+        }
+        WalOperation::JobStateChange {
+            job_id,
+            new_state,
+            ..
+        } => {
+            if let Some(job) = jobs.get_mut(job_id) {
+                let _ = job.transition(*new_state);
+            }
+        }
+        WalOperation::JobStart {
+            job_id,
+            nodes: node_names,
+            resources,
+        } => {
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.start_time = Some(entry.timestamp);
+                job.allocated_nodes = node_names.clone();
+                job.allocated_resources = Some(resources.clone());
+            }
+        }
+        WalOperation::JobComplete {
+            job_id,
+            exit_code,
+            ..
+        } => {
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.exit_code = Some(*exit_code);
+                job.end_time = Some(entry.timestamp);
+            }
+        }
+        WalOperation::JobPriorityChange {
+            job_id,
+            new_priority,
+            ..
+        } => {
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.priority = *new_priority;
+            }
+        }
+        WalOperation::NodeRegister {
+            name,
+            resources,
+            address,
+        } => {
+            let mut node = Node::new(name.clone(), resources.clone());
+            node.address = Some(address.clone());
+            node.state = NodeState::Idle;
+            nodes.insert(name.clone(), node);
+        }
+        WalOperation::NodeStateChange {
+            name,
+            new_state,
+            reason,
+            ..
+        } => {
+            if let Some(node) = nodes.get_mut(name) {
+                node.state = *new_state;
+                node.state_reason = reason.clone();
+            }
+        }
+        WalOperation::NodeHeartbeat { name, cpu_load, free_memory_mb } => {
+            if let Some(node) = nodes.get_mut(name) {
+                node.cpu_load = *cpu_load;
+                node.free_memory_mb = *free_memory_mb;
+            }
+        }
+    }
+}

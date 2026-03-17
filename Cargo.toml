@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spur-proto",
+    "crates/spur-core",
+    "crates/spur-sched",
+    "crates/spur-state",
+    "crates/spurctld",
+    "crates/spurd",
+    "crates/spurdbd",
+    "crates/spurrestd",
+    "crates/spur-cli",
+    "crates/spur-ffi",
+    "crates/spur-spank",
+    "crates/spur-k8s",
+    "crates/spur-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ROCm/spur"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# gRPC + protobuf
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+
+# REST API
+axum = { version = "0.7", features = ["json"] }
+utoipa = { version = "4", features = ["axum_extras"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+redb = "2"
+
+# Consensus
+openraft = { version = "0.10", features = ["serde"] }
+
+# K8s (post-MVP, declared for structure)
+# kube = { version = "0.96", features = ["runtime", "derive", "client"] }
+# k8s-openapi = { version = "0.23", features = ["latest"] }
+
+# Unix
+nix = { version = "0.29", features = ["process", "signal", "fs", "user"] }
+
+# Auth
+jsonwebtoken = "9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Misc
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+dashmap = "6"
+parking_lot = "0.12"
+bytes = "1"

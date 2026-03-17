@@ -1,0 +1,24 @@
+[package]
+name = "spur-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "spur"
+path = "src/main.rs"
+
+[dependencies]
+spur-proto = { path = "../spur-proto" }
+spur-core = { path = "../spur-core" }
+clap = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+prost-types = { workspace = true }
+whoami = "2.1.1"
+atty = "0.2.14"
+nix = { workspace = true, features = ["user"] }
