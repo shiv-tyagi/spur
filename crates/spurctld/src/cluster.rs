@@ -102,12 +102,7 @@ impl ClusterManager {
         // WAL
         self.append_wal(WalOperation::JobSubmit {
             job_id,
-            name: spec.name.clone(),
-            user: spec.user.clone(),
-            partition: spec.partition.clone(),
-            num_nodes: spec.num_nodes,
-            num_tasks: spec.num_tasks,
-            cpus_per_task: spec.cpus_per_task,
+            spec: spec.clone(),
         });
 
         self.jobs.write().insert(job_id, job);
@@ -140,19 +135,14 @@ impl ClusterManager {
             let mut task_spec = spec.clone();
             task_spec.array_spec = None; // Don't recurse
 
+            self.append_wal(WalOperation::JobSubmit {
+                job_id: task_job_id,
+                spec: task_spec.clone(),
+            });
+
             let mut job = Job::new(task_job_id, task_spec);
             job.array_job_id = Some(array_job_id);
             job.array_task_id = Some(task_id);
-
-            self.append_wal(WalOperation::JobSubmit {
-                job_id: task_job_id,
-                name: spec.name.clone(),
-                user: spec.user.clone(),
-                partition: spec.partition.clone(),
-                num_nodes: spec.num_nodes,
-                num_tasks: spec.num_tasks,
-                cpus_per_task: spec.cpus_per_task,
-            });
 
             jobs.insert(task_job_id, job);
         }
@@ -244,6 +234,22 @@ impl ClusterManager {
         job.allocated_resources = Some(resources.clone());
         job.pending_reason = PendingReason::None;
 
+        // Compute per-node resource share
+        let node_count = node_names.len().max(1) as u32;
+        let per_node = ResourceSet {
+            cpus: resources.cpus / node_count,
+            memory_mb: resources.memory_mb / node_count as u64,
+            gpus: resources.gpus.clone(), // GPUs are already per-node in the request
+            generic: resources
+                .generic
+                .iter()
+                .map(|(k, v)| (k.clone(), v / node_count as u64))
+                .collect(),
+        };
+
+        // Drop jobs lock before acquiring nodes lock (lock ordering: jobs → nodes)
+        drop(jobs);
+
         self.append_wal(WalOperation::JobStateChange {
             job_id,
             old_state,
@@ -251,9 +257,18 @@ impl ClusterManager {
         });
         self.append_wal(WalOperation::JobStart {
             job_id,
-            nodes: node_names,
+            nodes: node_names.clone(),
             resources,
         });
+
+        // Update node alloc_resources
+        let mut nodes = self.nodes.write();
+        for name in &node_names {
+            if let Some(node) = nodes.get_mut(name) {
+                node.alloc_resources = node.alloc_resources.add(&per_node);
+                node.update_state_from_alloc();
+            }
+        }
 
         debug!(job_id, "job started");
         Ok(())
@@ -271,12 +286,12 @@ impl ClusterManager {
             .get_mut(&job_id)
             .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
 
-        let old_state = job.state;
         job.transition(state)?;
         job.exit_code = Some(exit_code);
 
-        // Free node allocations
+        // Capture allocation info before dropping jobs lock
         let freed_nodes = job.allocated_nodes.clone();
+        let allocated_resources = job.allocated_resources.clone();
         drop(jobs);
 
         self.append_wal(WalOperation::JobComplete {
@@ -285,12 +300,33 @@ impl ClusterManager {
             state,
         });
 
-        // Update node states
+        // Subtract per-node resources instead of blanket-zeroing
         let mut nodes = self.nodes.write();
-        for name in &freed_nodes {
-            if let Some(node) = nodes.get_mut(name) {
-                node.alloc_resources = ResourceSet::default();
-                node.update_state_from_alloc();
+        if let Some(ref total_resources) = allocated_resources {
+            let node_count = freed_nodes.len().max(1) as u32;
+            let per_node = ResourceSet {
+                cpus: total_resources.cpus / node_count,
+                memory_mb: total_resources.memory_mb / node_count as u64,
+                gpus: total_resources.gpus.clone(),
+                generic: total_resources
+                    .generic
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v / node_count as u64))
+                    .collect(),
+            };
+            for name in &freed_nodes {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.alloc_resources = node.alloc_resources.subtract(&per_node);
+                    node.update_state_from_alloc();
+                }
+            }
+        } else {
+            // Fallback: zero out (legacy jobs without tracked resources)
+            for name in &freed_nodes {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.alloc_resources = ResourceSet::default();
+                    node.update_state_from_alloc();
+                }
             }
         }
 
@@ -503,6 +539,7 @@ impl ClusterManager {
     }
 
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
+    /// Recomputes effective priority using age and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
@@ -535,6 +572,27 @@ impl ClusterManager {
                 }
             }
         });
+
+        // Recompute effective priority with age + partition tier
+        let now = Utc::now();
+        let partitions = self.partitions.read();
+        for job in &mut pending {
+            let age_minutes = (now - job.submit_time).num_minutes().max(0);
+            let partition_tier = job
+                .spec
+                .partition
+                .as_ref()
+                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
+                .map(|p| p.priority_tier)
+                .unwrap_or(1);
+            // fair_share = 1.0 (neutral) until spurdbd integration
+            job.priority = spur_sched::priority::effective_priority(
+                job.priority,
+                1.0,
+                age_minutes,
+                partition_tier,
+            );
+        }
 
         pending.sort_by(|a, b| b.priority.cmp(&a.priority));
         pending
@@ -593,25 +651,8 @@ fn replay_entry(
     next_id: &mut u32,
 ) {
     match &entry.operation {
-        WalOperation::JobSubmit {
-            job_id,
-            name,
-            user,
-            partition,
-            num_nodes,
-            num_tasks,
-            cpus_per_task,
-        } => {
-            let spec = JobSpec {
-                name: name.clone(),
-                user: user.clone(),
-                partition: partition.clone(),
-                num_nodes: *num_nodes,
-                num_tasks: *num_tasks,
-                cpus_per_task: *cpus_per_task,
-                ..Default::default()
-            };
-            jobs.insert(*job_id, Job::new(*job_id, spec));
+        WalOperation::JobSubmit { job_id, spec } => {
+            jobs.insert(*job_id, Job::new(*job_id, spec.clone()));
             *next_id = (*next_id).max(job_id + 1);
         }
         WalOperation::JobStateChange {

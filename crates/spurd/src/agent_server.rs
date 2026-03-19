@@ -8,8 +8,12 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use tokio_stream::wrappers::ReceiverStream;
+
 use spur_proto::proto::slurm_agent_server::{SlurmAgent, SlurmAgentServer};
 use spur_proto::proto::*;
+
+use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 
 use crate::executor;
 use crate::reporter::NodeReporter;
@@ -21,37 +25,62 @@ struct TrackedJob {
     pid: Option<u32>,
     /// How the container rootfs was set up (for cleanup).
     rootfs_mode: crate::container::RootfsMode,
+    /// GPU/CPU allocation result for release on completion.
+    allocation: Option<AllocationResult>,
+    /// Stdout path for output streaming.
+    stdout_path: String,
+    /// Stderr path for output streaming.
+    stderr_path: String,
 }
 
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
+    allocation: Arc<Mutex<NodeAllocation>>,
 }
 
 impl AgentService {
     pub fn new(reporter: Arc<NodeReporter>) -> Self {
+        let allocation = NodeAllocation::new(
+            hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+            &reporter.resources,
+        );
         Self {
             reporter,
             running: Arc::new(Mutex::new(HashMap::new())),
+            allocation: Arc::new(Mutex::new(allocation)),
         }
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
+        let allocation = self.allocation.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
                 let mut jobs = running.lock().await;
-                let mut completed = Vec::new();
+                let mut completed: Vec<(
+                    u32,
+                    i32,
+                    crate::container::RootfsMode,
+                    Option<AllocationResult>,
+                )> = Vec::new();
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.child.try_wait() {
                         Ok(Some(status)) => {
                             let exit_code = status.code().unwrap_or(-1);
                             info!(job_id, exit_code, "job finished");
-                            completed.push((*job_id, exit_code, tracked.rootfs_mode.clone()));
+                            completed.push((
+                                *job_id,
+                                exit_code,
+                                tracked.rootfs_mode.clone(),
+                                tracked.allocation.take(),
+                            ));
                         }
                         Ok(None) => {} // Still running
                         Err(e) => {
@@ -60,9 +89,13 @@ impl AgentService {
                     }
                 }
 
-                for (job_id, exit_code, mode) in &completed {
+                for (job_id, _exit_code, mode, alloc) in &completed {
                     jobs.remove(job_id);
                     crate::container::cleanup_rootfs(*job_id, mode);
+                    // Release GPU/CPU allocation
+                    if let Some(alloc) = alloc {
+                        allocation.lock().await.release(alloc);
+                    }
                 }
 
                 // Release lock BEFORE network I/O — holding the lock during
@@ -70,7 +103,7 @@ impl AgentService {
                 // completions if the RPC times out.
                 drop(jobs);
 
-                for (job_id, exit_code, _mode) in &completed {
+                for (job_id, exit_code, _mode, _alloc) in &completed {
                     report_completion(&controller_addr, *job_id, *exit_code).await;
                 }
             }
@@ -140,6 +173,8 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
 
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
+    type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -303,17 +338,60 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
+        // Allocate GPU devices from the node's pool
+        let mut gpu_count = 0u32;
+        let mut gpu_type: Option<String> = None;
+        for gres in &spec.gres {
+            if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
+                if name == "gpu" {
+                    gpu_count += count;
+                    if let Some(t) = gtype {
+                        gpu_type = Some(t);
+                    }
+                }
+            }
+        }
+
+        let alloc_result = if gpu_count > 0 || spec.cpus_per_task > 0 {
+            let mut alloc = self.allocation.lock().await;
+            alloc.try_allocate(
+                spec.cpus_per_task.max(1),
+                spec.memory_per_node_mb,
+                gpu_count,
+                gpu_type.as_deref(),
+            )
+        } else {
+            None
+        };
+
+        let gpu_devices: Vec<u32> = alloc_result
+            .as_ref()
+            .map(|a| a.gpu_ids.clone())
+            .unwrap_or_default();
+
+        // Resolve stdout/stderr paths
+        let stdout_path = if spec.stdout_path.is_empty() {
+            format!("{}/spur-{}.out", work_dir, job_id)
+        } else {
+            spec.stdout_path.clone()
+        };
+        let stderr_path = if spec.stderr_path.is_empty() {
+            format!("{}/spur-{}.out", work_dir, job_id)
+        } else {
+            spec.stderr_path.clone()
+        };
+
         // Launch the job
         match executor::launch_job(
             job_id,
             &launch_script,
             &work_dir,
             &env,
-            &spec.stdout_path,
-            &spec.stderr_path,
+            &stdout_path,
+            &stderr_path,
             spec.cpus_per_task.max(1),
             spec.memory_per_node_mb,
-            &[], // GPU devices — TODO: allocate from GRES
+            &gpu_devices,
         )
         .await
         {
@@ -327,15 +405,22 @@ impl SlurmAgent for AgentService {
                         child,
                         pid,
                         rootfs_mode: rootfs_mode.clone(),
+                        allocation: alloc_result,
+                        stdout_path,
+                        stderr_path,
                     },
                 );
-                info!(job_id, "job launched successfully");
+                info!(job_id, gpus = ?gpu_devices, "job launched successfully");
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
                 }))
             }
             Err(e) => {
+                // Release allocation on launch failure
+                if let Some(ref alloc) = alloc_result {
+                    self.allocation.lock().await.release(alloc);
+                }
                 error!(job_id, error = %e, "failed to launch job");
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
@@ -417,6 +502,97 @@ impl SlurmAgent for AgentService {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }))
+    }
+
+    async fn stream_job_output(
+        &self,
+        request: Request<StreamJobOutputRequest>,
+    ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        // Look up the output file path from the tracked job
+        let file_path = {
+            let jobs = self.running.lock().await;
+            match jobs.get(&job_id) {
+                Some(tracked) => {
+                    if req.stream == "stderr" {
+                        tracked.stderr_path.clone()
+                    } else {
+                        tracked.stdout_path.clone()
+                    }
+                }
+                None => {
+                    return Err(Status::not_found(format!(
+                        "job {} not running on this node",
+                        job_id
+                    )));
+                }
+            }
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let running = self.running.clone();
+
+        tokio::spawn(async move {
+            // Wait for the output file to appear
+            let mut waited = 0;
+            while !std::path::Path::new(&file_path).exists() && waited < 30 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                waited += 1;
+            }
+
+            let mut offset = 0u64;
+            loop {
+                // Read new data from the file
+                match tokio::fs::read(&file_path).await {
+                    Ok(data) => {
+                        if data.len() as u64 > offset {
+                            let new_data = data[offset as usize..].to_vec();
+                            offset = data.len() as u64;
+                            if tx
+                                .send(Ok(StreamJobOutputChunk {
+                                    data: new_data,
+                                    eof: false,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break; // Client disconnected
+                            }
+                        }
+                    }
+                    Err(_) => {} // File not ready yet
+                }
+
+                // Check if job is still running
+                let still_running = running.lock().await.contains_key(&job_id);
+                if !still_running {
+                    // Final read to get any remaining output
+                    if let Ok(data) = tokio::fs::read(&file_path).await {
+                        if data.len() as u64 > offset {
+                            let _ = tx
+                                .send(Ok(StreamJobOutputChunk {
+                                    data: data[offset as usize..].to_vec(),
+                                    eof: false,
+                                }))
+                                .await;
+                        }
+                    }
+                    let _ = tx
+                        .send(Ok(StreamJobOutputChunk {
+                            data: Vec::new(),
+                            eof: true,
+                        }))
+                        .await;
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

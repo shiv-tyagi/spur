@@ -8,7 +8,7 @@ use spur_proto::proto::{
     AgentCancelJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
     ResourceSet as ProtoResourceSet,
 };
-use spur_sched::backfill::BackfillScheduler;
+use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
@@ -75,16 +75,18 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 None => continue,
             };
 
-            let per_node_cpus = if let Some(tpn) = job.spec.tasks_per_node {
-                tpn * job.spec.cpus_per_task
-            } else {
-                (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task
-            };
-
+            // Compute per-node resources (including GPUs from GRES)
+            let per_node = backfill::job_resource_request(&job);
+            let node_count = assignment.nodes.len() as u32;
             let resources = spur_core::resource::ResourceSet {
-                cpus: per_node_cpus * assignment.nodes.len() as u32,
-                memory_mb: job.spec.memory_per_node_mb.unwrap_or(0) * assignment.nodes.len() as u64,
-                ..Default::default()
+                cpus: per_node.cpus * node_count,
+                memory_mb: per_node.memory_mb * node_count as u64,
+                gpus: per_node.gpus.clone(),
+                generic: per_node
+                    .generic
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v * node_count as u64))
+                    .collect(),
             };
 
             // Transition job to Running
@@ -103,6 +105,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
             let job_id = assignment.job_id;
             let spec = job.spec.clone();
             let all_nodes = assignment.nodes.clone();
+            let per_node_alloc = per_node.clone();
 
             // Build peer_nodes list with addresses for cross-node communication
             let peer_addrs: Vec<String> = all_nodes
@@ -139,6 +142,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let peer_addrs = peer_addrs.clone();
                 let task_offset = node_idx as u32 * tasks_per_node;
                 let target_node = node_name.clone();
+                let allocated = per_node_alloc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = dispatch_to_agent(
                         &agent_addr,
@@ -147,6 +151,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                         &peer_addrs,
                         task_offset,
                         &target_node,
+                        &allocated,
                     )
                     .await
                     {
@@ -212,6 +217,7 @@ async fn dispatch_to_agent(
     peer_nodes: &[String],
     task_offset: u32,
     target_node: &str,
+    allocated: &spur_core::resource::ResourceSet,
 ) -> anyhow::Result<()> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
 
@@ -267,7 +273,7 @@ async fn dispatch_to_agent(
         .launch_job(LaunchJobRequest {
             job_id,
             spec: Some(proto_spec),
-            allocated: None,
+            allocated: Some(core_resource_to_proto(allocated)),
             peer_nodes: peer_nodes.to_vec(),
             task_offset,
             target_node: target_node.to_string(),
@@ -282,6 +288,31 @@ async fn dispatch_to_agent(
     }
 
     Ok(())
+}
+
+/// Convert a core ResourceSet to proto ResourceSet.
+fn core_resource_to_proto(r: &spur_core::resource::ResourceSet) -> ProtoResourceSet {
+    use spur_core::resource::GpuLinkType;
+    ProtoResourceSet {
+        cpus: r.cpus,
+        memory_mb: r.memory_mb,
+        gpus: r
+            .gpus
+            .iter()
+            .map(|g| spur_proto::proto::GpuResource {
+                device_id: g.device_id,
+                gpu_type: g.gpu_type.clone(),
+                memory_mb: g.memory_mb,
+                peer_gpus: g.peer_gpus.clone(),
+                link_type: match g.link_type {
+                    GpuLinkType::XGMI => spur_proto::proto::GpuLinkType::GpuLinkXgmi as i32,
+                    GpuLinkType::NVLink => spur_proto::proto::GpuLinkType::GpuLinkNvlink as i32,
+                    GpuLinkType::PCIe => spur_proto::proto::GpuLinkType::GpuLinkPcie as i32,
+                },
+            })
+            .collect(),
+        generic: r.generic.clone(),
+    }
 }
 
 /// Watchdog: cancel running jobs that have exceeded their wall-clock time limit.
