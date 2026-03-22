@@ -48,6 +48,10 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub gres: Vec<String>,
 
+    /// Licenses (e.g., "fluent:5", "matlab:1")
+    #[arg(short = 'L', long)]
+    pub licenses: Vec<String>,
+
     /// GPUs (shorthand, e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
@@ -115,6 +119,14 @@ pub struct SbatchArgs {
     /// Comment
     #[arg(long)]
     pub comment: Option<String>,
+
+    /// Mail notification type (comma-separated: BEGIN,END,FAIL,ALL)
+    #[arg(long)]
+    pub mail_type: Option<String>,
+
+    /// Mail notification user/address
+    #[arg(long)]
+    pub mail_user: Option<String>,
 
     /// Export environment variables
     #[arg(long, default_value = "ALL")]
@@ -347,6 +359,10 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     if let Some(gpn) = &args.gpus_per_node {
         gres.push(format!("gpu:{}", gpn));
     }
+    // Append licenses as GRES entries (license:<name>:<count>)
+    for lic in &args.licenses {
+        gres.push(format!("license:{}", lic));
+    }
 
     // Parse time limit — use parse_time_seconds so that short values like
     // "0:00:10" (10 seconds) are stored with full second precision instead of
@@ -436,6 +452,13 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
             .collect(),
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
+        licenses: args.licenses,
+        mail_type: args
+            .mail_type
+            .map(|s| s.split(',').map(|t| t.trim().to_uppercase()).collect())
+            .unwrap_or_default(),
+        mail_user: args.mail_user.unwrap_or_default(),
+        interactive: false,
     };
 
     // Submit to controller

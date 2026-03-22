@@ -12,6 +12,7 @@ use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
 use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
 use spur_state::snapshot::SnapshotStore;
@@ -26,6 +27,7 @@ pub struct ClusterManager {
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     next_job_id: AtomicU32,
+    reservations: RwLock<Vec<Reservation>>,
     wal: RwLock<FileWalStore>,
     snapshot: RwLock<Option<SnapshotStore>>,
     wal_since_snapshot: AtomicU32,
@@ -84,6 +86,7 @@ impl ClusterManager {
             jobs: RwLock::new(jobs),
             nodes: RwLock::new(nodes),
             partitions: RwLock::new(partitions),
+            reservations: RwLock::new(Vec::new()),
             next_job_id: AtomicU32::new(next_id),
             wal: RwLock::new(wal),
             snapshot: RwLock::new(snapshot),
@@ -306,6 +309,7 @@ impl ClusterManager {
 
         let old_state = job.state;
         let exclusive = job.spec.exclusive;
+        let spec_for_notify = job.spec.clone();
         job.transition(JobState::Running)?;
         job.start_time = Some(Utc::now());
         job.allocated_nodes = node_names.clone();
@@ -354,6 +358,16 @@ impl ClusterManager {
         }
 
         debug!(job_id, "job started");
+
+        // Send BEGIN notification if configured
+        if spec_for_notify
+            .mail_type
+            .iter()
+            .any(|t| t == "BEGIN" || t == "ALL")
+        {
+            self.send_notification(job_id, "BEGIN", &spec_for_notify);
+        }
+
         Ok(())
     }
 
@@ -372,9 +386,10 @@ impl ClusterManager {
         job.transition(state)?;
         job.exit_code = Some(exit_code);
 
-        // Capture allocation info before dropping jobs lock
+        // Capture allocation info and spec before dropping jobs lock
         let freed_nodes = job.allocated_nodes.clone();
         let allocated_resources = job.allocated_resources.clone();
+        let spec_for_notify = job.spec.clone();
         drop(jobs);
 
         self.append_wal(WalOperation::JobComplete {
@@ -430,6 +445,29 @@ impl ClusterManager {
         }
 
         debug!(job_id, exit_code, "job completed");
+
+        // Send completion notifications
+        let is_success = state == JobState::Completed;
+        let is_failure = matches!(
+            state,
+            JobState::Failed | JobState::Timeout | JobState::NodeFail
+        );
+        if is_success
+            && spec_for_notify
+                .mail_type
+                .iter()
+                .any(|t| t == "END" || t == "ALL")
+        {
+            self.send_notification(job_id, "END", &spec_for_notify);
+        }
+        if is_failure
+            && spec_for_notify
+                .mail_type
+                .iter()
+                .any(|t| t == "FAIL" || t == "ALL")
+        {
+            self.send_notification(job_id, "FAIL", &spec_for_notify);
+        }
 
         // Check for requeue: if the job has --requeue and hit a retriable state,
         // reset it to Pending so the scheduler picks it up again.
@@ -847,6 +885,89 @@ impl ClusterManager {
             .filter(|j| j.spec.name == name && j.spec.user == user)
             .cloned()
             .collect()
+    }
+
+    /// Create a new reservation.
+    pub fn create_reservation(&self, res: Reservation) -> anyhow::Result<()> {
+        let mut reservations = self.reservations.write();
+        if reservations.iter().any(|r| r.name == res.name) {
+            anyhow::bail!("reservation '{}' already exists", res.name);
+        }
+        info!(name = %res.name, "reservation created");
+        reservations.push(res);
+        Ok(())
+    }
+
+    /// Delete a reservation by name.
+    pub fn delete_reservation(&self, name: &str) -> anyhow::Result<()> {
+        let mut reservations = self.reservations.write();
+        let len_before = reservations.len();
+        reservations.retain(|r| r.name != name);
+        if reservations.len() == len_before {
+            anyhow::bail!("reservation '{}' not found", name);
+        }
+        info!(name, "reservation deleted");
+        Ok(())
+    }
+
+    /// Get all reservations.
+    pub fn get_reservations(&self) -> Vec<Reservation> {
+        self.reservations.read().clone()
+    }
+
+    /// Send a job event notification via webhook (if configured).
+    ///
+    /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
+    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
+        let webhook_url = self.config.notifications.webhook_url.clone();
+        if let Some(url) = webhook_url {
+            let event = event.to_string();
+            let user = spec.user.clone();
+            let mail_user = spec.mail_user.clone();
+            let job_name = spec.name.clone();
+            tokio::spawn(async move {
+                let payload = serde_json::json!({
+                    "job_id": job_id,
+                    "event": event,
+                    "job_name": job_name,
+                    "user": user,
+                    "mail_user": mail_user,
+                });
+                let payload_str = payload.to_string();
+                match tokio::process::Command::new("curl")
+                    .args([
+                        "-s",
+                        "-X",
+                        "POST",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        &payload_str,
+                        &url,
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            tracing::warn!(
+                                job_id,
+                                %event,
+                                "notification webhook returned non-zero exit"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id,
+                            %event,
+                            error = %e,
+                            "failed to send notification webhook"
+                        );
+                    }
+                }
+            });
+        }
     }
 
     fn append_wal(&self, op: WalOperation) {
