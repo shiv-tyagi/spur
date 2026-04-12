@@ -1,4 +1,5 @@
 mod cluster;
+mod leader_election;
 mod scheduler_loop;
 mod server;
 
@@ -32,6 +33,14 @@ struct Args {
     /// Foreground mode (don't daemonize)
     #[arg(short = 'D', long)]
     foreground: bool,
+
+    /// Enable K8s Lease-based leader election (for HA deployments)
+    #[arg(long)]
+    enable_leader_election: bool,
+
+    /// K8s namespace for the leader election Lease (default: spur)
+    #[arg(long, default_value = "spur")]
+    election_namespace: String,
 }
 
 #[tokio::main]
@@ -46,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(version = env!("CARGO_PKG_VERSION"), "spurctld starting");
+
+    // If leader election is enabled, wait until we acquire the Lease
+    if args.enable_leader_election {
+        info!("leader election enabled, acquiring K8s Lease...");
+        leader_election::acquire_lease(&args.election_namespace).await?;
+        info!("leader election: this instance is now the leader");
+    }
 
     // Load config if it exists, otherwise use defaults
     let mut config = if args.config.exists() {

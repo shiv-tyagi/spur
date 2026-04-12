@@ -6,8 +6,9 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::Client;
+use tokio::io::AsyncReadExt;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
@@ -371,19 +372,118 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
         let pod_name = format!("spur-job-{}", req.job_id);
-        Err(Status::unimplemented(format!(
-            "exec into K8s pod {} not yet implemented",
-            pod_name
-        )))
+        let command: Vec<String> = if req.command.is_empty() {
+            vec!["bash".into(), "-c".into(), "echo ok".into()]
+        } else {
+            req.command
+        };
+
+        debug!(pod = %pod_name, cmd = ?command, "exec in K8s pod");
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+
+        let attach = AttachParams {
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+            container: None,
+            max_stdin_buf_size: None,
+            max_stdout_buf_size: Some(1024 * 1024),
+            max_stderr_buf_size: Some(1024 * 1024),
+        };
+
+        let mut exec = pods
+            .exec(&pod_name, command, &attach)
+            .await
+            .map_err(|e| Status::internal(format!("exec failed: {e}")))?;
+
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+
+        if let Some(mut stdout) = exec.stdout() {
+            let _ = stdout.read_to_end(&mut stdout_data).await;
+        }
+        if let Some(mut stderr) = exec.stderr() {
+            let _ = stderr.read_to_end(&mut stderr_data).await;
+        }
+
+        let status = exec
+            .take_status()
+            .ok_or_else(|| Status::internal("no exit status"))?
+            .await
+            .ok_or_else(|| Status::internal("status channel closed"))?;
+
+        let exit_code = status
+            .status
+            .as_deref()
+            .map(|s| if s == "Success" { 0 } else { 1 })
+            .unwrap_or(1);
+
+        Ok(Response::new(ExecInJobResponse {
+            success: exit_code == 0,
+            exit_code,
+            stdout: String::from_utf8_lossy(&stdout_data).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_data).into_owned(),
+        }))
     }
 
     async fn stream_job_output(
         &self,
-        _request: Request<StreamJobOutputRequest>,
+        request: Request<StreamJobOutputRequest>,
     ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
-        Err(Status::unimplemented(
-            "output streaming not supported for K8s agent",
-        ))
+        let req = request.into_inner();
+        let pod_name = format!("spur-job-{}", req.job_id);
+
+        debug!(pod = %pod_name, "streaming logs from K8s pod");
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let log_params = kube::api::LogParams {
+            follow: true,
+            tail_lines: Some(100),
+            ..Default::default()
+        };
+
+        let log_stream = pods
+            .log_stream(&pod_name, &log_params)
+            .await
+            .map_err(|e| Status::internal(format!("log stream failed: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            use futures_util::AsyncReadExt;
+            let mut reader = log_stream;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(StreamJobOutputChunk {
+                                data: buf[..n].to_vec(),
+                                eof: false,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx
+                .send(Ok(StreamJobOutputChunk {
+                    data: Vec::new(),
+                    eof: true,
+                }))
+                .await;
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn attach_job(
