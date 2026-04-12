@@ -7,6 +7,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::finalizer::{self, finalizer, Event as FinalizerEvent};
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::Client;
 use tokio::sync::Mutex;
@@ -50,11 +51,14 @@ pub(crate) struct PodTracker {
 }
 
 /// Reconcile a SpurJob CRD: submit to Spur, track status, clean up.
+///
+/// Delegates to kube::runtime::finalizer which atomically manages the
+/// spur.ai/cleanup finalizer via Server-Side Apply, avoiding the TOCTOU
+/// race that a manual read-then-patch approach would have.
 async fn reconcile(
     job: Arc<SpurJob>,
     ctx: Arc<JobControllerCtx>,
 ) -> Result<Action, ReconcileError> {
-    let name = job.metadata.name.clone().unwrap_or_default();
     let ns = job
         .metadata
         .namespace
@@ -62,18 +66,41 @@ async fn reconcile(
         .unwrap_or_else(|| ctx.namespace.clone());
     let api: Api<SpurJob> = Api::namespaced(ctx.client.clone(), &ns);
 
+    finalizer(&api, FINALIZER, job, |event| {
+        let api = api.clone();
+        let ctx = ctx.clone();
+        async move {
+            match event {
+                FinalizerEvent::Apply(job) => handle_job(job, &api, &ctx).await,
+                FinalizerEvent::Cleanup(job) => handle_deletion(&job, &ctx).await,
+            }
+        }
+    })
+    .await
+    .map_err(map_finalizer_err)
+}
+
+fn map_finalizer_err(e: finalizer::Error<ReconcileError>) -> ReconcileError {
+    match e {
+        finalizer::Error::ApplyFailed(e) => e,
+        finalizer::Error::CleanupFailed(e) => e,
+        finalizer::Error::AddFinalizer(e) => ReconcileError::Kube(e),
+        finalizer::Error::RemoveFinalizer(e) => ReconcileError::Kube(e),
+        finalizer::Error::UnnamedObject => ReconcileError::Other("unnamed SpurJob".into()),
+        finalizer::Error::InvalidFinalizer => {
+            ReconcileError::Other(format!("{FINALIZER} is not a valid finalizer name"))
+        }
+    }
+}
+
+/// Normal reconcile path: submit job to Spur and poll for status changes.
+async fn handle_job(
+    job: Arc<SpurJob>,
+    api: &Api<SpurJob>,
+    ctx: &JobControllerCtx,
+) -> Result<Action, ReconcileError> {
+    let name = job.metadata.name.clone().unwrap_or_default();
     let status = job.status.clone().unwrap_or_default();
-
-    // Handle deletion with finalizer
-    if job.metadata.deletion_timestamp.is_some() {
-        return handle_deletion(&api, &name, &status, &ctx).await;
-    }
-
-    // Ensure finalizer is set
-    if !has_finalizer(&job) {
-        add_finalizer(&api, &name).await;
-        return Ok(Action::requeue(Duration::from_secs(1)));
-    }
 
     // If already in terminal state, nothing to do
     if is_terminal(&status.state) {
@@ -112,7 +139,7 @@ async fn reconcile(
                     spur_job_id: Some(job_id),
                     ..status
                 };
-                patch_status(&api, &name, &new_status).await;
+                patch_status(api, &name, &new_status).await;
             }
             Err(e) => {
                 error!(spurjob = %name, error = %e, "failed to submit SpurJob");
@@ -143,7 +170,7 @@ async fn reconcile(
                         .map(|s| s.trim().to_string())
                         .collect();
                 }
-                patch_status(&api, &name, &new_status).await;
+                patch_status(api, &name, &new_status).await;
             }
 
             if is_terminal(&spur_state) {
@@ -159,13 +186,12 @@ async fn reconcile(
     }
 }
 
-/// Handle SpurJob deletion: cancel Spur job, clean up Pods/Services, remove finalizer.
-async fn handle_deletion(
-    api: &Api<SpurJob>,
-    name: &str,
-    status: &SpurJobStatus,
-    ctx: &JobControllerCtx,
-) -> Result<Action, ReconcileError> {
+/// Handle SpurJob deletion: cancel Spur job, clean up Pods/Services.
+/// kube::runtime::finalizer removes spur.ai/cleanup automatically after this returns Ok.
+async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action, ReconcileError> {
+    let name = job.metadata.name.clone().unwrap_or_default();
+    let status = job.status.clone().unwrap_or_default();
+
     info!(spurjob = %name, "handling SpurJob deletion");
 
     // Cancel the Spur job if it has an ID and isn't terminal
@@ -196,9 +222,6 @@ async fn handle_deletion(
         let svc_name = format!("spur-job-{}", job_id);
         let _ = services.delete(&svc_name, &DeleteParams::default()).await;
     }
-
-    // Remove finalizer
-    remove_finalizer(api, name).await;
 
     Ok(Action::await_change())
 }
@@ -506,37 +529,6 @@ async fn patch_status(api: &Api<SpurJob>, name: &str, status: &SpurJobStatus) {
     }
 }
 
-fn has_finalizer(job: &SpurJob) -> bool {
-    job.metadata
-        .finalizers
-        .as_ref()
-        .map_or(false, |f| f.contains(&FINALIZER.to_string()))
-}
-
-async fn add_finalizer(api: &Api<SpurJob>, name: &str) {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": [FINALIZER]
-        }
-    });
-    let pp = PatchParams::apply("spur-k8s-operator");
-    if let Err(e) = api.patch(name, &pp, &Patch::Merge(&patch)).await {
-        error!(spurjob = %name, error = %e, "failed to add finalizer");
-    }
-}
-
-async fn remove_finalizer(api: &Api<SpurJob>, name: &str) {
-    let patch = serde_json::json!({
-        "metadata": {
-            "finalizers": []
-        }
-    });
-    let pp = PatchParams::apply("spur-k8s-operator");
-    if let Err(e) = api.patch(name, &pp, &Patch::Merge(&patch)).await {
-        error!(spurjob = %name, error = %e, "failed to remove finalizer");
-    }
-}
-
 fn is_terminal(state: &str) -> bool {
     matches!(
         state,
@@ -692,74 +684,6 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
-    }
-
-    // --- has_finalizer ---
-
-    use crate::crd::{GpuRequirement, SpurJobSpec};
-
-    fn test_spec() -> SpurJobSpec {
-        SpurJobSpec {
-            name: "test".into(),
-            image: "test:latest".into(),
-            gpus: GpuRequirement::default(),
-            num_nodes: 1,
-            tasks_per_node: 1,
-            cpus_per_task: 1,
-            memory_per_node: None,
-            time_limit: None,
-            command: vec![],
-            args: vec![],
-            env: Default::default(),
-            partition: None,
-            account: None,
-            volumes: vec![],
-            host_network: false,
-            tolerations: vec![],
-            node_selector: Default::default(),
-            priority_class: None,
-            service_account: None,
-            array_spec: None,
-            dependencies: vec![],
-        }
-    }
-
-    #[test]
-    fn test_has_finalizer_present() {
-        let mut job = SpurJob::new("test", test_spec());
-        job.metadata.finalizers = Some(vec![FINALIZER.to_string()]);
-        assert!(has_finalizer(&job));
-    }
-
-    #[test]
-    fn test_has_finalizer_absent() {
-        let job = SpurJob::new("test", test_spec());
-        assert!(!has_finalizer(&job));
-    }
-
-    #[test]
-    fn test_has_finalizer_empty_vec() {
-        let mut job = SpurJob::new("test", test_spec());
-        job.metadata.finalizers = Some(vec![]);
-        assert!(!has_finalizer(&job));
-    }
-
-    #[test]
-    fn test_has_finalizer_other_finalizer() {
-        let mut job = SpurJob::new("test", test_spec());
-        job.metadata.finalizers = Some(vec!["other.io/cleanup".to_string()]);
-        assert!(!has_finalizer(&job));
-    }
-
-    #[test]
-    fn test_has_finalizer_among_multiple() {
-        let mut job = SpurJob::new("test", test_spec());
-        job.metadata.finalizers = Some(vec![
-            "other.io/cleanup".to_string(),
-            FINALIZER.to_string(),
-            "another.io/finalizer".to_string(),
-        ]);
-        assert!(has_finalizer(&job));
     }
 
     // --- extract_failure_details ---
@@ -1091,5 +1015,46 @@ mod tests {
         assert_eq!(proto.gres, vec!["gpu:mi300x:8"]);
         assert_eq!(proto.dependency, vec!["afterok:42"]);
         assert_eq!(proto.array_spec, "0-99%10");
+    }
+
+    // --- map_finalizer_err ---
+
+    #[test]
+    fn test_map_finalizer_err_unnamed_object() {
+        let err = map_finalizer_err(finalizer::Error::UnnamedObject);
+        assert!(
+            matches!(&err, ReconcileError::Other(msg) if msg == "unnamed SpurJob"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_map_finalizer_err_invalid_finalizer_contains_name() {
+        let err = map_finalizer_err(finalizer::Error::InvalidFinalizer);
+        let ReconcileError::Other(msg) = &err else {
+            panic!("expected Other, got {err:?}");
+        };
+        assert!(
+            msg.contains(FINALIZER),
+            "message should name the finalizer: {msg}"
+        );
+        assert!(
+            msg.contains("not a valid"),
+            "message should say it's invalid: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_map_finalizer_err_apply_failed_is_passthrough() {
+        let inner = ReconcileError::Other("apply failure".into());
+        let err = map_finalizer_err(finalizer::Error::ApplyFailed(inner));
+        assert!(matches!(&err, ReconcileError::Other(msg) if msg == "apply failure"));
+    }
+
+    #[test]
+    fn test_map_finalizer_err_cleanup_failed_is_passthrough() {
+        let inner = ReconcileError::Other("cleanup failure".into());
+        let err = map_finalizer_err(finalizer::Error::CleanupFailed(inner));
+        assert!(matches!(&err, ReconcileError::Other(msg) if msg == "cleanup failure"));
     }
 }
