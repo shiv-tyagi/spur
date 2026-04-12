@@ -26,3 +26,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hostname = "0.4.2"
 tokio-stream = "0.1.18"
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
