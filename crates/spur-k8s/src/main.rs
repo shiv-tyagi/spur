@@ -6,7 +6,9 @@ mod job_controller;
 mod node_watcher;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use clap::{Parser, Subcommand};
 use kube::Client;
 use tracing::info;
@@ -189,19 +191,23 @@ where
     F: FnMut() -> std::pin::Pin<Box<Fut>>,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let mut backoff = std::time::Duration::from_secs(1);
-    let max_backoff = std::time::Duration::from_secs(60);
+    let mut eb = ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_secs(1))
+        .with_multiplier(2.0)
+        .with_max_interval(Duration::from_secs(60))
+        .with_max_elapsed_time(None)
+        .build();
 
     loop {
         match factory().await {
             Ok(()) => {
                 tracing::warn!(%name, "task exited cleanly, restarting");
-                backoff = std::time::Duration::from_secs(1);
+                eb.reset();
             }
             Err(e) => {
-                tracing::error!(%name, error = %e, backoff_secs = backoff.as_secs(), "task failed, retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, max_backoff);
+                let delay = eb.next_backoff().unwrap_or(Duration::from_secs(60));
+                tracing::error!(%name, error = %e, delay_secs = delay.as_secs(), "task failed, retrying");
+                tokio::time::sleep(delay).await;
             }
         }
     }
