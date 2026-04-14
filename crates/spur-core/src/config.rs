@@ -90,6 +90,15 @@ pub struct ControllerConfig {
     /// First job ID.
     #[serde(default = "default_one")]
     pub first_job_id: u32,
+
+    /// Raft peers for HA consensus. Each entry is "host:port" (gRPC address).
+    /// If empty, single-node mode (no Raft, no replication).
+    /// Example: ["node1:6817", "node2:6817", "node3:6817"]
+    #[serde(default)]
+    pub peers: Vec<String>,
+
+    /// This node's Raft ID. If not set, auto-assigned from position in peers list.
+    pub node_id: Option<u64>,
 }
 
 fn default_listen_addr() -> String {
@@ -117,6 +126,8 @@ impl Default for ControllerConfig {
             state_dir: "/var/spool/spur".into(),
             max_job_id: 999_999_999,
             first_job_id: 1,
+            peers: Vec::new(),
+            node_id: None,
         }
     }
 }
