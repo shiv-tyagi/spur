@@ -694,6 +694,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     // --- proto_job_state_to_string ---
 
@@ -1121,5 +1122,107 @@ mod tests {
         let inner = ReconcileError::Other("cleanup failure".into());
         let err = map_finalizer_err(finalizer::Error::CleanupFailed(inner));
         assert!(matches!(&err, ReconcileError::Other(msg) if msg == "cleanup failure"));
+    }
+
+    // --- has_job_id_label ---
+
+    fn make_spurjob(labels: Option<BTreeMap<String, String>>, namespace: Option<&str>) -> SpurJob {
+        SpurJob {
+            metadata: kube::api::ObjectMeta {
+                name: Some("test-job".into()),
+                namespace: namespace.map(String::from),
+                labels: labels,
+                ..Default::default()
+            },
+            spec: crate::crd::SpurJobSpec {
+                name: "test".into(),
+                image: "test:latest".into(),
+                gpus: Default::default(),
+                num_nodes: 1,
+                tasks_per_node: 1,
+                cpus_per_task: 1,
+                memory_per_node: None,
+                time_limit: None,
+                command: vec![],
+                args: vec![],
+                env: Default::default(),
+                partition: None,
+                account: None,
+                volumes: vec![],
+                host_network: false,
+                tolerations: vec![],
+                node_selector: Default::default(),
+                priority_class: None,
+                service_account: None,
+                array_spec: None,
+                dependencies: vec![],
+            },
+            status: None,
+        }
+    }
+
+    #[test]
+    fn test_has_job_id_label_present() {
+        let labels = BTreeMap::from([("spur.ai/job-id".into(), "42".into())]);
+        let job = make_spurjob(Some(labels), Some("default"));
+        assert!(has_job_id_label(&job));
+    }
+
+    #[test]
+    fn test_has_job_id_label_absent() {
+        let job = make_spurjob(Some(BTreeMap::new()), Some("default"));
+        assert!(!has_job_id_label(&job));
+    }
+
+    #[test]
+    fn test_has_job_id_label_none_labels() {
+        let job = make_spurjob(None, Some("default"));
+        assert!(!has_job_id_label(&job));
+    }
+
+    #[test]
+    fn test_has_job_id_label_other_labels_only() {
+        let labels = BTreeMap::from([
+            ("spur.ai/managed-by".into(), "spur-k8s-operator".into()),
+            ("app".into(), "training".into()),
+        ]);
+        let job = make_spurjob(Some(labels), Some("default"));
+        assert!(!has_job_id_label(&job));
+    }
+
+    #[test]
+    fn test_has_job_id_label_among_others() {
+        let labels = BTreeMap::from([
+            ("spur.ai/managed-by".into(), "spur-k8s-operator".into()),
+            ("spur.ai/job-id".into(), "99".into()),
+        ]);
+        let job = make_spurjob(Some(labels), Some("default"));
+        assert!(has_job_id_label(&job));
+    }
+
+    // --- namespace extraction (reconcile error path) ---
+
+    #[test]
+    fn test_namespace_missing_produces_error() {
+        let job = make_spurjob(None, None);
+        let result = job
+            .metadata
+            .namespace
+            .clone()
+            .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()));
+        assert!(
+            matches!(&result, Err(ReconcileError::Other(msg)) if msg == "SpurJob has no namespace")
+        );
+    }
+
+    #[test]
+    fn test_namespace_present_is_extracted() {
+        let job = make_spurjob(None, Some("ml-team"));
+        let result = job
+            .metadata
+            .namespace
+            .clone()
+            .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()));
+        assert_eq!(result.unwrap(), "ml-team");
     }
 }
