@@ -26,6 +26,7 @@ repository = "https://github.com/ROCm/spur"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+backoff = { version = "0.4", features = ["tokio"] }
 
 # gRPC + protobuf
 tonic = "0.12"

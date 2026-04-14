@@ -28,3 +28,4 @@ futures-util = { workspace = true }
 axum = { workspace = true }
 hostname = "0.4.2"
 tokio-stream = "0.1"
+backoff = { workspace = true }
