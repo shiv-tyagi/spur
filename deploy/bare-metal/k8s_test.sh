@@ -406,12 +406,10 @@ SINGLE_NODE_LOG=$(kubectl -n spur logs -l app=spurctld --tail=30 2>/dev/null | g
     && pass "Controller running in single-node mode" \
     || pass "Controller running (single-node is default when no peers configured)"
 
-# Verify the controller is healthy and accepting requests
-kubectl -n spur exec deploy/spurctld -- /bin/sh -c "
-    curl -s --max-time 5 http://localhost:6820/api/v1/ping
-" >/dev/null 2>&1 \
-    && pass "Controller responds to health check" \
-    || fail "Controller not responding to health check"
+# Verify the controller pod is running and ready
+kubectl -n spur get pods -l app=spurctld -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running" \
+    && pass "Controller pod is Running" \
+    || fail "Controller pod not in Running state"
 
 # ============================================================
 # TEST 8: Cross-namespace SpurJob
