@@ -7,6 +7,15 @@ data:
   spur.conf: |
     cluster_name = "spur-k8s"
 
+    [controller]
+    # Raft peers use StatefulSet DNS names on the dedicated Raft port.
+    # node_id is auto-detected from the pod hostname ordinal (spurctld-N → N+1).
+    peers = [
+      "spurctld-0.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-1.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-2.spurctld.spur.svc.cluster.local:6821",
+    ]
+
     [scheduler]
     interval_secs = 2
     max_jobs_per_cycle = 100
