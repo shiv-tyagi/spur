@@ -190,11 +190,14 @@ data:
     default_time = "10m"
 EOF
 
-# Deploy controller + operator with CI image
-for f in spurctld.yaml operator.yaml; do
-    sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/${f}" \
-        | kubectl apply -f -
-done
+# Deploy controller + operator with CI image.
+# Patch spurctld to 1 replica for CI (Raft HA needs peers configured;
+# CI tests single-node mode).
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/spurctld.yaml" \
+    | sed 's|replicas: 3|replicas: 1|g' \
+    | kubectl apply -f -
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/operator.yaml" \
+    | kubectl apply -f -
 
 # Wait for pods to be ready
 kubectl -n spur wait --for=condition=Available deployment/spur-k8s-operator --timeout=120s \
@@ -399,16 +402,8 @@ done
 # ============================================================
 section "TEST 7: Single-node mode (no Raft peers)"
 
-# Verify the controller is running in single-node mode (no peers configured)
-# This is the default — no --enable-leader-election flag needed.
-SINGLE_NODE_LOG=$(kubectl -n spur logs -l app=spurctld --tail=30 2>/dev/null | grep "single-node mode" || true)
-[ -n "$SINGLE_NODE_LOG" ] \
-    && pass "Controller running in single-node mode" \
-    || pass "Controller running (single-node is default when no peers configured)"
-
-# Verify the controller pod is running and ready
 kubectl -n spur get pods -l app=spurctld -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running" \
-    && pass "Controller pod is Running" \
+    && pass "Controller pod is Running in single-node mode" \
     || fail "Controller pod not in Running state"
 
 # ============================================================
@@ -472,6 +467,121 @@ fi
 
 kubectl delete spurjob test-cross-ns -n "$CROSS_NS" --timeout=30s 2>/dev/null || true
 kubectl delete namespace "$CROSS_NS" --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 9: Raft HA — deploy 3-replica cluster
+# ============================================================
+section "TEST 9: Raft HA cluster setup"
+
+# Tear down single-node controller
+kubectl -n spur delete statefulset spurctld --timeout=30s 2>/dev/null || true
+kubectl -n spur delete svc spurctld --timeout=10s 2>/dev/null || true
+for pvc in spool-spurctld-0 spool-spurctld-1 spool-spurctld-2; do
+    kubectl -n spur delete pvc "$pvc" --timeout=10s 2>/dev/null || true
+done
+sleep 5
+
+kubectl apply -f - <<'RAFTCFG'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spur-config
+  namespace: spur
+data:
+  spur.conf: |
+    cluster_name = "k8s-ci-raft"
+    [controller]
+    peers = [
+      "spurctld-0.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-1.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-2.spurctld.spur.svc.cluster.local:6821",
+    ]
+    [scheduler]
+    interval_secs = 1
+    plugin = "backfill"
+    [[partitions]]
+    name = "default"
+    state = "UP"
+    default = true
+    nodes = "ALL"
+    max_time = "1h"
+    default_time = "10m"
+RAFTCFG
+
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/spurctld.yaml" \
+    | kubectl apply -f -
+
+echo "  Waiting for 3-replica Raft cluster..."
+sleep 45
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s 2>/dev/null
+
+# Voter initialization restart
+kubectl -n spur delete pod spurctld-0 spurctld-1 spurctld-2 --grace-period=5 2>/dev/null || true
+sleep 35
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s 2>/dev/null
+sleep 10
+
+RUNNING=$(kubectl -n spur get pods -l app=spurctld --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+[ "$RUNNING" -eq 3 ] \
+    && pass "3-replica Raft cluster deployed" \
+    || fail "Expected 3 running pods, got $RUNNING"
+
+# ============================================================
+# TEST 10: Raft leader election
+# ============================================================
+section "TEST 10: Raft leader election"
+
+LEADER_FOUND=false
+for attempt in $(seq 1 10); do
+    for i in 0 1 2; do
+        VOTE=$(kubectl -n spur exec spurctld-$i -- cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+        if echo "$VOTE" | grep -q '"committed":true'; then
+            LEADER_FOUND=true
+            pass "Committed vote found on spurctld-$i"
+            break 2
+        fi
+    done
+    sleep 3
+done
+$LEADER_FOUND || fail "No committed leader vote after 30s"
+
+# ============================================================
+# TEST 11: Raft state replication
+# ============================================================
+section "TEST 11: Raft state replication"
+
+BOUND=$(kubectl -n spur get pvc --no-headers 2>/dev/null | grep -c Bound || true)
+[ "$BOUND" -ge 3 ] \
+    && pass "All 3 PVCs bound" \
+    || fail "Only $BOUND PVCs bound"
+
+ALL_HAVE_LOGS=true
+for i in 0 1 2; do
+    LC=$(kubectl -n spur exec spurctld-$i -- ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+    [ "$LC" -eq 0 ] && ALL_HAVE_LOGS=false
+done
+$ALL_HAVE_LOGS \
+    && pass "All nodes have Raft log entries on disk" \
+    || fail "Some nodes missing Raft log entries"
+
+# ============================================================
+# TEST 12: Raft failover recovery
+# ============================================================
+section "TEST 12: Raft failover recovery"
+
+kubectl -n spur delete pod spurctld-0 --grace-period=0 --force 2>/dev/null || true
+sleep 20
+kubectl -n spur wait --for=condition=Ready pod/spurctld-0 --timeout=60s 2>/dev/null
+
+PODS_READY=$(kubectl -n spur get pods -l app=spurctld --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+[ "$PODS_READY" -eq 3 ] \
+    && pass "Cluster recovered after pod kill (3 pods running)" \
+    || fail "Cluster not fully recovered ($PODS_READY pods running)"
+
+VOTE_AFTER=$(kubectl -n spur exec spurctld-0 -- cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+echo "$VOTE_AFTER" | grep -q '"committed":true' \
+    && pass "Restarted pod recovered Raft state from PVC" \
+    || fail "Restarted pod has no committed vote"
 
 # ============================================================
 # Summary
