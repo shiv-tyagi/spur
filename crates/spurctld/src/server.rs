@@ -773,12 +773,11 @@ pub async fn serve(
         .peers
         .iter()
         .map(|(id, raft_addr)| {
-            let client_addr =
-                if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
-                    format!("{}:6817", host)
-                } else {
-                    format!("{}:6817", raft_addr)
-                };
+            let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
+                format!("{}:6817", host)
+            } else {
+                format!("{}:6817", raft_addr)
+            };
             (*id, client_addr)
         })
         .collect();

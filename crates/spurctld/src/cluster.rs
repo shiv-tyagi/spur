@@ -1505,7 +1505,6 @@ impl ClusterManager {
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
     }
-
 }
 
 /// Snapshot data for Raft serialization.
@@ -1636,14 +1635,9 @@ mod tests {
 
     async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
         let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
-        let handle = crate::raft::start_raft(
-            1,
-            &["[::1]:0".into()],
-            dir.path(),
-            cm.clone(),
-        )
-        .await
-        .unwrap();
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
         cm.set_raft(handle.raft);
         cm
     }
