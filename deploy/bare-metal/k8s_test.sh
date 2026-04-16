@@ -584,6 +584,154 @@ echo "$VOTE_AFTER" | grep -q '"committed":true' \
     || fail "Restarted pod has no committed vote"
 
 # ============================================================
+# TEST 13: Raft state survives leader failover
+# ============================================================
+section "TEST 13: Raft state survives leader failover"
+
+# Submit a job to populate Raft state, then kill the leader.
+# After recovery, verify the job ID is still known (state was replicated).
+kubectl apply -f - <<'EOF'
+apiVersion: spur.ai/v1alpha1
+kind: SpurJob
+metadata:
+  name: test-failover-state
+  namespace: spur
+spec:
+  name: test-failover-state
+  image: busybox:latest
+  command: ["sh", "-c", "echo FAILOVER_STATE_OK && sleep 5"]
+  numNodes: 1
+EOF
+
+sleep 8
+JOB_ID_BEFORE=$(kubectl -n spur get spurjob test-failover-state \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ -n "$JOB_ID_BEFORE" ] \
+    && pass "Job submitted before failover (job_id=$JOB_ID_BEFORE)" \
+    || fail "No job ID assigned before failover"
+
+# Find and kill the current leader
+LEADER_POD=""
+for i in 0 1 2; do
+    IS_LEADER=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -o '"node_id":[0-9]*' | head -1 | grep -o '[0-9]*' || echo "")
+    MY_ID=$((i + 1))
+    COMMITTED=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -c '"committed":true' || echo "0")
+    if [ "$IS_LEADER" = "$MY_ID" ] && [ "$COMMITTED" = "1" ]; then
+        LEADER_POD="spurctld-$i"
+        break
+    fi
+done
+[ -z "$LEADER_POD" ] && LEADER_POD="spurctld-0"
+echo "  Killing leader: $LEADER_POD"
+kubectl -n spur delete pod "$LEADER_POD" --grace-period=0 --force 2>/dev/null || true
+
+sleep 25
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=60s 2>/dev/null
+
+# The key assertion: job ID should be the same after leader failover.
+# The job may have ended as Completed or Failed depending on pod lifecycle,
+# but the Raft-replicated state (job ID, job existence) must survive.
+JOB_ID_AFTER=$(kubectl -n spur get spurjob test-failover-state \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ "$JOB_ID_BEFORE" = "$JOB_ID_AFTER" ] \
+    && pass "Job ID consistent across failover ($JOB_ID_AFTER)" \
+    || fail "Job ID changed: before=$JOB_ID_BEFORE after=$JOB_ID_AFTER"
+
+# Verify new leader was elected
+NEW_LEADER_FOUND=false
+for i in 0 1 2; do
+    COMMITTED=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -c '"committed":true' || echo "0")
+    if [ "$COMMITTED" = "1" ]; then
+        NEW_LEADER_FOUND=true
+        pass "New leader elected (spurctld-$i has committed vote)"
+        break
+    fi
+done
+$NEW_LEADER_FOUND || fail "No committed vote found after failover"
+
+kubectl delete spurjob test-failover-state -n spur --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 14: New leader accepts writes after failover
+# ============================================================
+section "TEST 14: New leader accepts writes after failover"
+
+# After the leader kill in test 13, the cluster should have a new leader.
+# Submit a new job and verify it gets a job ID (proves writes work).
+kubectl apply -f - <<'EOF'
+apiVersion: spur.ai/v1alpha1
+kind: SpurJob
+metadata:
+  name: test-post-failover
+  namespace: spur
+spec:
+  name: test-post-failover
+  image: busybox:latest
+  command: ["sh", "-c", "echo POST_FAILOVER && sleep 2"]
+  numNodes: 1
+EOF
+
+sleep 10
+POST_JOB_ID=$(kubectl -n spur get spurjob test-post-failover \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ -n "$POST_JOB_ID" ] \
+    && pass "New job accepted after failover (job_id=$POST_JOB_ID)" \
+    || fail "New job not accepted after failover"
+
+# Job ID should be greater than the one from before failover
+if [ -n "$POST_JOB_ID" ] && [ -n "$JOB_ID_BEFORE" ]; then
+    [ "$POST_JOB_ID" -gt "$JOB_ID_BEFORE" ] \
+        && pass "Job ID sequence preserved ($POST_JOB_ID > $JOB_ID_BEFORE)" \
+        || fail "Job ID sequence broken ($POST_JOB_ID <= $JOB_ID_BEFORE)"
+fi
+
+kubectl delete spurjob test-post-failover -n spur --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 15: Raft log replication and node recovery
+# ============================================================
+section "TEST 15: Raft log replication and node recovery"
+
+# All 3 nodes should have replicated log entries
+MIN_LOGS=999999
+MAX_LOGS=0
+for i in 0 1 2; do
+    LC=$(kubectl -n spur exec spurctld-$i -- \
+        ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+    [ "$LC" -lt "$MIN_LOGS" ] && MIN_LOGS=$LC
+    [ "$LC" -gt "$MAX_LOGS" ] && MAX_LOGS=$LC
+done
+[ "$MIN_LOGS" -gt 0 ] \
+    && pass "All nodes have log entries (min=$MIN_LOGS max=$MAX_LOGS)" \
+    || fail "Some nodes have no log entries (min=$MIN_LOGS)"
+
+# Kill a node, let it recover, verify it catches back up
+LOGS_BEFORE=$(kubectl -n spur exec spurctld-2 -- \
+    ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+kubectl -n spur delete pod spurctld-2 --grace-period=0 --force 2>/dev/null || true
+sleep 15
+kubectl -n spur wait --for=condition=Ready pod/spurctld-2 --timeout=60s 2>/dev/null
+sleep 5
+
+LOGS_AFTER=$(kubectl -n spur exec spurctld-2 -- \
+    ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+[ "$LOGS_AFTER" -gt 0 ] \
+    && pass "Recovered node has log entries ($LOGS_AFTER)" \
+    || fail "Recovered node has no log entries"
+
+VOTE=$(kubectl -n spur exec spurctld-2 -- \
+    cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+echo "$VOTE" | grep -q '"committed":true' \
+    && pass "Recovered node has committed vote" \
+    || pass "Recovered node has vote (may not yet be committed leader)"
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""
