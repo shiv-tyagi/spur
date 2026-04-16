@@ -88,7 +88,7 @@ jobs:
 
       - name: Build release binaries
         run: |
-          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           cargo build --release -j 4
 
       - name: Stop any running cluster and clear state
