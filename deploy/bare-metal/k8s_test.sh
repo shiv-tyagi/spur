@@ -191,8 +191,8 @@ data:
 EOF
 
 # Deploy controller + operator with CI image.
-# Patch spurctld to 1 replica for CI (Raft HA needs peers configured;
-# CI tests single-node mode).
+# Patch spurctld to 1 replica for CI (single-node Raft self-elects;
+# no peers config needed).
 sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/spurctld.yaml" \
     | sed 's|replicas: 3|replicas: 1|g' \
     | kubectl apply -f -
@@ -398,12 +398,12 @@ for i in 1 2 3; do
 done
 
 # ============================================================
-# TEST 7: Single-node mode (no Raft peers = standalone)
+# TEST 7: Single-node mode (implicit single-node Raft cluster)
 # ============================================================
-section "TEST 7: Single-node mode (no Raft peers)"
+section "TEST 7: Single-node Raft mode (no peers configured)"
 
 kubectl -n spur get pods -l app=spurctld -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running" \
-    && pass "Controller pod is Running in single-node mode" \
+    && pass "Controller pod is Running in single-node Raft mode" \
     || fail "Controller pod not in Running state"
 
 # ============================================================

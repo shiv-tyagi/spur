@@ -390,8 +390,8 @@ spur submit --dependency=afterany:$JOB2 eval.sh
   │    spurctld      │  Port 6817 (gRPC)
   │  - backfill      │  Port 6820 (REST, via spurrestd)
   │    scheduler     │
-  │  - WAL + redb    │
-  │    state store   │
+  │  - Raft log +    │
+  │    snapshots     │
   └────────┬────────┘
            │  dispatches jobs via gRPC
     ┌──────┼──────┐
@@ -405,7 +405,7 @@ spur submit --dependency=afterany:$JOB2 eval.sh
 - **spurctld** is the brain — one instance, manages all state, runs the scheduler
 - **spurd** runs on every compute node — receives jobs, manages processes via cgroups v2
 - Communication is all gRPC over WireGuard (encrypted, NAT-proof)
-- State survives restarts via WAL + periodic snapshots (redb)
+- State survives restarts via Raft log + periodic snapshots (always-on, even single-node)
 
 ## Troubleshooting
 
