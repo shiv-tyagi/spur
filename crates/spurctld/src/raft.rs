@@ -630,8 +630,17 @@ pub async fn start_raft(
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
     let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
 
-    if node_id == 1 {
-        bootstrap_cluster(&raft, &peer_map).await;
+    // Symmetric bootstrap: every node calls initialize with the full
+    // membership. Openraft guarantees that when all nodes use the same
+    // membership, the voting protocol picks exactly one leader. On
+    // subsequent restarts initialize() returns "already initialized"
+    // (benign) and normal Raft elections take over.
+    let members: BTreeMap<NodeId, BasicNode> = peer_map
+        .iter()
+        .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
+        .collect();
+    if let Err(e) = raft.initialize(members).await {
+        debug!("raft initialize: {e} (already initialized)");
     }
 
     info!(node_id, peers = ?peer_map, "raft node started");
@@ -640,81 +649,6 @@ pub async fn start_raft(
         node_id,
         peers: peer_map,
     })
-}
-
-/// Bootstrap: node 1 initializes as a single-member cluster, then expands
-/// membership via add_learner + change_membership. This avoids the
-/// Learner-on-first-boot bug where nodes start with empty membership
-/// and never transition to voters.
-async fn bootstrap_cluster(raft: &SpurRaft, peer_map: &BTreeMap<NodeId, String>) {
-    let mut self_member = BTreeMap::new();
-    self_member.insert(
-        1u64,
-        BasicNode::new(peer_map.get(&1).cloned().unwrap_or_default()),
-    );
-    if let Err(e) = raft.initialize(self_member).await {
-        debug!("raft initialize: {e} (may be already initialized)");
-    }
-
-    if peer_map.len() <= 1 {
-        return;
-    }
-
-    let raft = raft.clone();
-    let peer_map = peer_map.clone();
-    tokio::spawn(async move {
-        wait_for_leadership(&raft, 1).await;
-        add_peers_with_retry(&raft, &peer_map).await;
-        expand_voter_set(&raft, &peer_map).await;
-    });
-}
-
-async fn wait_for_leadership(raft: &SpurRaft, expected_leader: NodeId) {
-    for _ in 0..20 {
-        if raft.metrics().borrow().current_leader == Some(expected_leader) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    warn!("timed out waiting for leadership");
-}
-
-/// Retry adding each peer as a learner until reachable.
-/// Peers may not be running yet (bare-metal simultaneous start).
-async fn add_peers_with_retry(raft: &SpurRaft, peer_map: &BTreeMap<NodeId, String>) {
-    for (id, addr) in peer_map {
-        if *id == 1 {
-            continue;
-        }
-        let node = BasicNode::new(addr.clone());
-        for attempt in 1..=30 {
-            match raft.add_learner(*id, node.clone(), true).await {
-                Ok(_) => {
-                    info!(node_id = id, "peer added as learner");
-                    break;
-                }
-                Err(e) => {
-                    if attempt == 30 {
-                        warn!(node_id = id, error = %e, "failed to add peer after 30 attempts");
-                    } else {
-                        debug!(node_id = id, attempt, "add_learner retry: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn expand_voter_set(raft: &SpurRaft, peer_map: &BTreeMap<NodeId, String>) {
-    let voter_ids = peer_map
-        .keys()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    match raft.change_membership(voter_ids, false).await {
-        Ok(_) => info!("raft membership expanded to all peers"),
-        Err(e) => warn!("change_membership failed: {e}"),
-    }
 }
 
 #[cfg(test)]
