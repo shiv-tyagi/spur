@@ -77,7 +77,7 @@ jobs:
 
   cluster:
     name: Cluster Tests (2x MI300X)
-    runs-on: [self-hosted, mi300x]
+    runs-on: [self-hosted, mi300x, primary]
     needs: [build-and-test, fmt, clippy]
     # Only one cluster run at a time; cancel older runs on the same ref.
     concurrency:
