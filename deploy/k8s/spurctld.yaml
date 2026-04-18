@@ -10,7 +10,10 @@ spec:
     - name: grpc
       port: 6817
       targetPort: 6817
-  clusterIP: None  # headless for StatefulSet
+    - name: raft
+      port: 6821
+      targetPort: 6821
+  clusterIP: None  # headless for StatefulSet peer DNS
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -19,7 +22,7 @@ metadata:
   namespace: spur
 spec:
   serviceName: spurctld
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: spurctld
@@ -39,6 +42,8 @@ spec:
           ports:
             - containerPort: 6817
               name: grpc
+            - containerPort: 6821
+              name: raft
           volumeMounts:
             - name: config
               mountPath: /etc/spur
@@ -58,13 +63,11 @@ spec:
         - name: config
           configMap:
             name: spur-config
-        - name: spool
-          emptyDir: {}
-  # volumeClaimTemplates:
-  #   - metadata:
-  #       name: spool
-  #     spec:
-  #       accessModes: [ReadWriteOnce]
-  #       resources:
-  #         requests:
-  #           storage: 10Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: spool
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

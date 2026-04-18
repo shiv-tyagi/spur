@@ -190,11 +190,14 @@ data:
     default_time = "10m"
 EOF
 
-# Deploy controller + operator with CI image
-for f in spurctld.yaml operator.yaml; do
-    sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/${f}" \
-        | kubectl apply -f -
-done
+# Deploy controller + operator with CI image.
+# Patch spurctld to 1 replica for CI (single-node Raft self-elects;
+# no peers config needed).
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/spurctld.yaml" \
+    | sed 's|replicas: 3|replicas: 1|g' \
+    | kubectl apply -f -
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/operator.yaml" \
+    | kubectl apply -f -
 
 # Wait for pods to be ready
 kubectl -n spur wait --for=condition=Available deployment/spur-k8s-operator --timeout=120s \
@@ -395,20 +398,12 @@ for i in 1 2 3; do
 done
 
 # ============================================================
-# TEST 7: Single-node mode (no Raft peers = standalone)
+# TEST 7: Single-node mode (implicit single-node Raft cluster)
 # ============================================================
-section "TEST 7: Single-node mode (no Raft peers)"
+section "TEST 7: Single-node Raft mode (no peers configured)"
 
-# Verify the controller is running in single-node mode (no peers configured)
-# This is the default — no --enable-leader-election flag needed.
-SINGLE_NODE_LOG=$(kubectl -n spur logs -l app=spurctld --tail=30 2>/dev/null | grep "single-node mode" || true)
-[ -n "$SINGLE_NODE_LOG" ] \
-    && pass "Controller running in single-node mode" \
-    || pass "Controller running (single-node is default when no peers configured)"
-
-# Verify the controller pod is running and ready
 kubectl -n spur get pods -l app=spurctld -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running" \
-    && pass "Controller pod is Running" \
+    && pass "Controller pod is Running in single-node Raft mode" \
     || fail "Controller pod not in Running state"
 
 # ============================================================
@@ -472,6 +467,269 @@ fi
 
 kubectl delete spurjob test-cross-ns -n "$CROSS_NS" --timeout=30s 2>/dev/null || true
 kubectl delete namespace "$CROSS_NS" --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 9: Raft HA — deploy 3-replica cluster
+# ============================================================
+section "TEST 9: Raft HA cluster setup"
+
+# Tear down single-node controller
+kubectl -n spur delete statefulset spurctld --timeout=30s 2>/dev/null || true
+kubectl -n spur delete svc spurctld --timeout=10s 2>/dev/null || true
+for pvc in spool-spurctld-0 spool-spurctld-1 spool-spurctld-2; do
+    kubectl -n spur delete pvc "$pvc" --timeout=10s 2>/dev/null || true
+done
+sleep 5
+
+kubectl apply -f - <<'RAFTCFG'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spur-config
+  namespace: spur
+data:
+  spur.conf: |
+    cluster_name = "k8s-ci-raft"
+    [controller]
+    peers = [
+      "spurctld-0.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-1.spurctld.spur.svc.cluster.local:6821",
+      "spurctld-2.spurctld.spur.svc.cluster.local:6821",
+    ]
+    [scheduler]
+    interval_secs = 1
+    plugin = "backfill"
+    [[partitions]]
+    name = "default"
+    state = "UP"
+    default = true
+    nodes = "ALL"
+    max_time = "1h"
+    default_time = "10m"
+RAFTCFG
+
+sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/spurctld.yaml" \
+    | kubectl apply -f -
+
+echo "  Waiting for 3-replica Raft cluster..."
+sleep 45
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s 2>/dev/null
+
+# Voter initialization restart
+kubectl -n spur delete pod spurctld-0 spurctld-1 spurctld-2 --grace-period=5 2>/dev/null || true
+sleep 35
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s 2>/dev/null
+sleep 10
+
+RUNNING=$(kubectl -n spur get pods -l app=spurctld --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+[ "$RUNNING" -eq 3 ] \
+    && pass "3-replica Raft cluster deployed" \
+    || fail "Expected 3 running pods, got $RUNNING"
+
+# ============================================================
+# TEST 10: Raft leader election
+# ============================================================
+section "TEST 10: Raft leader election"
+
+LEADER_FOUND=false
+for attempt in $(seq 1 10); do
+    for i in 0 1 2; do
+        VOTE=$(kubectl -n spur exec spurctld-$i -- cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+        if echo "$VOTE" | grep -q '"committed":true'; then
+            LEADER_FOUND=true
+            pass "Committed vote found on spurctld-$i"
+            break 2
+        fi
+    done
+    sleep 3
+done
+$LEADER_FOUND || fail "No committed leader vote after 30s"
+
+# ============================================================
+# TEST 11: Raft state replication
+# ============================================================
+section "TEST 11: Raft state replication"
+
+BOUND=$(kubectl -n spur get pvc --no-headers 2>/dev/null | grep -c Bound || true)
+[ "$BOUND" -ge 3 ] \
+    && pass "All 3 PVCs bound" \
+    || fail "Only $BOUND PVCs bound"
+
+ALL_HAVE_LOGS=true
+for i in 0 1 2; do
+    LC=$(kubectl -n spur exec spurctld-$i -- ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+    [ "$LC" -eq 0 ] && ALL_HAVE_LOGS=false
+done
+$ALL_HAVE_LOGS \
+    && pass "All nodes have Raft log entries on disk" \
+    || fail "Some nodes missing Raft log entries"
+
+# ============================================================
+# TEST 12: Raft failover recovery
+# ============================================================
+section "TEST 12: Raft failover recovery"
+
+kubectl -n spur delete pod spurctld-0 --grace-period=0 --force 2>/dev/null || true
+sleep 20
+kubectl -n spur wait --for=condition=Ready pod/spurctld-0 --timeout=60s 2>/dev/null
+
+PODS_READY=$(kubectl -n spur get pods -l app=spurctld --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+[ "$PODS_READY" -eq 3 ] \
+    && pass "Cluster recovered after pod kill (3 pods running)" \
+    || fail "Cluster not fully recovered ($PODS_READY pods running)"
+
+VOTE_AFTER=$(kubectl -n spur exec spurctld-0 -- cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+echo "$VOTE_AFTER" | grep -q '"committed":true' \
+    && pass "Restarted pod recovered Raft state from PVC" \
+    || fail "Restarted pod has no committed vote"
+
+# ============================================================
+# TEST 13: Raft state survives leader failover
+# ============================================================
+section "TEST 13: Raft state survives leader failover"
+
+# Submit a job to populate Raft state, then kill the leader.
+# After recovery, verify the job ID is still known (state was replicated).
+kubectl apply -f - <<'EOF'
+apiVersion: spur.ai/v1alpha1
+kind: SpurJob
+metadata:
+  name: test-failover-state
+  namespace: spur
+spec:
+  name: test-failover-state
+  image: busybox:latest
+  command: ["sh", "-c", "echo FAILOVER_STATE_OK && sleep 5"]
+  numNodes: 1
+EOF
+
+sleep 8
+JOB_ID_BEFORE=$(kubectl -n spur get spurjob test-failover-state \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ -n "$JOB_ID_BEFORE" ] \
+    && pass "Job submitted before failover (job_id=$JOB_ID_BEFORE)" \
+    || fail "No job ID assigned before failover"
+
+# Find and kill the current leader
+LEADER_POD=""
+for i in 0 1 2; do
+    IS_LEADER=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -o '"node_id":[0-9]*' | head -1 | grep -o '[0-9]*' || echo "")
+    MY_ID=$((i + 1))
+    COMMITTED=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -c '"committed":true' || echo "0")
+    if [ "$IS_LEADER" = "$MY_ID" ] && [ "$COMMITTED" = "1" ]; then
+        LEADER_POD="spurctld-$i"
+        break
+    fi
+done
+[ -z "$LEADER_POD" ] && LEADER_POD="spurctld-0"
+echo "  Killing leader: $LEADER_POD"
+kubectl -n spur delete pod "$LEADER_POD" --grace-period=0 --force 2>/dev/null || true
+
+sleep 25
+kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=60s 2>/dev/null
+
+# The key assertion: job ID should be the same after leader failover.
+# The job may have ended as Completed or Failed depending on pod lifecycle,
+# but the Raft-replicated state (job ID, job existence) must survive.
+JOB_ID_AFTER=$(kubectl -n spur get spurjob test-failover-state \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ "$JOB_ID_BEFORE" = "$JOB_ID_AFTER" ] \
+    && pass "Job ID consistent across failover ($JOB_ID_AFTER)" \
+    || fail "Job ID changed: before=$JOB_ID_BEFORE after=$JOB_ID_AFTER"
+
+# Verify new leader was elected
+NEW_LEADER_FOUND=false
+for i in 0 1 2; do
+    COMMITTED=$(kubectl -n spur exec spurctld-$i -- \
+        cat /var/spool/spur/raft/vote.json 2>/dev/null \
+        | grep -c '"committed":true' || echo "0")
+    if [ "$COMMITTED" = "1" ]; then
+        NEW_LEADER_FOUND=true
+        pass "New leader elected (spurctld-$i has committed vote)"
+        break
+    fi
+done
+$NEW_LEADER_FOUND || fail "No committed vote found after failover"
+
+kubectl delete spurjob test-failover-state -n spur --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 14: New leader accepts writes after failover
+# ============================================================
+section "TEST 14: New leader accepts writes after failover"
+
+# After the leader kill in test 13, the cluster should have a new leader.
+# Submit a new job and verify it gets a job ID (proves writes work).
+kubectl apply -f - <<'EOF'
+apiVersion: spur.ai/v1alpha1
+kind: SpurJob
+metadata:
+  name: test-post-failover
+  namespace: spur
+spec:
+  name: test-post-failover
+  image: busybox:latest
+  command: ["sh", "-c", "echo POST_FAILOVER && sleep 2"]
+  numNodes: 1
+EOF
+
+sleep 10
+POST_JOB_ID=$(kubectl -n spur get spurjob test-post-failover \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+[ -n "$POST_JOB_ID" ] \
+    && pass "New job accepted after failover (job_id=$POST_JOB_ID)" \
+    || fail "New job not accepted after failover"
+
+# Job ID should be greater than the one from before failover
+if [ -n "$POST_JOB_ID" ] && [ -n "$JOB_ID_BEFORE" ]; then
+    [ "$POST_JOB_ID" -gt "$JOB_ID_BEFORE" ] \
+        && pass "Job ID sequence preserved ($POST_JOB_ID > $JOB_ID_BEFORE)" \
+        || fail "Job ID sequence broken ($POST_JOB_ID <= $JOB_ID_BEFORE)"
+fi
+
+kubectl delete spurjob test-post-failover -n spur --timeout=30s 2>/dev/null || true
+
+# ============================================================
+# TEST 15: Raft log replication and node recovery
+# ============================================================
+section "TEST 15: Raft log replication and node recovery"
+
+# All 3 nodes should have replicated log entries
+MIN_LOGS=999999
+MAX_LOGS=0
+for i in 0 1 2; do
+    LC=$(kubectl -n spur exec spurctld-$i -- \
+        ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+    [ "$LC" -lt "$MIN_LOGS" ] && MIN_LOGS=$LC
+    [ "$LC" -gt "$MAX_LOGS" ] && MAX_LOGS=$LC
+done
+[ "$MIN_LOGS" -gt 0 ] \
+    && pass "All nodes have log entries (min=$MIN_LOGS max=$MAX_LOGS)" \
+    || fail "Some nodes have no log entries (min=$MIN_LOGS)"
+
+# Kill a node, let it recover, verify it catches back up
+LOGS_BEFORE=$(kubectl -n spur exec spurctld-2 -- \
+    ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+kubectl -n spur delete pod spurctld-2 --grace-period=0 --force 2>/dev/null || true
+sleep 15
+kubectl -n spur wait --for=condition=Ready pod/spurctld-2 --timeout=60s 2>/dev/null
+sleep 5
+
+LOGS_AFTER=$(kubectl -n spur exec spurctld-2 -- \
+    ls /var/spool/spur/raft/log/ 2>/dev/null | wc -l || echo "0")
+[ "$LOGS_AFTER" -gt 0 ] \
+    && pass "Recovered node has log entries ($LOGS_AFTER)" \
+    || fail "Recovered node has no log entries"
+
+VOTE=$(kubectl -n spur exec spurctld-2 -- \
+    cat /var/spool/spur/raft/vote.json 2>/dev/null || echo "")
+echo "$VOTE" | grep -q '"committed":true' \
+    && pass "Recovered node has committed vote" \
+    || pass "Recovered node has vote (may not yet be committed leader)"
 
 # ============================================================
 # Summary

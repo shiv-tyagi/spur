@@ -15,13 +15,14 @@ use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
-use spur_core::wal::{WalEntry, WalOperation, WalStore};
-use spur_state::snapshot::SnapshotStore;
-use spur_state::wal_store::FileWalStore;
+use spur_core::wal::WalOperation;
+
+use crate::raft::{SpurRaft, StateMachineApply};
 
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
+/// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
     pub config: SlurmConfig,
     jobs: RwLock<HashMap<JobId, Job>>,
@@ -30,79 +31,32 @@ pub struct ClusterManager {
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
-    wal: RwLock<FileWalStore>,
-    snapshot: RwLock<Option<SnapshotStore>>,
-    wal_since_snapshot: AtomicU32,
-    /// Cluster-wide license pool: available licenses (decremented when jobs start).
     license_pool: RwLock<HashMap<String, u64>>,
-    /// Maps agent hostname → config node name (for name normalization).
     hostname_aliases: RwLock<HashMap<String, String>>,
+    raft: RwLock<Option<SpurRaft>>,
 }
 
 impl ClusterManager {
-    pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
-        let wal = FileWalStore::new(&state_dir.join("wal"))?;
-        let snapshot = if state_dir.join("snapshot.redb").exists() {
-            Some(SnapshotStore::open(&state_dir.join("snapshot.redb"))?)
-        } else {
-            std::fs::create_dir_all(state_dir)?;
-            Some(SnapshotStore::open(&state_dir.join("snapshot.redb"))?)
-        };
-
+    pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
-
-        // Recover state from snapshot + WAL replay
-        let mut jobs = HashMap::new();
-        let mut nodes = HashMap::new();
-        let mut next_id = config.controller.first_job_id;
-
-        if let Some(ref snap) = snapshot {
-            let snap_seq = snap.wal_sequence().unwrap_or(0);
-            for job in snap.load_jobs().unwrap_or_default() {
-                next_id = next_id.max(job.job_id + 1);
-                jobs.insert(job.job_id, job);
-            }
-            for node in snap.load_nodes().unwrap_or_default() {
-                nodes.insert(node.name.clone(), node);
-            }
-
-            // Replay WAL entries after snapshot
-            let wal_entries = wal.read_from(snap_seq + 1).unwrap_or_default();
-            if !wal_entries.is_empty() {
-                info!(
-                    count = wal_entries.len(),
-                    from_seq = snap_seq + 1,
-                    "replaying WAL entries"
-                );
-                for entry in &wal_entries {
-                    replay_entry(entry, &mut jobs, &mut nodes, &mut next_id);
-                }
-            }
-        }
-
-        info!(
-            jobs = jobs.len(),
-            nodes = nodes.len(),
-            next_job_id = next_id,
-            "cluster state recovered"
-        );
-
         let license_pool = config.licenses.clone();
 
-        Ok(Self {
+        let cm = Self {
             config,
-            jobs: RwLock::new(jobs),
-            nodes: RwLock::new(nodes),
+            jobs: RwLock::new(HashMap::new()),
+            nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
-            next_job_id: AtomicU32::new(next_id),
-            wal: RwLock::new(wal),
-            snapshot: RwLock::new(snapshot),
-            wal_since_snapshot: AtomicU32::new(0),
+            next_job_id: AtomicU32::new(1),
             license_pool: RwLock::new(license_pool),
             hostname_aliases: RwLock::new(HashMap::new()),
-        })
+            raft: RwLock::new(None),
+        };
+
+        info!("cluster manager initialized (state will be recovered via Raft)");
+
+        Ok(cm)
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -126,39 +80,13 @@ impl ClusterManager {
         }
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let mut job = Job::new(job_id, spec.clone());
 
-        // Heterogeneous job linking: if het_group > 0, find the first component
-        // (het_group == 0) submitted by the same user with the same name and
-        // link this component to it via het_job_id.
-        if let Some(het_group) = spec.het_group {
-            job.het_group = Some(het_group);
-            if het_group > 0 {
-                // Find the first component (het_group 0) as the anchor
-                let jobs = self.jobs.read();
-                let anchor = jobs.values().find(|j| {
-                    j.het_group == Some(0)
-                        && j.spec.user == spec.user
-                        && j.spec.name == spec.name
-                        && j.state == JobState::Pending
-                });
-                if let Some(anchor_job) = anchor {
-                    job.het_job_id = Some(anchor_job.job_id);
-                }
-                drop(jobs);
-            }
-        }
-
-        // WAL
-        self.append_wal(WalOperation::JobSubmit {
+        self.propose(WalOperation::JobSubmit {
             job_id,
             spec: spec.clone(),
         });
 
-        self.jobs.write().insert(job_id, job);
-
         info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
-        self.maybe_snapshot();
         Ok(job_id)
     }
 
@@ -185,7 +113,7 @@ impl ClusterManager {
             let mut task_spec = spec.clone();
             task_spec.array_spec = None; // Don't recurse
 
-            self.append_wal(WalOperation::JobSubmit {
+            self.propose(WalOperation::JobSubmit {
                 job_id: task_job_id,
                 spec: task_spec.clone(),
             });
@@ -319,15 +247,18 @@ impl ClusterManager {
 
     /// Cancel a job.
     pub fn cancel_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        let old_state = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_terminal() {
+                anyhow::bail!("job {} is already {:?}", job_id, job.state);
+            }
+            job.state
+        };
 
-        let old_state = job.state;
-        job.transition(JobState::Cancelled)?;
-
-        self.append_wal(WalOperation::JobStateChange {
+        self.propose(WalOperation::JobStateChange {
             job_id,
             old_state,
             new_state: JobState::Cancelled,
@@ -344,75 +275,45 @@ impl ClusterManager {
         node_names: Vec<String>,
         resources: ResourceSet,
     ) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        // Validate job exists and can transition
+        let old_state;
+        let spec_for_notify;
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            old_state = job.state;
+            spec_for_notify = job.spec.clone();
+            if job.state != JobState::Pending {
+                anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
+            }
+        }
 
-        let old_state = job.state;
-        let exclusive = job.spec.exclusive;
-        let spec_for_notify = job.spec.clone();
-        job.transition(JobState::Running)?;
-        job.start_time = Some(Utc::now());
-        job.allocated_nodes = node_names.clone();
-        job.allocated_resources = Some(resources.clone());
-        job.pending_reason = PendingReason::None;
+        // propose() handles: state transition, resource allocation, license subtraction
+        self.propose(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Running,
+        });
+        self.propose(WalOperation::JobStart {
+            job_id,
+            nodes: node_names.clone(),
+            resources: resources.clone(),
+        });
 
-        // Compute per-node resource share
+        // Batch step creation (not WAL-tracked, recreated on apply)
         let node_count = node_names.len().max(1) as u32;
         let per_node = ResourceSet {
             cpus: resources.cpus / node_count,
             memory_mb: resources.memory_mb / node_count as u64,
-            gpus: resources.gpus.clone(), // GPUs are already per-node in the request
+            gpus: resources.gpus.clone(),
             generic: resources
                 .generic
                 .iter()
                 .map(|(k, v)| (k.clone(), v / node_count as u64))
                 .collect(),
         };
-
-        // Subtract licenses from cluster pool
-        let lic_req = extract_license_requirements(&spec_for_notify);
-        if !lic_req.is_empty() {
-            let mut pool = self.license_pool.write();
-            for (lic, count) in &lic_req {
-                if let Some(avail) = pool.get_mut(lic) {
-                    *avail = avail.saturating_sub(*count);
-                }
-            }
-        }
-
-        // Drop jobs lock before acquiring nodes lock (lock ordering: jobs → nodes)
-        drop(jobs);
-
-        self.append_wal(WalOperation::JobStateChange {
-            job_id,
-            old_state,
-            new_state: JobState::Running,
-        });
-        self.append_wal(WalOperation::JobStart {
-            job_id,
-            nodes: node_names.clone(),
-            resources,
-        });
-
-        // Update node alloc_resources
-        let mut nodes = self.nodes.write();
-        for name in &node_names {
-            if let Some(node) = nodes.get_mut(name) {
-                if exclusive {
-                    // Exclusive: claim entire node so no other jobs can co-schedule
-                    node.alloc_resources = node.total_resources.clone();
-                } else {
-                    node.alloc_resources = node.alloc_resources.add(&per_node);
-                }
-                node.update_state_from_alloc();
-            }
-        }
-
-        debug!(job_id, "job started");
-
-        // Create the batch step for this job
         let batch_step = JobStep {
             job_id,
             step_id: STEP_BATCH,
@@ -420,8 +321,8 @@ impl ClusterManager {
             state: StepState::Running,
             num_tasks: 1,
             cpus_per_task: per_node.cpus,
-            resources: per_node.clone(),
-            nodes: node_names.clone(),
+            resources: per_node,
+            nodes: node_names,
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(Utc::now()),
             end_time: None,
@@ -429,7 +330,6 @@ impl ClusterManager {
         };
         self.create_step(job_id, STEP_BATCH, batch_step);
 
-        // Send BEGIN notification if configured
         if spec_for_notify
             .mail_type
             .iter()
@@ -438,6 +338,7 @@ impl ClusterManager {
             self.send_notification(job_id, "BEGIN", &spec_for_notify);
         }
 
+        debug!(job_id, "job started");
         Ok(())
     }
 
@@ -448,124 +349,41 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-
-        job.transition(state)?;
-        job.exit_code = Some(exit_code);
-
-        // Capture allocation info and spec before dropping jobs lock
-        let freed_nodes = job.allocated_nodes.clone();
-        let allocated_resources = job.allocated_resources.clone();
-        let spec_for_notify = job.spec.clone();
-        drop(jobs);
-
-        // Return licenses to cluster pool
-        let lic_req = extract_license_requirements(&spec_for_notify);
-        if !lic_req.is_empty() {
-            let mut pool = self.license_pool.write();
-            for (lic, count) in &lic_req {
-                *pool.entry(lic.clone()).or_insert(0) += count;
+        // Validate
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_terminal() {
+                anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
             }
         }
 
-        self.append_wal(WalOperation::JobComplete {
+        // propose() handles: state transition, exit_code, end_time,
+        // resource deallocation, step completion, license return
+        self.propose(WalOperation::JobComplete {
             job_id,
             exit_code,
             state,
         });
 
-        // Complete all steps for this job
-        {
-            let mut steps = self.steps.write();
-            for step in steps.values_mut() {
-                if step.job_id == job_id && !step.state.is_terminal() {
-                    step.state = if exit_code == 0 {
-                        StepState::Completed
-                    } else {
-                        StepState::Failed
-                    };
-                    step.exit_code = Some(exit_code);
-                    step.end_time = Some(Utc::now());
-                }
+        // Notifications (side effects, not replicated)
+        let spec_for_notify = self.jobs.read().get(&job_id).map(|j| j.spec.clone());
+        if let Some(spec) = spec_for_notify {
+            let is_success = state == JobState::Completed;
+            let is_failure = matches!(
+                state,
+                JobState::Failed | JobState::Timeout | JobState::NodeFail
+            );
+            if is_success && spec.mail_type.iter().any(|t| t == "END" || t == "ALL") {
+                self.send_notification(job_id, "END", &spec);
+            }
+            if is_failure && spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
+                self.send_notification(job_id, "FAIL", &spec);
             }
         }
 
-        // Subtract per-node resources instead of blanket-zeroing
-        let mut nodes = self.nodes.write();
-        if let Some(ref total_resources) = allocated_resources {
-            let node_count = freed_nodes.len().max(1) as u32;
-            let per_node = ResourceSet {
-                cpus: total_resources.cpus / node_count,
-                memory_mb: total_resources.memory_mb / node_count as u64,
-                gpus: total_resources.gpus.clone(),
-                generic: total_resources
-                    .generic
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v / node_count as u64))
-                    .collect(),
-            };
-            for name in &freed_nodes {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.alloc_resources = node.alloc_resources.subtract(&per_node);
-                    node.update_state_from_alloc();
-
-                    // Draining → Drain: if node was draining and all resources are now free,
-                    // complete the drain transition.
-                    if node.state == NodeState::Draining
-                        && node.alloc_resources.cpus == 0
-                        && node.alloc_resources.gpus.is_empty()
-                    {
-                        node.state = NodeState::Drain;
-                        info!(node = %node.name, "draining node fully drained");
-                    }
-                }
-            }
-        } else {
-            // Fallback: zero out (legacy jobs without tracked resources)
-            for name in &freed_nodes {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.alloc_resources = ResourceSet::default();
-                    node.update_state_from_alloc();
-
-                    // Draining → Drain on fallback path too
-                    if node.state == NodeState::Draining {
-                        node.state = NodeState::Drain;
-                        info!(node = %node.name, "draining node fully drained");
-                    }
-                }
-            }
-        }
-
-        debug!(job_id, exit_code, "job completed");
-
-        // Send completion notifications
-        let is_success = state == JobState::Completed;
-        let is_failure = matches!(
-            state,
-            JobState::Failed | JobState::Timeout | JobState::NodeFail
-        );
-        if is_success
-            && spec_for_notify
-                .mail_type
-                .iter()
-                .any(|t| t == "END" || t == "ALL")
-        {
-            self.send_notification(job_id, "END", &spec_for_notify);
-        }
-        if is_failure
-            && spec_for_notify
-                .mail_type
-                .iter()
-                .any(|t| t == "FAIL" || t == "ALL")
-        {
-            self.send_notification(job_id, "FAIL", &spec_for_notify);
-        }
-
-        // Check for requeue: if the job has --requeue and hit a retriable state,
-        // reset it to Pending so the scheduler picks it up again.
         let should_requeue = matches!(
             state,
             JobState::Timeout | JobState::Preempted | JobState::NodeFail
@@ -574,44 +392,34 @@ impl ClusterManager {
             self.maybe_requeue(job_id);
         }
 
-        self.maybe_snapshot();
+        debug!(job_id, exit_code, "job completed");
         Ok(())
     }
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) {
         const MAX_REQUEUE: u32 = 3;
-        let mut jobs = self.jobs.write();
-        let Some(job) = jobs.get_mut(&job_id) else {
-            return;
+        let (should_requeue, old_state) = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return;
+            };
+            if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
+                return;
+            }
+            (true, job.state)
         };
-        if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
+        if !should_requeue {
             return;
         }
 
-        let old_state = job.state;
-        if job.transition(JobState::Pending).is_err() {
-            return;
-        }
-        job.requeue_count += 1;
-        job.start_time = None;
-        job.exit_code = None;
-        job.allocated_nodes.clear();
-        job.allocated_resources = None;
-        job.pending_reason = PendingReason::None;
-
-        self.append_wal(WalOperation::JobStateChange {
+        self.propose(WalOperation::JobStateChange {
             job_id,
             old_state,
             new_state: JobState::Pending,
         });
 
-        info!(
-            job_id,
-            requeue_count = job.requeue_count,
-            from = %old_state,
-            "job requeued"
-        );
+        info!(job_id, from = %old_state, "job requeued");
     }
 
     /// Requeue a job back to Pending after a dispatch failure.
@@ -620,23 +428,15 @@ impl ClusterManager {
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
     pub fn requeue_job(&self, job_id: JobId) {
-        let mut jobs = self.jobs.write();
-        let Some(job) = jobs.get_mut(&job_id) else {
-            return;
+        let old_state = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return;
+            };
+            job.state
         };
 
-        let old_state = job.state;
-        if job.transition(JobState::Pending).is_err() {
-            return;
-        }
-        job.requeue_count += 1;
-        job.start_time = None;
-        job.exit_code = None;
-        job.allocated_nodes.clear();
-        job.allocated_resources = None;
-        job.pending_reason = PendingReason::Resources;
-
-        self.append_wal(WalOperation::JobStateChange {
+        self.propose(WalOperation::JobStateChange {
             job_id,
             old_state,
             new_state: JobState::Pending,
@@ -729,59 +529,25 @@ impl ClusterManager {
             }
         }
 
-        // First-time registration: create new node with Idle state
-        let mut node = Node::new(effective_name.clone(), resources.clone());
-        node.state = NodeState::Idle;
-        node.source = source;
-        node.address = Some(address.clone());
-        node.port = port;
-        if !wg_pubkey.is_empty() {
-            node.wg_pubkey = Some(wg_pubkey);
-        }
-        node.version = Some(version);
-        node.agent_start_time = Some(Utc::now());
-        node.last_heartbeat = Some(Utc::now());
-
-        // Assign to partitions based on config hostlist patterns
-        let partitions = self.partitions.read();
-        for part in partitions.iter() {
-            if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
-                if hosts.contains(&effective_name) {
-                    node.partitions.push(part.name.clone());
-                }
-            }
-        }
-
-        // If node didn't match any partition's hostlist, auto-assign to the
-        // default partition so dynamically-registered nodes are always
-        // schedulable. This matches Slurm's behavior for unconfigured nodes.
-        if node.partitions.is_empty() {
-            if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
-                node.partitions.push(default_part.name.clone());
-            } else if let Some(first) = partitions.first() {
-                node.partitions.push(first.name.clone());
-            }
-        }
-
-        // Copy features and weight from node config
-        for nc in &self.config.nodes {
-            if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
-                if hosts.contains(&effective_name) {
-                    node.features = nc.features.clone();
-                    node.weight = nc.weight;
-                    break;
-                }
-            }
-        }
-
-        self.append_wal(WalOperation::NodeRegister {
+        self.propose(WalOperation::NodeRegister {
             name: effective_name.clone(),
             resources,
             address,
         });
 
-        info!(node = %effective_name, partitions = ?node.partitions, "node registered");
-        self.nodes.write().insert(effective_name, node);
+        // Set ephemeral connection info not tracked by the WAL
+        if let Some(node) = self.nodes.write().get_mut(&effective_name) {
+            node.port = port;
+            node.source = source;
+            if !wg_pubkey.is_empty() {
+                node.wg_pubkey = Some(wg_pubkey);
+            }
+            node.version = Some(version);
+            node.agent_start_time = Some(Utc::now());
+            node.last_heartbeat = Some(Utc::now());
+        }
+
+        info!(node = %effective_name, "node registered");
     }
 
     /// Update node heartbeat data.
@@ -818,44 +584,54 @@ impl ClusterManager {
 
     /// Hold a job (prevent scheduling).
     pub fn hold_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-        if job.state != JobState::Pending {
-            anyhow::bail!(
-                "can only hold pending jobs (job {} is {:?})",
-                job_id,
-                job.state
-            );
-        }
-        job.pending_reason = PendingReason::Held;
-        job.priority = 0;
-        self.append_wal(WalOperation::JobPriorityChange {
+        let old_priority = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!(
+                    "can only hold pending jobs (job {} is {:?})",
+                    job_id,
+                    job.state
+                );
+            }
+            job.priority
+        };
+
+        self.propose(WalOperation::JobPriorityChange {
             job_id,
-            old_priority: job.priority,
+            old_priority,
             new_priority: 0,
         });
+        // Set held reason (not WAL-tracked)
+        if let Some(job) = self.jobs.write().get_mut(&job_id) {
+            job.pending_reason = PendingReason::Held;
+        }
         info!(job_id, "job held");
         Ok(())
     }
 
     /// Release a held job.
     pub fn release_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-        if job.pending_reason != PendingReason::Held {
-            anyhow::bail!("job {} is not held", job_id);
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.pending_reason != PendingReason::Held {
+                anyhow::bail!("job {} is not held", job_id);
+            }
         }
-        job.pending_reason = PendingReason::Priority;
-        job.priority = 1000; // Restore default priority
-        self.append_wal(WalOperation::JobPriorityChange {
+
+        self.propose(WalOperation::JobPriorityChange {
             job_id,
             old_priority: 0,
             new_priority: 1000,
         });
+        if let Some(job) = self.jobs.write().get_mut(&job_id) {
+            job.pending_reason = PendingReason::Priority;
+        }
         info!(job_id, "job released");
         Ok(())
     }
@@ -871,34 +647,45 @@ impl ClusterManager {
         account: Option<String>,
         qos: Option<String>,
     ) -> anyhow::Result<()> {
-        let mut jobs = self.jobs.write();
-        let job = jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-
-        if let Some(tl) = time_limit {
-            job.spec.time_limit = Some(tl);
+        {
+            let jobs = self.jobs.read();
+            if !jobs.contains_key(&job_id) {
+                anyhow::bail!("job {} not found", job_id);
+            }
         }
+
         if let Some(p) = priority {
-            let old = job.priority;
-            job.priority = p;
-            self.append_wal(WalOperation::JobPriorityChange {
+            let old = self
+                .jobs
+                .read()
+                .get(&job_id)
+                .map(|j| j.priority)
+                .unwrap_or(0);
+            self.propose(WalOperation::JobPriorityChange {
                 job_id,
                 old_priority: old,
                 new_priority: p,
             });
         }
-        if let Some(part) = partition {
-            job.spec.partition = Some(part);
-        }
-        if let Some(c) = comment {
-            job.spec.comment = Some(c);
-        }
-        if let Some(a) = account {
-            job.spec.account = Some(a);
-        }
-        if let Some(q) = qos {
-            job.spec.qos = Some(q);
+
+        // Non-WAL-tracked fields: update directly
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if let Some(tl) = time_limit {
+                job.spec.time_limit = Some(tl);
+            }
+            if let Some(part) = partition {
+                job.spec.partition = Some(part);
+            }
+            if let Some(c) = comment {
+                job.spec.comment = Some(c);
+            }
+            if let Some(a) = account {
+                job.spec.account = Some(a);
+            }
+            if let Some(q) = qos {
+                job.spec.qos = Some(q);
+            }
         }
         info!(job_id, "job updated");
         Ok(())
@@ -915,24 +702,23 @@ impl ClusterManager {
         state: NodeState,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
-        let mut nodes = self.nodes.write();
-        let node = nodes
-            .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
-        let old_state = node.state;
-
-        // If admin requests Drain but node has running jobs, set Draining instead
-        let effective_state = if state == NodeState::Drain
-            && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
-        {
-            NodeState::Draining
-        } else {
-            state
+        let (old_state, effective_state) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
+            let old = node.state;
+            let effective = if state == NodeState::Drain
+                && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
+            {
+                NodeState::Draining
+            } else {
+                state
+            };
+            (old, effective)
         };
 
-        node.state = effective_state;
-        node.state_reason = reason.clone();
-        self.append_wal(WalOperation::NodeStateChange {
+        self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: effective_state,
@@ -946,30 +732,31 @@ impl ClusterManager {
     pub fn check_node_health(&self, timeout_secs: u64) {
         let now = Utc::now();
         let threshold = chrono::Duration::seconds(timeout_secs as i64);
-        let mut nodes = self.nodes.write();
 
-        for node in nodes.values_mut() {
-            if node.state == NodeState::Down || node.state == NodeState::Drain {
-                continue;
-            }
-            if let Some(last_hb) = node.last_heartbeat {
-                if now - last_hb > threshold {
-                    let old_state = node.state;
-                    node.state = NodeState::Down;
-                    node.state_reason = Some("Not responding".into());
-                    warn!(
-                        node = %node.name,
-                        last_heartbeat = %last_hb,
-                        "node marked DOWN (heartbeat timeout)"
-                    );
-                    self.append_wal(WalOperation::NodeStateChange {
-                        name: node.name.clone(),
-                        old_state,
-                        new_state: NodeState::Down,
-                        reason: Some("Not responding".into()),
-                    });
-                }
-            }
+        // Collect nodes that need to be marked DOWN (avoid holding write lock across propose)
+        let stale_nodes: Vec<(String, NodeState)> = {
+            let nodes = self.nodes.read();
+            nodes
+                .values()
+                .filter(|n| {
+                    n.state != NodeState::Down
+                        && n.state != NodeState::Drain
+                        && n.last_heartbeat
+                            .map(|hb| now - hb > threshold)
+                            .unwrap_or(false)
+                })
+                .map(|n| (n.name.clone(), n.state))
+                .collect()
+        };
+
+        for (name, old_state) in stale_nodes {
+            warn!(node = %name, "node marked DOWN (heartbeat timeout)");
+            self.propose(WalOperation::NodeStateChange {
+                name,
+                old_state,
+                new_state: NodeState::Down,
+                reason: Some("Not responding".into()),
+            });
         }
     }
 
@@ -1464,37 +1251,324 @@ impl ClusterManager {
         }
     }
 
-    fn append_wal(&self, op: WalOperation) {
-        let mut wal = self.wal.write();
-        let seq = wal.latest_sequence() + 1;
-        let entry = WalEntry::new(seq, op);
-        if let Err(e) = wal.append(&entry) {
-            warn!(error = %e, "failed to append WAL entry");
-        }
-        self.wal_since_snapshot.fetch_add(1, Ordering::Relaxed);
+    pub fn set_raft(&self, raft: SpurRaft) {
+        *self.raft.write() = Some(raft);
     }
 
-    fn maybe_snapshot(&self) {
-        let count = self.wal_since_snapshot.load(Ordering::Relaxed);
-        if count >= 10_000 {
-            self.take_snapshot();
+    /// Persist a mutation via Raft consensus. The apply callback
+    /// (`StateMachineApply`) handles in-memory state on all nodes.
+    fn propose(&self, op: WalOperation) {
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .expect("raft must be set before propose is called");
+        if let Err(e) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
+        }) {
+            warn!(error = %e, "raft propose failed");
         }
     }
 
-    pub fn take_snapshot(&self) {
-        let snap = self.snapshot.read();
-        if let Some(ref store) = *snap {
-            let jobs: Vec<Job> = self.jobs.read().values().cloned().collect();
-            let nodes: Vec<Node> = self.nodes.read().values().cloned().collect();
-            let seq = self.wal.read().latest_sequence();
+    /// Apply a WalOperation to in-memory state.
+    /// Called by Raft's `apply_to_state_machine` on commit.
+    fn apply_operation(&self, op: &WalOperation) {
+        let mut jobs = self.jobs.write();
+        let mut nodes = self.nodes.write();
+        let mut next_id = self.next_job_id.load(Ordering::Relaxed);
+        let timestamp = Utc::now();
 
-            match store.save(&jobs, &nodes, seq) {
-                Ok(()) => {
-                    self.wal_since_snapshot.store(0, Ordering::Relaxed);
-                    debug!(wal_sequence = seq, "snapshot taken");
+        match op {
+            WalOperation::JobSubmit { job_id, spec } => {
+                let mut job = Job::new(*job_id, spec.clone());
+                if let Some(het_group) = spec.het_group {
+                    job.het_group = Some(het_group);
+                    if het_group > 0 {
+                        let anchor = jobs.values().find(|j| {
+                            j.het_group == Some(0)
+                                && j.spec.user == spec.user
+                                && j.spec.name == spec.name
+                                && j.state == JobState::Pending
+                        });
+                        if let Some(a) = anchor {
+                            job.het_job_id = Some(a.job_id);
+                        }
+                    }
                 }
-                Err(e) => warn!(error = %e, "failed to take snapshot"),
+                jobs.insert(*job_id, job);
+                next_id = next_id.max(job_id + 1);
             }
+            WalOperation::JobStateChange {
+                job_id, new_state, ..
+            } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    let _ = job.transition(*new_state);
+                    // Requeue: reset allocation fields when returning to Pending
+                    if *new_state == JobState::Pending {
+                        job.requeue_count += 1;
+                        job.start_time = None;
+                        job.exit_code = None;
+                        job.allocated_nodes.clear();
+                        job.allocated_resources = None;
+                        job.pending_reason = PendingReason::None;
+                    }
+                }
+            }
+            WalOperation::JobStart {
+                job_id,
+                nodes: node_names,
+                resources,
+            } => {
+                let spec = jobs.get(job_id).map(|j| j.spec.clone());
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.start_time = Some(timestamp);
+                    job.allocated_nodes = node_names.clone();
+                    job.allocated_resources = Some(resources.clone());
+                    job.pending_reason = PendingReason::None;
+                }
+                let node_count = node_names.len().max(1) as u32;
+                let per_node = ResourceSet {
+                    cpus: resources.cpus / node_count,
+                    memory_mb: resources.memory_mb / node_count as u64,
+                    gpus: resources.gpus.clone(),
+                    generic: resources
+                        .generic
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v / node_count as u64))
+                        .collect(),
+                };
+                for name in node_names {
+                    if let Some(node) = nodes.get_mut(name) {
+                        node.alloc_resources = node.alloc_resources.add(&per_node);
+                        node.update_state_from_alloc();
+                    }
+                }
+                // Subtract licenses
+                if let Some(ref spec) = spec {
+                    let lic_req = extract_license_requirements(spec);
+                    if !lic_req.is_empty() {
+                        drop(jobs);
+                        drop(nodes);
+                        let mut pool = self.license_pool.write();
+                        for (lic, count) in &lic_req {
+                            if let Some(avail) = pool.get_mut(lic) {
+                                *avail = avail.saturating_sub(*count);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            WalOperation::JobComplete {
+                job_id,
+                exit_code,
+                state,
+            } => {
+                let freed_nodes;
+                let allocated_resources;
+                if let Some(job) = jobs.get_mut(job_id) {
+                    let _ = job.transition(*state);
+                    job.exit_code = Some(*exit_code);
+                    job.end_time = Some(timestamp);
+                    freed_nodes = job.allocated_nodes.clone();
+                    allocated_resources = job.allocated_resources.clone();
+                } else {
+                    return;
+                }
+                // Deallocate node resources
+                if let Some(ref total) = allocated_resources {
+                    let node_count = freed_nodes.len().max(1) as u32;
+                    let per_node = ResourceSet {
+                        cpus: total.cpus / node_count,
+                        memory_mb: total.memory_mb / node_count as u64,
+                        gpus: total.gpus.clone(),
+                        generic: total
+                            .generic
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v / node_count as u64))
+                            .collect(),
+                    };
+                    for name in &freed_nodes {
+                        if let Some(node) = nodes.get_mut(name) {
+                            node.alloc_resources = node.alloc_resources.subtract(&per_node);
+                            node.update_state_from_alloc();
+                            if node.state == NodeState::Draining
+                                && node.alloc_resources.cpus == 0
+                                && node.alloc_resources.gpus.is_empty()
+                            {
+                                node.state = NodeState::Drain;
+                            }
+                        }
+                    }
+                }
+                // Complete all steps
+                drop(jobs);
+                drop(nodes);
+                let mut steps = self.steps.write();
+                for step in steps.values_mut() {
+                    if step.job_id == *job_id && !step.state.is_terminal() {
+                        step.state = if *exit_code == 0 {
+                            StepState::Completed
+                        } else {
+                            StepState::Failed
+                        };
+                        step.exit_code = Some(*exit_code);
+                        step.end_time = Some(timestamp);
+                    }
+                }
+                // Return licenses
+                let lic_req = if let Some(job) = self.jobs.read().get(job_id) {
+                    extract_license_requirements(&job.spec)
+                } else {
+                    HashMap::new()
+                };
+                if !lic_req.is_empty() {
+                    let mut pool = self.license_pool.write();
+                    for (lic, count) in &lic_req {
+                        *pool.entry(lic.clone()).or_insert(0) += count;
+                    }
+                }
+            }
+            WalOperation::JobPriorityChange {
+                job_id,
+                new_priority,
+                ..
+            } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.priority = *new_priority;
+                }
+            }
+            WalOperation::NodeRegister {
+                name,
+                resources,
+                address,
+            } => {
+                let mut node = Node::new(name.clone(), resources.clone());
+                node.address = Some(address.clone());
+                node.state = NodeState::Idle;
+
+                // Assign partitions from config
+                drop(nodes);
+                let partitions = self.partitions.read();
+                for part in partitions.iter() {
+                    if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
+                        if hosts.contains(name) {
+                            node.partitions.push(part.name.clone());
+                        }
+                    }
+                }
+                if node.partitions.is_empty() {
+                    if let Some(dp) = partitions.iter().find(|p| p.is_default) {
+                        node.partitions.push(dp.name.clone());
+                    } else if let Some(first) = partitions.first() {
+                        node.partitions.push(first.name.clone());
+                    }
+                }
+                drop(partitions);
+
+                for nc in &self.config.nodes {
+                    if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
+                        if hosts.contains(name) {
+                            node.features = nc.features.clone();
+                            node.weight = nc.weight;
+                            break;
+                        }
+                    }
+                }
+
+                let mut nodes = self.nodes.write();
+                nodes.insert(name.clone(), node);
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                return;
+            }
+            WalOperation::NodeStateChange {
+                name,
+                new_state,
+                reason,
+                ..
+            } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.state = *new_state;
+                    node.state_reason = reason.clone();
+                }
+            }
+            WalOperation::NodeHeartbeat {
+                name,
+                cpu_load,
+                free_memory_mb,
+            } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.cpu_load = *cpu_load;
+                    node.free_memory_mb = *free_memory_mb;
+                }
+            }
+        }
+        self.next_job_id.store(next_id, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot data for Raft serialization.
+/// Must include all durable cluster state so a follower can fully restore from it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClusterSnapshot {
+    jobs: Vec<Job>,
+    nodes: Vec<Node>,
+    reservations: Vec<Reservation>,
+    steps: Vec<JobStep>,
+    license_pool: HashMap<String, u64>,
+    hostname_aliases: HashMap<String, String>,
+}
+
+impl StateMachineApply for ClusterManager {
+    fn apply_operation(&self, op: &WalOperation) {
+        self.apply_operation(op);
+    }
+
+    fn snapshot_state(&self) -> Vec<u8> {
+        let snap = ClusterSnapshot {
+            jobs: self.jobs.read().values().cloned().collect(),
+            nodes: self.nodes.read().values().cloned().collect(),
+            reservations: self.reservations.read().clone(),
+            steps: self.steps.read().values().cloned().collect(),
+            license_pool: self.license_pool.read().clone(),
+            hostname_aliases: self.hostname_aliases.read().clone(),
+        };
+        serde_json::to_vec(&snap).unwrap_or_default()
+    }
+
+    fn restore_from_snapshot(&self, data: &[u8]) {
+        if let Ok(snap) = serde_json::from_slice::<ClusterSnapshot>(data) {
+            let mut next_id = self.config.controller.first_job_id;
+            let mut jobs = self.jobs.write();
+            jobs.clear();
+            for job in snap.jobs {
+                next_id = next_id.max(job.job_id + 1);
+                jobs.insert(job.job_id, job);
+            }
+
+            let mut nodes = self.nodes.write();
+            nodes.clear();
+            for node in snap.nodes {
+                nodes.insert(node.name.clone(), node);
+            }
+
+            *self.reservations.write() = snap.reservations;
+
+            let mut steps = self.steps.write();
+            steps.clear();
+            for step in snap.steps {
+                steps.insert((step.job_id, step.step_id), step);
+            }
+
+            *self.license_pool.write() = snap.license_pool;
+            *self.hostname_aliases.write() = snap.hostname_aliases;
+
+            self.next_job_id.store(next_id, Ordering::Relaxed);
+            info!(
+                jobs = jobs.len(),
+                nodes = nodes.len(),
+                "restored cluster state from Raft snapshot"
+            );
         }
     }
 }
@@ -1514,83 +1588,562 @@ fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
     licenses
 }
 
-/// Replay a single WAL entry into state.
-fn replay_entry(
-    entry: &WalEntry,
-    jobs: &mut HashMap<JobId, Job>,
-    nodes: &mut HashMap<String, Node>,
-    next_id: &mut u32,
-) {
-    match &entry.operation {
-        WalOperation::JobSubmit { job_id, spec } => {
-            jobs.insert(*job_id, Job::new(*job_id, spec.clone()));
-            *next_id = (*next_id).max(job_id + 1);
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use spur_core::job::JobSpec;
+    use spur_core::resource::ResourceSet;
+    use tempfile::TempDir;
+
+    fn test_config() -> SlurmConfig {
+        SlurmConfig {
+            cluster_name: "test".into(),
+            controller: spur_core::config::ControllerConfig {
+                first_job_id: 1,
+                ..Default::default()
+            },
+            accounting: Default::default(),
+            scheduler: Default::default(),
+            auth: Default::default(),
+            partitions: vec![spur_core::config::PartitionConfig {
+                name: "default".into(),
+                default: true,
+                state: "UP".into(),
+                nodes: "ALL".into(),
+                max_time: None,
+                default_time: None,
+                max_nodes: None,
+                min_nodes: 1,
+                allow_accounts: Vec::new(),
+                allow_groups: Vec::new(),
+                priority_tier: 1,
+                preempt_mode: String::new(),
+            }],
+            nodes: Vec::new(),
+            network: Default::default(),
+            logging: Default::default(),
+            kubernetes: Default::default(),
+            notifications: Default::default(),
+            power: Default::default(),
+            federation: Default::default(),
+            topology: None,
+            licenses: HashMap::new(),
         }
-        WalOperation::JobStateChange {
-            job_id, new_state, ..
-        } => {
-            if let Some(job) = jobs.get_mut(job_id) {
-                let _ = job.transition(*new_state);
+    }
+
+    async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        // Wait for the single-node Raft to self-elect before returning.
+        // Without this, the first propose() call may hit a not-yet-leader
+        // node and silently fail.
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        cm
+    }
+
+    fn basic_spec(name: &str) -> JobSpec {
+        JobSpec {
+            name: name.into(),
+            user: "testuser".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Spin until a Raft-proposed mutation is visible in memory.
+    /// In tests, `propose()` can be called before the single-node Raft
+    /// has finished its initial self-election, causing `client_write` to
+    /// fail silently. This helper retries until the election completes
+    /// and the mutation is applied.
+    fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        WalOperation::JobStart {
-            job_id,
-            nodes: node_names,
-            resources,
-        } => {
-            if let Some(job) = jobs.get_mut(job_id) {
-                job.start_time = Some(entry.timestamp);
-                job.allocated_nodes = node_names.clone();
-                job.allocated_resources = Some(resources.clone());
-            }
+        panic!("timed out waiting for: {label}");
+    }
+
+    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+        cm.register_node(
+            name.into(),
+            ResourceSet {
+                cpus,
+                memory_mb: mem,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::BareMetal,
+        );
+        let n = name.to_string();
+        wait_for(&format!("node '{n}' registered"), || {
+            cm.get_node(&n).is_some()
+        });
+    }
+
+    fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
+        let id = cm.submit_job(spec).unwrap();
+        wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
+        id
+    }
+
+    /// Wait for a job to reach the expected state.
+    /// Handles the test-only race where propose() is called before the
+    /// single-node Raft has self-elected.
+    fn settle(cm: &ClusterManager, job_id: JobId, expected: JobState) {
+        wait_for(&format!("job {job_id} -> {expected:?}"), || {
+            cm.get_job(job_id).map_or(false, |j| j.state == expected)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_submit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let spec = basic_spec("test-job");
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: spec.clone(),
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.job_id, 1);
+        assert_eq!(job.spec.name, "test-job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_state_change() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: basic_spec("j"),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_start_allocates_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "node1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: basic_spec("j"),
+        });
+
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["node1".into()],
+            resources: resources.clone(),
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert!(job.start_time.is_some());
+        assert_eq!(job.allocated_nodes, vec!["node1"]);
+
+        let node = cm.get_node("node1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 4);
+        assert_eq!(node.alloc_resources.memory_mb, 8000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_complete_deallocates_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "node1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: basic_spec("j"),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["node1".into()],
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+        });
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+        assert!(job.end_time.is_some());
+
+        let node = cm.get_node("node1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(node.alloc_resources.memory_mb, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_register() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "gpu-node".into(),
+            resources: ResourceSet {
+                cpus: 64,
+                memory_mb: 256000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(node.total_resources.cpus, 64);
+        assert_eq!(node.state, NodeState::Idle);
+        assert_eq!(node.address, Some("10.0.0.1".into()));
+        // Dynamically registered nodes get the default partition
+        assert!(
+            !node.partitions.is_empty(),
+            "node should be assigned to default partition"
+        );
+        assert_eq!(node.partitions[0], "default");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_state_change() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Drain,
+            reason: Some("maintenance".into()),
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert_eq!(node.state_reason, Some("maintenance".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_priority_change() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: basic_spec("j"),
+        });
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: 1,
+            old_priority: 1000,
+            new_priority: 5000,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.priority, 5000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_heartbeat() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::NodeHeartbeat {
+            name: "n1".into(),
+            cpu_load: 75,
+            free_memory_mb: 4000,
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.cpu_load, 75);
+        assert_eq!(node.free_memory_mb, 4000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_assigns_id_and_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let id = submit_and_wait(&cm, basic_spec("my-job"));
+        assert!(id >= 1);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.name, "my-job");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.spec.partition, Some("default".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_multiple_jobs_increments_ids() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let id1 = submit_and_wait(&cm, basic_spec("a"));
+        let id2 = submit_and_wait(&cm, basic_spec("b"));
+        let id3 = submit_and_wait(&cm, basic_spec("c"));
+
+        assert!(id2 > id1);
+        assert!(id3 > id2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_complete_job_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("lifecycle"));
+
+        let resources = ResourceSet {
+            cpus: 2,
+            memory_mb: 4000,
+            ..Default::default()
+        };
+        cm.start_job(job_id, vec!["worker1".into()], resources)
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.start_time.is_some());
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 2);
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-me"));
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_terminal_job_errors() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("j"));
+        cm.cancel_job(job_id, "u").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+
+        let result = cm.complete_job(job_id, 1, JobState::Failed);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_and_restore() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        submit_and_wait(&cm, basic_spec("snap-job"));
+
+        let data = cm.snapshot_state();
+        assert!(!data.is_empty());
+
+        // Create a fresh cluster and restore
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&data);
+
+        assert!(cm2.get_job(1).is_some());
+        assert!(cm2.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_and_release_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("holdme"));
+
+        cm.hold_job(id).unwrap();
+        wait_for("hold applied", || {
+            cm.get_job(id).map_or(false, |j| j.priority == 0)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.priority, 0);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+
+        cm.release_job(id).unwrap();
+        wait_for("release applied", || {
+            cm.get_job(id).map_or(false, |j| j.priority > 0)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.priority, 1000);
+        assert_eq!(job.pending_reason, PendingReason::Priority);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_priority() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("prio"));
+
+        cm.update_job(id, None, Some(5000), None, None, None, None)
+            .unwrap();
+        wait_for("priority updated", || {
+            cm.get_job(id).map_or(false, |j| j.priority == 5000)
+        });
+        assert_eq!(cm.get_job(id).unwrap().priority, 5000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_node_state() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("maint".into()))
+            .unwrap();
+        wait_for("node drain applied", || {
+            cm.get_node("n1")
+                .map_or(false, |n| n.state == NodeState::Drain)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert_eq!(node.state_reason, Some("maint".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_node_health_marks_stale_down() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "stale", 4, 8000);
+
+        // Set last_heartbeat far in the past
+        if let Some(node) = cm.nodes.write().get_mut("stale") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
         }
-        WalOperation::JobComplete {
-            job_id, exit_code, ..
-        } => {
-            if let Some(job) = jobs.get_mut(job_id) {
-                job.exit_code = Some(*exit_code);
-                job.end_time = Some(entry.timestamp);
-            }
-        }
-        WalOperation::JobPriorityChange {
-            job_id,
-            new_priority,
-            ..
-        } => {
-            if let Some(job) = jobs.get_mut(job_id) {
-                job.priority = *new_priority;
-            }
-        }
-        WalOperation::NodeRegister {
-            name,
-            resources,
-            address,
-        } => {
-            let mut node = Node::new(name.clone(), resources.clone());
-            node.address = Some(address.clone());
-            node.state = NodeState::Idle;
-            nodes.insert(name.clone(), node);
-        }
-        WalOperation::NodeStateChange {
-            name,
-            new_state,
-            reason,
-            ..
-        } => {
-            if let Some(node) = nodes.get_mut(name) {
-                node.state = *new_state;
-                node.state_reason = reason.clone();
-            }
-        }
-        WalOperation::NodeHeartbeat {
-            name,
-            cpu_load,
-            free_memory_mb,
-        } => {
-            if let Some(node) = nodes.get_mut(name) {
-                node.cpu_load = *cpu_load;
-                node.free_memory_mb = *free_memory_mb;
-            }
-        }
+
+        cm.check_node_health(90);
+        wait_for("health check applied", || {
+            cm.get_node("stale")
+                .map_or(false, |n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("stale").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_resets_fields_via_apply() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("requeue-me"));
+
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: -1,
+            state: JobState::Timeout,
+        });
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
+
+        // Requeue: Timeout → Pending should reset allocation fields
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: id,
+            old_state: JobState::Timeout,
+            new_state: JobState::Pending,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert!(
+            job.start_time.is_none(),
+            "start_time should be cleared on requeue"
+        );
+        assert!(
+            job.allocated_nodes.is_empty(),
+            "allocated_nodes should be cleared"
+        );
+        assert!(
+            job.allocated_resources.is_none(),
+            "allocated_resources should be cleared"
+        );
+        assert_eq!(job.pending_reason, PendingReason::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_node_gets_partition_via_propose() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "test-node", 4, 8000);
+
+        let node = cm.get_node("test-node").unwrap();
+        assert!(!node.partitions.is_empty());
+        assert_eq!(node.partitions[0], "default");
     }
 }

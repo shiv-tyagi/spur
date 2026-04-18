@@ -1,15 +1,110 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
 use spur_proto::proto::*;
 
 use crate::cluster::ClusterManager;
+use crate::raft::RaftHandle;
+
+const FORWARDED_HEADER: &str = "x-spur-forwarded";
+const LEADER_HEADER: &str = "x-spur-leader";
 
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
+    raft: Arc<RaftHandle>,
+    leader_proxy: LeaderProxy,
+    /// Node ID → client API address (host:6817) for the x-spur-leader header.
+    client_addrs: BTreeMap<u64, String>,
+}
+
+struct LeaderProxy {
+    raft: Arc<RaftHandle>,
+    client_addrs: BTreeMap<u64, String>,
+    cached_client: Mutex<Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>>,
+}
+
+impl LeaderProxy {
+    fn new(raft: Arc<RaftHandle>, client_addrs: BTreeMap<u64, String>) -> Self {
+        Self {
+            raft,
+            client_addrs,
+            cached_client: Mutex::new(None),
+        }
+    }
+
+    async fn get_leader_client(
+        &self,
+    ) -> Result<SlurmControllerClient<tonic::transport::Channel>, Status> {
+        let leader_id = self
+            .raft
+            .current_leader()
+            .ok_or_else(|| Status::unavailable("no leader elected yet"))?;
+
+        let mut cached = self.cached_client.lock().await;
+
+        if let Some((id, ref client)) = *cached {
+            if id == leader_id {
+                return Ok(client.clone());
+            }
+        }
+
+        let addr = self
+            .client_addrs
+            .get(&leader_id)
+            .ok_or_else(|| Status::unavailable("leader address unknown"))?;
+
+        let url = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{}", addr)
+        };
+
+        let client = SlurmControllerClient::connect(url)
+            .await
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
+
+        *cached = Some((leader_id, client.clone()));
+        Ok(client)
+    }
+}
+
+impl ControllerService {
+    fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if self.raft.is_leader() {
+            return Ok(());
+        }
+
+        if request.metadata().get(FORWARDED_HEADER).is_some() {
+            return Err(self.not_leader_status());
+        }
+
+        Err(self.not_leader_status())
+    }
+
+    fn not_leader_status(&self) -> Status {
+        let mut status = Status::unavailable("not the Raft leader");
+        if let Some(leader_id) = self.raft.current_leader() {
+            if let Some(addr) = self.client_addrs.get(&leader_id) {
+                if let Ok(val) = addr.parse::<MetadataValue<tonic::metadata::Ascii>>() {
+                    status.metadata_mut().insert(LEADER_HEADER, val);
+                }
+            }
+        }
+        status
+    }
+
+    fn forwarded_metadata() -> tonic::metadata::MetadataMap {
+        let mut meta = tonic::metadata::MetadataMap::new();
+        meta.insert(FORWARDED_HEADER, "true".parse().unwrap());
+        meta
+    }
 }
 
 #[tonic::async_trait]
@@ -18,6 +113,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<SubmitJobResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.submit_job(fwd).await;
+            }
+            return Err(status);
+        }
+
         let spec = request
             .into_inner()
             .spec
@@ -36,6 +142,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_jobs(fwd).await;
+            }
+        }
+
         let req = request.into_inner();
 
         let states: Vec<spur_core::job::JobState> = req
@@ -70,6 +186,16 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_job(fwd).await;
+            }
+        }
+
         let job_id = request.into_inner().job_id;
         let job = self
             .cluster
@@ -80,6 +206,17 @@ impl SlurmController for ControllerService {
     }
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.cancel_job(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
         self.cluster
             .cancel_job(req.job_id, &req.user)
@@ -88,6 +225,17 @@ impl SlurmController for ControllerService {
     }
 
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.update_job(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
 
         // Handle hold/release via priority
@@ -125,6 +273,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_nodes(fwd).await;
+            }
+        }
+
         let _req = request.into_inner();
         let nodes = self.cluster.get_nodes();
         let proto_nodes: Vec<NodeInfo> = nodes.iter().map(node_to_proto).collect();
@@ -135,10 +293,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_node(fwd).await;
+            }
+        }
+
         let name = request.into_inner().name;
-        // spurd uses GetNode as a lightweight heartbeat — update the
-        // last_heartbeat timestamp so the health checker doesn't mark
-        // the node DOWN.
         self.cluster.update_heartbeat(&name, 0, 0);
         let node = self
             .cluster
@@ -151,6 +316,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<UpdateNodeRequest>,
     ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.update_node(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
         if let Some(state) = req.state {
             let node_state = proto_to_node_state(state)
@@ -164,8 +340,18 @@ impl SlurmController for ControllerService {
 
     async fn get_partitions(
         &self,
-        _request: Request<GetPartitionsRequest>,
+        request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_partitions(fwd).await;
+            }
+        }
+
         let partitions = self.cluster.get_partitions();
         let proto: Vec<PartitionInfo> = partitions.iter().map(partition_to_proto).collect();
         Ok(Response::new(GetPartitionsResponse { partitions: proto }))
@@ -197,6 +383,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.register_agent(fwd).await;
+            }
+            return Err(status);
+        }
+
         // Extract the remote IP from the gRPC connection as fallback
         let remote_addr = request
             .remote_addr()
@@ -218,8 +415,6 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
-        // Prefer agent's self-reported address (e.g. WireGuard IP),
-        // fall back to remote TCP address
         let agent_addr = if !req.address.is_empty() {
             req.address.clone()
         } else {
@@ -257,6 +452,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ReportJobStatusRequest>,
     ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.report_job_status(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
         let state = proto_to_job_state(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
@@ -274,9 +480,8 @@ impl SlurmController for ControllerService {
         &self,
         _request: Request<tonic::Streaming<HeartbeatRequest>>,
     ) -> Result<Response<Self::HeartbeatStream>, Status> {
-        // MVP: simple request/response, streaming deferred
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let _ = tx; // Will implement streaming in Phase 5
+        let _ = tx;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
@@ -286,6 +491,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_job_steps(fwd).await;
+            }
+        }
+
         let job_id = request.into_inner().job_id;
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
@@ -305,10 +520,20 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreateJobStepRequest>,
     ) -> Result<Response<CreateJobStepResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.create_job_step(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // Verify job exists and is Running
         let job = self
             .cluster
             .get_job(job_id)
@@ -321,7 +546,6 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Auto-increment step_id from existing step count (skip special IDs)
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
             .iter()
@@ -352,6 +576,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreateReservationRequest>,
     ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.create_reservation(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
 
         let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
@@ -385,6 +620,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<UpdateReservationRequest>,
     ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.update_reservation(fwd).await;
+            }
+            return Err(status);
+        }
+
         let req = request.into_inner();
         self.cluster
             .update_reservation(
@@ -405,6 +651,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<DeleteReservationRequest>,
     ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.delete_reservation(fwd).await;
+            }
+            return Err(status);
+        }
+
         let name = request.into_inner().name;
         self.cluster
             .delete_reservation(&name)
@@ -414,8 +671,17 @@ impl SlurmController for ControllerService {
 
     async fn list_reservations(
         &self,
-        _request: Request<ListReservationsRequest>,
+        request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.list_reservations(fwd).await;
+            }
+        }
         let reservations = self.cluster.get_reservations();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
@@ -433,20 +699,25 @@ impl SlurmController for ControllerService {
         }))
     }
 
-    /// Proxy ExecInJob to the agent running the job.
-    ///
-    /// The CLI connects to the controller; the controller looks up which node
-    /// is running the job and forwards the request to that node's agent.
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.exec_in_job(fwd).await;
+            }
+        }
+
         use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // Find the running job
         let job = self
             .cluster
             .get_job(job_id)
@@ -459,14 +730,12 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        // Get the first allocated node (batch host)
         let node_name = job
             .allocated_nodes
             .first()
             .ok_or_else(|| Status::internal(format!("job {} has no allocated nodes", job_id)))?
             .clone();
 
-        // Look up agent address
         let node = self
             .cluster
             .get_node(&node_name)
@@ -477,7 +746,6 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
         let agent_addr = format!("http://{}:{}", addr, node.port);
 
-        // Forward to agent
         let mut agent = SlurmAgentClient::connect(agent_addr.clone())
             .await
             .map_err(|e| {
@@ -496,8 +764,32 @@ impl SlurmController for ControllerService {
     }
 }
 
-pub async fn serve(addr: SocketAddr, cluster: Arc<ClusterManager>) -> anyhow::Result<()> {
-    let service = ControllerService { cluster };
+pub async fn serve(
+    addr: SocketAddr,
+    cluster: Arc<ClusterManager>,
+    raft_handle: Arc<RaftHandle>,
+) -> anyhow::Result<()> {
+    let client_addrs: BTreeMap<u64, String> = raft_handle
+        .peers
+        .iter()
+        .map(|(id, raft_addr)| {
+            let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
+                format!("{}:6817", host)
+            } else {
+                format!("{}:6817", raft_addr)
+            };
+            (*id, client_addr)
+        })
+        .collect();
+
+    let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
+
+    let service = ControllerService {
+        cluster,
+        client_addrs,
+        raft: raft_handle,
+        leader_proxy,
+    };
 
     tonic::transport::Server::builder()
         .add_service(SlurmControllerServer::new(service))
@@ -510,7 +802,6 @@ pub async fn serve(addr: SocketAddr, cluster: Arc<ClusterManager>) -> anyhow::Re
 // ---- Proto conversion helpers ----
 
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
-    // Merge licenses into gres as "license:<entry>"
     let mut gres = spec.gres;
     for lic in &spec.licenses {
         gres.push(format!("license:{}", lic));
@@ -831,7 +1122,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         name: part.name.clone(),
         state: part.state.display().to_string(),
         is_default: part.is_default,
-        total_nodes: 0, // Computed at query time
+        total_nodes: 0,
         total_cpus: 0,
         nodes: part.nodes.clone(),
         max_time: part.max_time_minutes.map(|m| prost_types::Duration {

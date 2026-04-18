@@ -205,9 +205,9 @@ printf("Submitted job %u\n", job_id);
                     ┌──────────────▼───────────────┐
                     │      spurctld (Rust)          │
                     │  ┌─────────┐ ┌────────────┐  │
-                    │  │Backfill │ │  WAL +      │  │
+                    │  │Backfill │ │  Raft Log + │  │
                     │  │Scheduler│ │  Snapshots  │  │
-                    │  │         │ │  (redb)     │  │
+                    │  │         │ │  (openraft) │  │
                     │  └─────────┘ └────────────┘  │
                     └──────┬───────────────┬───────┘
                            │               │
@@ -278,10 +278,10 @@ spur/
 ├── docs/quickstart.md          # Getting started guide
 ├── crates/
 │   ├── spur-proto/             # Generated gRPC code
-│   ├── spur-core/              # Job, Node, ResourceSet, config, hostlist, WAL
+│   ├── spur-core/              # Job, Node, ResourceSet, config, hostlist, WalOperation
 │   ├── spur-net/               # WireGuard mesh networking, address detection
 │   ├── spur-sched/             # Backfill scheduler, priority, timeline
-│   ├── spur-state/             # WAL persistence, redb snapshots
+
 │   ├── spurctld/               # Controller daemon
 │   ├── spurd/                  # Node agent daemon
 │   ├── spurdbd/                # Accounting daemon
@@ -313,7 +313,7 @@ Test groups mirror Slurm's testsuite numbering for 1-1 mapping:
 | t50 | Core types (state machine, resources, GRES) |
 | t51 | Hostlist expansion/compression |
 | t52 | Configuration parsing |
-| t53 | WAL and snapshot persistence |
+| t53 | (removed — covered by spurctld Raft tests) |
 | t55 | Output format conformance |
 
 ## License

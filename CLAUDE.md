@@ -26,10 +26,9 @@ cargo test
 proto/slurm.proto              # Single protobuf file — all gRPC service definitions
 crates/
   spur-proto/                  # Generated gRPC code (build.rs runs tonic-build)
-  spur-core/                   # Core types: Job, Node, ResourceSet, config, hostlist, WAL
+  spur-core/                   # Core types: Job, Node, ResourceSet, config, hostlist, WalOperation
   spur-net/                    # WireGuard mesh networking, IP pool, address detection
   spur-sched/                  # Backfill scheduler
-  spur-state/                  # WAL persistence + redb snapshots
   spurctld/                    # Controller daemon (the brain)
   spurd/                       # Node agent daemon (runs on compute nodes)
   spurdbd/                     # Accounting daemon (PostgreSQL)
@@ -44,7 +43,7 @@ crates/
 ## Key Architecture Decisions
 
 - **Single proto file**: All services defined in `proto/slurm.proto`. Controller is `SlurmController` (port 6817), agent is `SlurmAgent` (port 6818), accounting is `SlurmAccounting` (port 6819).
-- **State**: WAL (write-ahead log) + periodic redb snapshots in `spur-state`. The controller recovers from snapshot + WAL replay on restart.
+- **State**: Always-on Raft consensus (openraft) in `spurctld/src/raft.rs`. Even single-node deployments run a 1-member Raft cluster. The Raft log is the sole durable store; snapshots are JSON-serialized `ClusterSnapshot` blobs. Recovery happens via Raft log replay + snapshot restore.
 - **Scheduler**: Backfill scheduler in `spur-sched`. Runs every N seconds, assigns pending jobs to idle/mixed nodes.
 - **Job dispatch**: Controller dispatches `LaunchJobRequest` to ALL allocated nodes (not just the first). Each node gets `peer_nodes` list and `task_offset`.
 - **Networking**: Agents auto-detect WireGuard interface IP and self-report it during registration. Controller prefers self-reported address over TCP remote_addr. `spur net` CLI manages WireGuard mesh setup.
