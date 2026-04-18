@@ -176,6 +176,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         power: Default::default(),
         federation: Default::default(),
         topology: None,
+        isolation: Default::default(),
         licenses: std::collections::HashMap::new(),
     }
 }

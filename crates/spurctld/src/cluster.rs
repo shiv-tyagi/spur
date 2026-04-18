@@ -1677,6 +1677,7 @@ mod tests {
             power: Default::default(),
             federation: Default::default(),
             topology: None,
+            isolation: Default::default(),
             licenses: HashMap::new(),
         }
     }
