@@ -65,6 +65,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub topology: Option<crate::topology::TopologyConfig>,
 
+    /// Job isolation configuration.
+    #[serde(default)]
+    pub isolation: IsolationConfig,
+
     /// Cluster-wide license pool, e.g., {"fluent": 20, "comsol": 5}.
     #[serde(default)]
     pub licenses: HashMap<String, u64>,
@@ -400,6 +404,50 @@ pub struct NotificationConfig {
     pub smtp_command: Option<String>,
     /// From address for notification emails, e.g., "spur@cluster.local".
     pub from_address: Option<String>,
+}
+
+/// Job isolation configuration for bare-metal and container jobs.
+///
+/// Each layer operates independently and degrades gracefully when the
+/// kernel doesn't support it or spurd isn't running as root.
+///
+/// Example:
+/// ```toml
+/// [isolation]
+/// setuid = true       # Run jobs as submitting user (requires root)
+/// namespaces = true   # PID + mount namespace isolation
+/// seccomp = true      # syscall whitelist (blocks ptrace, mount, bpf)
+/// landlock = true     # filesystem access control (kernel 5.13+)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IsolationConfig {
+    /// Run jobs as the submitting user's UID/GID (requires root spurd).
+    #[serde(default = "default_true_fn")]
+    pub setuid: bool,
+    /// PID + mount namespace isolation (requires root).
+    #[serde(default = "default_true_fn")]
+    pub namespaces: bool,
+    /// seccomp-BPF syscall filter (kernel 3.5+).
+    #[serde(default = "default_true_fn")]
+    pub seccomp: bool,
+    /// Landlock filesystem access control (kernel 5.13+, bare-metal only).
+    #[serde(default = "default_true_fn")]
+    pub landlock: bool,
+}
+
+fn default_true_fn() -> bool {
+    true
+}
+
+impl Default for IsolationConfig {
+    fn default() -> Self {
+        Self {
+            setuid: true,
+            namespaces: true,
+            seccomp: true,
+            landlock: true,
+        }
+    }
 }
 
 /// Federation configuration for multi-cluster job routing.
