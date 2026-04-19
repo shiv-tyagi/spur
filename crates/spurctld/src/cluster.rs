@@ -548,14 +548,12 @@ impl ClusterManager {
         }
     }
 
-    /// Update node heartbeat data.
+    /// Update node heartbeat telemetry (load, memory, timestamp).
     ///
-    /// If a node is Down due to heartbeat timeout ("Not responding"), receiving
-    /// a fresh heartbeat automatically recovers it to Idle. Admin-set Down
-    /// states (any other reason) are NOT cleared — those require explicit
-    /// `scontrol update`. (Issue #95)
-    pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) {
-        // Resolve hostname alias (agent may use real hostname, node stored under config name)
+    /// Returns `true` if the node was found, `false` if unknown.
+    /// State recovery is handled separately by `check_node_health`, which
+    /// detects the fresh `last_heartbeat` and proposes a WAL-backed transition.
+    pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) -> bool {
         let effective_name = self
             .hostname_aliases
             .read()
@@ -567,25 +565,9 @@ impl ClusterManager {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
-
-            // Auto-recover nodes that went Down from heartbeat timeout.
-            // Only recover if the reason is "Not responding" (auto-detected).
-            // Admin-set Down (e.g., "maintenance", "hardware issue") stays Down.
-            if node.state == NodeState::Down {
-                let is_auto_down = node
-                    .state_reason
-                    .as_deref()
-                    .map(|r| r == "Not responding")
-                    .unwrap_or(false);
-                if is_auto_down {
-                    info!(
-                        node = %node.name,
-                        "node recovered from heartbeat timeout — transitioning to Idle"
-                    );
-                    node.state = NodeState::Idle;
-                    node.state_reason = None;
-                }
-            }
+            true
+        } else {
+            false
         }
     }
 
@@ -1571,16 +1553,6 @@ impl ClusterManager {
                     node.admin_locked = *admin_locked;
                 }
             }
-            WalOperation::NodeHeartbeat {
-                name,
-                cpu_load,
-                free_memory_mb,
-            } => {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.cpu_load = *cpu_load;
-                    node.free_memory_mb = *free_memory_mb;
-                }
-            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
     }
@@ -2042,23 +2014,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn apply_node_heartbeat() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-
-        register_node(&cm, "n1", 4, 8000);
-        cm.apply_operation(&WalOperation::NodeHeartbeat {
-            name: "n1".into(),
-            cpu_load: 75,
-            free_memory_mb: 4000,
-        });
-
-        let node = cm.get_node("n1").unwrap();
-        assert_eq!(node.cpu_load, 75);
-        assert_eq!(node.free_memory_mb, 4000);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_assigns_id_and_applies() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -2306,41 +2261,6 @@ mod tests {
             "admin-locked node must not auto-recover"
         );
         assert!(node.admin_locked);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_downed_node_recovers_via_health_check() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "auto", 4, 8000);
-
-        // Heartbeat timeout — auto Down, admin_locked = false
-        if let Some(node) = cm.nodes.write().get_mut("auto") {
-            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
-        }
-        cm.check_node_health(90);
-        wait_for("health check applied", || {
-            cm.get_node("auto")
-                .map_or(false, |n| n.state == NodeState::Down)
-        });
-        let node = cm.get_node("auto").unwrap();
-        assert!(!node.admin_locked, "auto-downed must not be admin_locked");
-
-        // Agent heartbeat resumes — refresh last_heartbeat
-        cm.update_heartbeat("auto", 50, 4000);
-
-        // Next health check cycle detects fresh heartbeat → recovers to Idle
-        cm.check_node_health(90);
-        wait_for("recovery applied", || {
-            cm.get_node("auto")
-                .map_or(false, |n| n.state == NodeState::Idle)
-        });
-        let node = cm.get_node("auto").unwrap();
-        assert_eq!(
-            node.state,
-            NodeState::Idle,
-            "auto-downed node must recover via health check"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
