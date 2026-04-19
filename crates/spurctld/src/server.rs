@@ -304,7 +304,6 @@ impl SlurmController for ControllerService {
         }
 
         let name = request.into_inner().name;
-        self.cluster.update_heartbeat(&name, 0, 0);
         let node = self
             .cluster
             .get_node(&name)
@@ -445,9 +444,6 @@ impl SlurmController for ControllerService {
         }))
     }
 
-    type HeartbeatStream =
-        tokio_stream::wrappers::ReceiverStream<Result<HeartbeatResponse, Status>>;
-
     async fn report_job_status(
         &self,
         request: Request<ReportJobStatusRequest>,
@@ -478,13 +474,32 @@ impl SlurmController for ControllerService {
 
     async fn heartbeat(
         &self,
-        _request: Request<tonic::Streaming<HeartbeatRequest>>,
-    ) -> Result<Response<Self::HeartbeatStream>, Status> {
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let _ = tx;
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(request.into_inner());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.heartbeat(fwd).await;
+            }
+            #[allow(unreachable_code)]
+            return Err(status);
+        }
+
+        let req = request.into_inner();
+        if self
+            .cluster
+            .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
+        {
+            Ok(Response::new(HeartbeatResponse {}))
+        } else {
+            Err(Status::not_found(format!(
+                "node {} not found — is the node registered?",
+                req.hostname
+            )))
+        }
     }
 
     async fn get_job_steps(

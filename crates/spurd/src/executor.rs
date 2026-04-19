@@ -56,8 +56,7 @@ async fn report_completion(
     job_id: JobId,
     exit_code: i32,
 ) -> anyhow::Result<()> {
-    // For now, the controller handles this via the heartbeat/status update path.
-    // Full implementation in Phase 5 with streaming heartbeats.
+    // Stub: completion is reported via ReportJobStatus RPC from the agent server.
     debug!(job_id, exit_code, "would report completion to controller");
     Ok(())
 }

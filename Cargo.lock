@@ -3385,7 +3385,6 @@ dependencies = [
  "spur-sched",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

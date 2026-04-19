@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 
 use tokio::sync::RwLock;
-use tonic::Code;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{GetNodeRequest, RegisterAgentRequest};
+use spur_proto::proto::{HeartbeatRequest, RegisterAgentRequest};
 
 // Matches spurctld's check_node_health(90) timeout and spurd's 30 s interval.
 const INTERVAL_SECS: u64 = 30;
 
-/// Tracks the set of active K8s nodes and sends periodic `GetNode` heartbeats
+/// Tracks the set of active K8s nodes and sends periodic `Heartbeat` RPCs
 /// to spurctld on their behalf, mirroring what `spurd`'s `reporter::heartbeat_loop`
 /// does for bare-metal nodes.
 ///
@@ -40,7 +39,7 @@ impl HeartbeatManager {
         self.registry.write().await.remove(name);
     }
 
-    /// Send `GetNode` pings to spurctld for every tracked node.
+    /// Send `Heartbeat` RPCs to spurctld for every tracked node.
     pub async fn run(&self) -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(INTERVAL_SECS));
         loop {
@@ -54,22 +53,14 @@ impl HeartbeatManager {
             match connect(&self.controller_addr).await {
                 Ok(mut client) => {
                     for name in &names {
-                        match client.get_node(GetNodeRequest { name: name.clone() }).await {
+                        let req = HeartbeatRequest {
+                            hostname: name.clone(),
+                            cpu_load: 0,
+                            free_memory_mb: 0,
+                            running_jobs: vec![],
+                        };
+                        match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
-                            // spurctld restarted and lost state — re-register immediately.
-                            Err(e) if e.code() == Code::NotFound => {
-                                let req = self.registry.read().await.get(name).cloned();
-                                if let Some(req) = req {
-                                    match client.register_agent(req).await {
-                                        Ok(_) => {
-                                            info!(node = %name, "K8s node re-registered with spurctld");
-                                        }
-                                        Err(e) => {
-                                            warn!(node = %name, error = %e, "re-registration failed");
-                                        }
-                                    }
-                                }
-                            }
                             Err(e) => warn!(node = %name, error = %e, "heartbeat failed"),
                         }
                     }

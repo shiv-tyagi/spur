@@ -65,9 +65,4 @@ pub enum WalOperation {
         #[serde(default)]
         admin_locked: bool,
     },
-    NodeHeartbeat {
-        name: String,
-        cpu_load: u32,
-        free_memory_mb: u64,
-    },
 }

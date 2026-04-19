@@ -252,7 +252,7 @@ service SlurmController {
 
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
-  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
@@ -412,10 +412,7 @@ message RunningJobStatus {
   int32 exit_code = 3;
 }
 
-message HeartbeatResponse {
-  repeated LaunchJobRequest launch_jobs = 1;
-  repeated uint32 cancel_jobs = 2;
-}
+message HeartbeatResponse {}
 
 // -- Agent --
 

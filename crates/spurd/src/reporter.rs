@@ -71,19 +71,18 @@ impl NodeReporter {
         loop {
             interval.tick().await;
 
-            // Update system metrics
             let (load, free_mem) = read_system_metrics();
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
 
-            // Send heartbeat via unary RPC (streaming deferred to Phase 5)
             match SlurmControllerClient::connect(self.controller_addr.clone()).await {
                 Ok(mut client) => {
-                    // Use GetNode as a lightweight heartbeat for now
-                    // Full streaming heartbeat in Phase 5
                     match client
-                        .get_node(spur_proto::proto::GetNodeRequest {
-                            name: self.hostname.clone(),
+                        .heartbeat(spur_proto::proto::HeartbeatRequest {
+                            hostname: self.hostname.clone(),
+                            cpu_load: load,
+                            free_memory_mb: free_mem,
+                            running_jobs: vec![],
                         })
                         .await
                     {
