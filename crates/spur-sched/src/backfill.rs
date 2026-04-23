@@ -177,6 +177,13 @@ impl Scheduler for BackfillScheduler {
                     node.alloc_resources.clone(),
                 );
             }
+            // Debug: log alloc_resources.gpus for each node
+            debug!(
+                node = %node.name,
+                alloc_cpus = node.alloc_resources.cpus,
+                alloc_gpus = node.alloc_resources.gpus.len(),
+                "node allocation state"
+            );
         }
 
         // Identify het job groups: collect sets of jobs linked by het_job_id.
@@ -243,6 +250,13 @@ impl Scheduler for BackfillScheduler {
                 .iter()
                 .map(|&ni| {
                     let start = self.timelines[ni].earliest_start(&required, duration, now);
+                    debug!(
+                        job_id = job.job_id,
+                        node = %cluster.nodes[ni].name,
+                        earliest_start = %start,
+                        is_now = (start <= now),
+                        "earliest start for node"
+                    );
                     (ni, start)
                 })
                 .collect();

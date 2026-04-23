@@ -29,7 +29,7 @@ spec:
       serviceAccountName: spur-operator
       containers:
         - name: spurrestd
-          image: spur:latest
+          image: amdaccelcloud/spur:latest
           command: [spurrestd]
           args:
             - --listen=[::]:6820

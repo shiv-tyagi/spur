@@ -32,7 +32,7 @@ spec:
       serviceAccountName: spur-operator
       containers:
         - name: operator
-          image: spur:latest
+          image: amdaccelcloud/spur:latest
           command: [spur-k8s-operator]
           args:
             - --controller-addr=spurctld.spur.svc.cluster.local:6817

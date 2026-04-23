@@ -36,6 +36,12 @@ impl NodeTimeline {
             if interval.start <= time && time < interval.end {
                 used.cpus += interval.resources.cpus;
                 used.memory_mb += interval.resources.memory_mb;
+                // Accumulate GPU allocations so subtract() can remove them by device_id.
+                for gpu in &interval.resources.gpus {
+                    if !used.gpus.iter().any(|g| g.device_id == gpu.device_id) {
+                        used.gpus.push(gpu.clone());
+                    }
+                }
             }
         }
         self.total.subtract(&used)
@@ -68,6 +74,11 @@ impl NodeTimeline {
                         let mut total_used = ResourceSet::default();
                         total_used.cpus += interval.resources.cpus;
                         total_used.memory_mb += interval.resources.memory_mb;
+                        for gpu in &interval.resources.gpus {
+                            if !total_used.gpus.iter().any(|g| g.device_id == gpu.device_id) {
+                                total_used.gpus.push(gpu.clone());
+                            }
+                        }
                         let avail = self.total.subtract(&total_used);
                         if !avail.can_satisfy(request) {
                             // Move candidate past this interval
@@ -123,6 +134,7 @@ impl NodeTimeline {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use spur_core::resource::GpuResource;
 
     fn make_timeline() -> NodeTimeline {
         NodeTimeline::new(
@@ -130,6 +142,27 @@ mod tests {
             ResourceSet {
                 cpus: 64,
                 memory_mb: 256_000,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn make_gpu_timeline(num_gpus: usize) -> NodeTimeline {
+        let gpus = (0..num_gpus)
+            .map(|i| GpuResource {
+                device_id: i as u32,
+                gpu_type: "mi355x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: spur_core::resource::GpuLinkType::PCIe,
+            })
+            .collect();
+        NodeTimeline::new(
+            "gpu-node".into(),
+            ResourceSet {
+                cpus: 192,
+                memory_mb: 2_000_000,
+                gpus,
                 ..Default::default()
             },
         )
@@ -183,7 +216,7 @@ mod tests {
             },
         );
 
-        // Request 32 CPUs for 2 hours — should fit now (64-48=16 < 32, so must wait)
+        // Request 32 CPUs for 2 hours - should fit now (64-48=16 < 32, so must wait)
         let req = ResourceSet {
             cpus: 32,
             memory_mb: 0,
@@ -192,5 +225,81 @@ mod tests {
         let start = tl.earliest_start(&req, Duration::hours(2), now);
         // Should start after the reservation ends
         assert!(start >= now + Duration::hours(4));
+    }
+
+    #[test]
+    fn test_gpu_reservation_blocks_scheduling() {
+        let mut tl = make_gpu_timeline(8);
+        let now = Utc::now();
+
+        // Reserve all 8 GPUs (simulating job 13 with 8 GPUs on gpu-2)
+        let all_gpus: Vec<GpuResource> = (0..8)
+            .map(|i| GpuResource {
+                device_id: i as u32,
+                gpu_type: "mi355x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: spur_core::resource::GpuLinkType::PCIe,
+            })
+            .collect();
+        tl.reserve(
+            now,
+            now + Duration::hours(4),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 0,
+                gpus: all_gpus,
+                ..Default::default()
+            },
+        );
+
+        // Now try to schedule a job needing 4 GPUs - should see 0 available
+        let avail = tl.available_at(now + Duration::minutes(1));
+        assert_eq!(avail.gpus.len(), 0, "all GPUs should be allocated");
+
+        // Request 4 GPUs - should not be satisfiable now
+        let req = ResourceSet {
+            cpus: 4,
+            memory_mb: 0,
+            gpus: (0..4).map(|i| GpuResource {
+                device_id: i as u32,
+                gpu_type: "mi355x".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: spur_core::resource::GpuLinkType::PCIe,
+            }).collect(),
+            ..Default::default()
+        };
+        assert!(!avail.can_satisfy(&req), "should not schedule when GPUs are full");
+    }
+
+    #[test]
+    fn test_gpu_partial_reservation_allows_remaining() {
+        let mut tl = make_gpu_timeline(8);
+        let now = Utc::now();
+
+        // Reserve 4 GPUs (devices 0-3)
+        let half_gpus: Vec<GpuResource> = (0..4)
+            .map(|i| GpuResource {
+                device_id: i as u32,
+                gpu_type: "mi355x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: spur_core::resource::GpuLinkType::PCIe,
+            })
+            .collect();
+        tl.reserve(
+            now,
+            now + Duration::hours(4),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 0,
+                gpus: half_gpus,
+                ..Default::default()
+            },
+        );
+
+        let avail = tl.available_at(now + Duration::minutes(1));
+        assert_eq!(avail.gpus.len(), 4, "4 GPUs should still be available");
     }
 }
