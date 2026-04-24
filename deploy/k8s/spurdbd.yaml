@@ -29,7 +29,7 @@ spec:
       serviceAccountName: spur-operator
       containers:
         - name: spurdbd
-          image: amdaccelcloud/spur:latest
+          image: spur:latest
           command: [spurdbd]
           args:
             - --listen=[::]:6819
