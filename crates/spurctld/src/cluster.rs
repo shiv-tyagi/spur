@@ -258,10 +258,13 @@ impl ClusterManager {
             job.state
         };
 
-        self.propose(WalOperation::JobStateChange {
+        // Use JobComplete (not JobStateChange) so that resource deallocation
+        // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
+        // so the deallocation loop is a no-op.
+        self.propose(WalOperation::JobComplete {
             job_id,
-            old_state,
-            new_state: JobState::Cancelled,
+            exit_code: -1,
+            state: JobState::Cancelled,
         });
 
         info!(job_id, "job cancelled");

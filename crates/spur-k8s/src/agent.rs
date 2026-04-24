@@ -236,7 +236,8 @@ impl SlurmAgent for VirtualAgent {
         } else if !spec.script.is_empty() {
             Some(vec!["sh".into(), "-c".into(), spec.script.clone()])
         } else {
-            None
+            // Interactive session: keep pod alive so kube exec can attach a terminal
+            Some(vec!["sleep".into(), "infinity".into()])
         };
 
         // Parse container_mounts → volumes + volume_mounts

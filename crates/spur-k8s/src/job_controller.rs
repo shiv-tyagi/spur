@@ -359,11 +359,40 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 .and_then(|s| s.phase.as_deref())
                 .unwrap_or("");
 
+            // Detect Pending pods rejected by kubelet (UnexpectedAdmissionError, ImagePullBackOff)
+            let pending_failure = if phase == "Pending" {
+                pod.status
+                    .as_ref()
+                    .and_then(|s| s.reason.as_deref())
+                    .map_or(false, |r| r == "UnexpectedAdmissionError")
+                    || pod
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.container_statuses.as_ref())
+                        .and_then(|cs| cs.first())
+                        .and_then(|cs| cs.state.as_ref())
+                        .and_then(|st| st.waiting.as_ref())
+                        .and_then(|w| w.reason.as_deref())
+                        .map_or(false, |r| r == "ImagePullBackOff" || r == "ErrImagePull")
+            } else {
+                false
+            };
+
             // Extract richer status from container statuses
-            let (state, exit_code, message) = match phase {
-                "Succeeded" => (3, 0, String::new()), // JOB_COMPLETED
-                "Failed" => extract_failure_details(&pod),
-                _ => continue,
+            let (state, exit_code, message) = if pending_failure {
+                let msg = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.message.as_deref())
+                    .unwrap_or("Pod rejected by kubelet before starting")
+                    .to_string();
+                (4i32, 1i32, msg) // JOB_FAILED
+            } else {
+                match phase {
+                    "Succeeded" => (3, 0, String::new()), // JOB_COMPLETED
+                    "Failed" => extract_failure_details(&pod),
+                    _ => continue,
+                }
             };
 
             let pod_name = pod.metadata.name.clone().unwrap_or_default();
