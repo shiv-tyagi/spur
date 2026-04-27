@@ -269,7 +269,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         job_id,
                         failures, "all dispatches failed — requeueing job to Pending"
                     );
-                    cluster_ref.requeue_job(job_id);
+                    if let Err(e) = cluster_ref.requeue_job(job_id) {
+                        error!(job_id, error = %e, "failed to requeue job after dispatch failure");
+                    }
                 } else if failures > 0 {
                     warn!(
                         job_id,

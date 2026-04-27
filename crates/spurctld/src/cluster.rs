@@ -84,7 +84,7 @@ impl ClusterManager {
         self.propose(WalOperation::JobSubmit {
             job_id,
             spec: spec.clone(),
-        });
+        })?;
 
         info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
         Ok(job_id)
@@ -116,7 +116,7 @@ impl ClusterManager {
             self.propose(WalOperation::JobSubmit {
                 job_id: task_job_id,
                 spec: task_spec.clone(),
-            });
+            })?;
 
             let mut job = Job::new(task_job_id, task_spec);
             job.array_job_id = Some(array_job_id);
@@ -265,7 +265,7 @@ impl ClusterManager {
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
-        });
+        })?;
 
         info!(job_id, "job cancelled");
         Ok(())
@@ -298,12 +298,12 @@ impl ClusterManager {
             job_id,
             old_state,
             new_state: JobState::Running,
-        });
+        })?;
         self.propose(WalOperation::JobStart {
             job_id,
             nodes: node_names.clone(),
             resources: resources.clone(),
-        });
+        })?;
 
         // Batch step creation (not WAL-tracked, recreated on apply)
         let node_count = node_names.len().max(1) as u32;
@@ -369,7 +369,7 @@ impl ClusterManager {
             job_id,
             exit_code,
             state,
-        });
+        })?;
 
         // Notifications (side effects, not replicated)
         let spec_for_notify = self.jobs.read().get(&job_id).map(|j| j.spec.clone());
@@ -392,7 +392,7 @@ impl ClusterManager {
             JobState::Timeout | JobState::Preempted | JobState::NodeFail
         );
         if should_requeue {
-            self.maybe_requeue(job_id);
+            self.maybe_requeue(job_id)?;
         }
 
         debug!(job_id, exit_code, "job completed");
@@ -400,29 +400,30 @@ impl ClusterManager {
     }
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
-    fn maybe_requeue(&self, job_id: JobId) {
+    fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
         const MAX_REQUEUE: u32 = 3;
         let (should_requeue, old_state) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
-                return;
+                return Ok(());
             };
             if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
-                return;
+                return Ok(());
             }
             (true, job.state)
         };
         if !should_requeue {
-            return;
+            return Ok(());
         }
 
         self.propose(WalOperation::JobStateChange {
             job_id,
             old_state,
             new_state: JobState::Pending,
-        });
+        })?;
 
         info!(job_id, from = %old_state, "job requeued");
+        Ok(())
     }
 
     /// Requeue a job back to Pending after a dispatch failure.
@@ -430,11 +431,11 @@ impl ClusterManager {
     /// the requeue flag on the spec. Used when the agent rejects a job
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
-    pub fn requeue_job(&self, job_id: JobId) {
+    pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
         let old_state = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
-                return;
+                return Ok(());
             };
             job.state
         };
@@ -443,9 +444,10 @@ impl ClusterManager {
             job_id,
             old_state,
             new_state: JobState::Pending,
-        });
+        })?;
 
         info!(job_id, from = %old_state, "job requeued after dispatch failure");
+        Ok(())
     }
 
     /// Register a node agent.
@@ -458,7 +460,7 @@ impl ClusterManager {
         wg_pubkey: String,
         version: String,
         source: NodeSource,
-    ) {
+    ) -> anyhow::Result<()> {
         // Normalize node name: if the agent's hostname doesn't match any config
         // entry, check if there's an unmatched config node it could be aliased to.
         // This handles single-node setups where config says "localhost" but the
@@ -527,7 +529,7 @@ impl ClusterManager {
                     port,
                     wg_pubkey,
                     version,
-                });
+                })?;
                 if let Some(node) = self.nodes.write().get_mut(&effective_name) {
                     node.source = source;
                 }
@@ -541,7 +543,7 @@ impl ClusterManager {
                     port,
                     wg_pubkey,
                     version,
-                });
+                })?;
                 if let Some(node) = self.nodes.write().get_mut(&effective_name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
@@ -549,6 +551,7 @@ impl ClusterManager {
                 info!(node = %effective_name, "node registered");
             }
         }
+        Ok(())
     }
 
     /// Update node heartbeat telemetry (load, memory, timestamp).
@@ -610,7 +613,7 @@ impl ClusterManager {
             job_id,
             old_priority,
             new_priority: 0,
-        });
+        })?;
         // Set held reason (not WAL-tracked)
         if let Some(job) = self.jobs.write().get_mut(&job_id) {
             job.pending_reason = PendingReason::Held;
@@ -635,7 +638,7 @@ impl ClusterManager {
             job_id,
             old_priority: 0,
             new_priority: 1000,
-        });
+        })?;
         if let Some(job) = self.jobs.write().get_mut(&job_id) {
             job.pending_reason = PendingReason::Priority;
         }
@@ -672,7 +675,7 @@ impl ClusterManager {
                 job_id,
                 old_priority: old,
                 new_priority: p,
-            });
+            })?;
         }
 
         // Non-WAL-tracked fields: update directly
@@ -740,7 +743,7 @@ impl ClusterManager {
             new_state: effective_state,
             reason,
             admin_locked,
-        });
+        })?;
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
@@ -765,23 +768,27 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    self.propose(WalOperation::NodeStateChange {
+                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
                         name,
                         old_state,
                         new_state: NodeState::Down,
                         reason: Some("Not responding".into()),
                         admin_locked,
-                    });
+                    }) {
+                        warn!(error = %e, "failed to propose node DOWN");
+                    }
                 }
                 HealthAction::Recover { name, old_state } => {
                     info!(node = %name, "node recovered (heartbeat resumed)");
-                    self.propose(WalOperation::NodeStateChange {
+                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
                         name,
                         old_state,
                         new_state: NodeState::Idle,
                         reason: None,
                         admin_locked: false,
-                    });
+                    }) {
+                        warn!(error = %e, "failed to propose node recovery");
+                    }
                 }
             }
         }
@@ -1284,17 +1291,17 @@ impl ClusterManager {
 
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
-    fn propose(&self, op: WalOperation) {
+    fn propose(&self, op: WalOperation) -> anyhow::Result<()> {
         let raft = self
             .raft
             .read()
             .clone()
             .expect("raft must be set before propose is called");
-        if let Err(e) = tokio::task::block_in_place(|| {
+        tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
-        }) {
-            warn!(error = %e, "raft propose failed");
-        }
+        })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
     /// Apply a WalOperation to in-memory state.
@@ -1329,7 +1336,9 @@ impl ClusterManager {
                 job_id, new_state, ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    let _ = job.transition(*new_state);
+                    if let Err(e) = job.transition(*new_state) {
+                        warn!(job_id = *job_id, error = %e, "invalid state transition in WAL apply");
+                    }
                     // Requeue: reset allocation fields when returning to Pending
                     if *new_state == JobState::Pending {
                         job.requeue_count += 1;
@@ -1394,7 +1403,9 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 if let Some(job) = jobs.get_mut(job_id) {
-                    let _ = job.transition(*state);
+                    if let Err(e) = job.transition(*state) {
+                        warn!(job_id = *job_id, error = %e, "invalid state transition in WAL apply");
+                    }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     freed_nodes = job.allocated_nodes.clone();
@@ -1818,7 +1829,8 @@ mod tests {
             String::new(),
             String::new(),
             spur_core::node::NodeSource::BareMetal,
-        );
+        )
+        .unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
@@ -2257,7 +2269,8 @@ mod tests {
             String::new(),
             "1.0".into(),
             NodeSource::BareMetal,
-        );
+        )
+        .unwrap();
         let node = cm.get_node("locked").unwrap();
         assert_eq!(
             node.state,
