@@ -428,15 +428,17 @@ impl SlurmController for ControllerService {
 
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 
-        self.cluster.register_node(
-            req.hostname.clone(),
-            resources,
-            agent_addr,
-            agent_port,
-            req.wg_pubkey,
-            req.version,
-            spur_core::node::NodeSource::BareMetal,
-        );
+        self.cluster
+            .register_node(
+                req.hostname.clone(),
+                resources,
+                agent_addr,
+                agent_port,
+                req.wg_pubkey,
+                req.version,
+                spur_core::node::NodeSource::BareMetal,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
