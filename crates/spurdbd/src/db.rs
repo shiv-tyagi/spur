@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Connect to PostgreSQL and return a connection pool.
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
@@ -167,7 +167,7 @@ pub async fn record_job_end(
     exit_code: i32,
     end_time: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE jobs SET state = $2, exit_code = $3, end_time = $4
         WHERE job_id = $1
@@ -180,7 +180,14 @@ pub async fn record_job_end(
     .execute(pool)
     .await?;
 
-    // Update usage table
+    if result.rows_affected() == 0 {
+        warn!(
+            job_id,
+            "RecordJobEnd for unknown job; start was likely missed"
+        );
+        return Ok(());
+    }
+
     update_usage(pool, job_id, end_time).await?;
 
     Ok(())
