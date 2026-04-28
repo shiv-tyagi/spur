@@ -16,7 +16,7 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 
 /// Run database migrations (create tables if they don't exist).
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query(SCHEMA).execute(pool).await?;
+    sqlx::raw_sql(SCHEMA).execute(pool).await?;
     Ok(())
 }
 
