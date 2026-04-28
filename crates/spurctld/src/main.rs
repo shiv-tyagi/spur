@@ -1,3 +1,4 @@
+mod accounting;
 mod cluster;
 mod raft;
 mod raft_server;
@@ -127,6 +128,24 @@ async fn main() -> anyhow::Result<()> {
 
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
+
+    // Connect to accounting daemon (best-effort -- scheduling works without it)
+    match accounting::AccountingNotifier::connect(&config.accounting.host).await {
+        Ok(notifier) => {
+            cluster.set_accounting(notifier);
+            info!(
+                "accounting notifier connected to {}",
+                config.accounting.host
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                host = %config.accounting.host,
+                "failed to connect to accounting daemon; job history will not be recorded"
+            );
+        }
+    }
 
     // Start scheduler loop (only schedules when this node is Raft leader)
     let sched_cluster = cluster.clone();
