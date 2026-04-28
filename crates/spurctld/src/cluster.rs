@@ -17,6 +17,7 @@ use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 
+use crate::accounting::AccountingNotifier;
 use crate::raft::{SpurRaft, StateMachineApply};
 
 /// Central cluster state manager.
@@ -34,6 +35,7 @@ pub struct ClusterManager {
     license_pool: RwLock<HashMap<String, u64>>,
     hostname_aliases: RwLock<HashMap<String, String>>,
     raft: RwLock<Option<SpurRaft>>,
+    accounting: RwLock<Option<AccountingNotifier>>,
 }
 
 impl ClusterManager {
@@ -52,6 +54,7 @@ impl ClusterManager {
             license_pool: RwLock::new(license_pool),
             hostname_aliases: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
+            accounting: RwLock::new(None),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -292,6 +295,17 @@ impl ClusterManager {
             self.send_notification(job_id, "BEGIN", &spec_for_notify);
         }
 
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_job_start(
+                job_id,
+                spec_for_notify.user.clone(),
+                spec_for_notify.account.clone().unwrap_or_default(),
+                spec_for_notify.partition.clone().unwrap_or_default(),
+                &resources,
+                Utc::now(),
+            );
+        }
+
         debug!(job_id, "job started");
         Ok(())
     }
@@ -336,6 +350,10 @@ impl ClusterManager {
             if is_failure && spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
                 self.send_notification(job_id, "FAIL", &spec);
             }
+        }
+
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_job_end(job_id, state, exit_code, Utc::now());
         }
 
         let should_requeue = matches!(
@@ -1238,6 +1256,10 @@ impl ClusterManager {
 
     pub fn set_raft(&self, raft: SpurRaft) {
         *self.raft.write() = Some(raft);
+    }
+
+    pub fn set_accounting(&self, notifier: AccountingNotifier) {
+        *self.accounting.write() = Some(notifier);
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
