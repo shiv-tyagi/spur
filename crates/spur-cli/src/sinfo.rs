@@ -281,3 +281,185 @@ fn node_state_str(state: i32) -> String {
     }
     .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::NodeState;
+
+    fn make_node(name: &str, state: NodeState, partition: &str) -> NodeInfo {
+        NodeInfo {
+            name: name.into(),
+            state: state as i32,
+            partition: partition.into(),
+            ..Default::default()
+        }
+    }
+
+    fn make_partition(name: &str, is_default: bool) -> PartitionInfo {
+        PartitionInfo {
+            name: name.into(),
+            state: "up".into(),
+            is_default,
+            ..Default::default()
+        }
+    }
+
+    fn default_fields() -> Vec<format_engine::FormatField> {
+        format_engine::parse_format(
+            format_engine::SINFO_DEFAULT_FORMAT,
+            &format_engine::sinfo_header,
+        )
+    }
+
+    #[test]
+    fn test_group_nodes_by_state_mixed() {
+        let nodes = vec![
+            make_node("n1", NodeState::NodeIdle, "p"),
+            make_node("n2", NodeState::NodeIdle, "p"),
+            make_node("n3", NodeState::NodeDown, "p"),
+            make_node("n4", NodeState::NodeDrain, "p"),
+        ];
+        let refs: Vec<&NodeInfo> = nodes.iter().collect();
+        let groups = group_nodes_by_state(&refs);
+
+        assert_eq!(groups.len(), 3);
+        // BTreeMap ordering: idle(0), down(3), drain(4)
+        assert_eq!(groups[0].0, NodeState::NodeIdle as i32);
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, NodeState::NodeDown as i32);
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[2].0, NodeState::NodeDrain as i32);
+        assert_eq!(groups[2].1.len(), 1);
+    }
+
+    #[test]
+    fn test_group_nodes_by_state_all_same() {
+        let nodes = vec![
+            make_node("n1", NodeState::NodeIdle, "p"),
+            make_node("n2", NodeState::NodeIdle, "p"),
+            make_node("n3", NodeState::NodeIdle, "p"),
+        ];
+        let refs: Vec<&NodeInfo> = nodes.iter().collect();
+        let groups = group_nodes_by_state(&refs);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, NodeState::NodeIdle as i32);
+        assert_eq!(groups[0].1.len(), 3);
+    }
+
+    #[test]
+    fn test_group_nodes_by_state_empty() {
+        let groups = group_nodes_by_state(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_render_partition_groups_by_state() {
+        let fields = default_fields();
+        let partitions = vec![make_partition("batch", true)];
+        let nodes = vec![
+            make_node("n1", NodeState::NodeIdle, "batch"),
+            make_node("n2", NodeState::NodeIdle, "batch"),
+            make_node("n3", NodeState::NodeDown, "batch"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected 2 rows (idle + down), got: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("idle"),
+            "first row should be idle: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("2"),
+            "idle row should show 2 nodes: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("n1"),
+            "idle row should list n1: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("n2"),
+            "idle row should list n2: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("n3"),
+            "idle row should not list n3: {}",
+            lines[0]
+        );
+
+        assert!(
+            lines[1].contains("down"),
+            "second row should be down: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("1"),
+            "down row should show 1 node: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("n3"),
+            "down row should list n3: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn test_render_all_idle_single_row() {
+        let fields = default_fields();
+        let partitions = vec![make_partition("batch", true)];
+        let nodes = vec![
+            make_node("n1", NodeState::NodeIdle, "batch"),
+            make_node("n2", NodeState::NodeIdle, "batch"),
+            make_node("n3", NodeState::NodeIdle, "batch"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("idle"));
+        assert!(lines[0].contains("3"));
+    }
+
+    #[test]
+    fn test_render_empty_partition() {
+        let fields = default_fields();
+        let partitions = vec![make_partition("empty", false)];
+        let nodes: Vec<NodeInfo> = vec![];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("idle"));
+    }
+
+    #[test]
+    fn test_render_node_oriented_unchanged() {
+        let fields =
+            format_engine::parse_format("%#N %.6D %#P %.11T", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("batch", true)];
+        let nodes = vec![
+            make_node("n1", NodeState::NodeIdle, "batch"),
+            make_node("n2", NodeState::NodeDown, "batch"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
+        assert_eq!(
+            lines.len(),
+            2,
+            "node-oriented should emit one line per node"
+        );
+        assert!(lines[0].contains("n1"));
+        assert!(lines[0].contains("idle"));
+        assert!(lines[1].contains("n2"));
+        assert!(lines[1].contains("down"));
+    }
+}
