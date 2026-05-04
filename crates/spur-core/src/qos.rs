@@ -2,8 +2,8 @@
 //!
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
-use crate::accounting::{Qos, QosLimits, TresRecord, TresType};
-use crate::job::{Job, JobState, PendingReason};
+use crate::accounting::{Qos, TresRecord, TresType};
+use crate::job::{Job, PendingReason};
 
 /// Result of QOS limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,7 @@ pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounting::QosLimits;
     use crate::job::JobSpec;
 
     fn make_qos(max_jobs: Option<u32>, max_wall: Option<u32>) -> Qos {
