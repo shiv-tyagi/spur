@@ -47,7 +47,6 @@ impl BackfillScheduler {
         &self,
         job: &Job,
         nodes: &[Node],
-        partitions: &[spur_core::partition::Partition],
         reservations: &[Reservation],
     ) -> Vec<usize> {
         let partition_name = job.spec.partition.as_deref();
@@ -208,12 +207,7 @@ impl Scheduler for BackfillScheduler {
             }
             let all_have_nodes = indices.iter().all(|&idx| {
                 let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(
-                    job,
-                    cluster.nodes,
-                    cluster.partitions,
-                    cluster.reservations,
-                );
+                let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
                 suitable.len() >= job.spec.num_nodes as usize
             });
             if !all_have_nodes {
@@ -231,12 +225,7 @@ impl Scheduler for BackfillScheduler {
             if skip_indices.contains(&job_idx) {
                 continue;
             }
-            let suitable = self.find_suitable_nodes(
-                job,
-                cluster.nodes,
-                cluster.partitions,
-                cluster.reservations,
-            );
+            let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
             if suitable.is_empty() {
                 continue;
             }
