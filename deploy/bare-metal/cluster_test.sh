@@ -74,6 +74,23 @@ wait_job() {
     echo "(timeout after ${timeout}s)"
 }
 
+debug_fail() {
+    local name="$1" job_id="$2"
+    echo "    DEBUG ${name} (job ${job_id}):"
+    "${SPUR}/scontrol" show job "$job_id" 2>/dev/null \
+        | grep -E 'JobState|ExitCode|NodeList|Reason|Partition|Priority' \
+        | sed 's/^/      /' || true
+    echo "    CLUSTER STATE:"
+    echo "      Nodes:"
+    "${SPUR}/sinfo" 2>/dev/null | head -20 | sed 's/^/        /' || true
+    echo "      Queue:"
+    "${SPUR}/squeue" -t all 2>/dev/null | head -20 | sed 's/^/        /' || true
+    echo "      Controller logs (last 15 lines):"
+    journalctl -u spurctld --no-pager -n 15 2>/dev/null | sed 's/^/        /' || true
+    echo "      Agent logs (last 10 lines):"
+    journalctl -u spurd --no-pager -n 10 2>/dev/null | sed 's/^/        /' || true
+}
+
 job_state() {
     local job_id="$1"
     # squeue data: when whitespace-collapsed, fields are:
@@ -104,6 +121,17 @@ rm -f ~/spur-*.out ~/spur-*.err 2>/dev/null
 echo "============================================"
 echo "  Spur MI300X Cluster Integration Tests"
 echo "============================================"
+echo ""
+
+echo "--- Cluster Baseline ---"
+echo "  Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "  Controller: ${SPUR_CONTROLLER_ADDR:-http://localhost:6817}"
+echo "  Nodes:"
+"${SPUR}/sinfo" 2>/dev/null | sed 's/^/    /' || echo "    (sinfo failed)"
+echo "  Queue:"
+"${SPUR}/squeue" -t all 2>/dev/null | sed 's/^/    /' || echo "    (squeue failed)"
+echo "  Controller PID: $(pgrep -x spurctld 2>/dev/null || echo 'not found')"
+echo "  Agent PID: $(pgrep -x spurd 2>/dev/null || echo 'not found')"
 echo ""
 
 # --- Test 1: Cluster health ---
@@ -959,11 +987,9 @@ ctest_exit_code() {
     "${SPUR}/scontrol" show job "$1" 2>/dev/null | grep -oP 'ExitCode=\K[0-9-]+'
 }
 
-# Dump debug info for a failed job
+# Dump debug info for a failed container job (delegates to general helper)
 ctest_debug() {
-    local name="$1" job_id="$2"
-    echo "    DEBUG ${name}:"
-    "${SPUR}/scontrol" show job "$job_id" 2>/dev/null | grep -E 'JobState|ExitCode|NodeList|Reason' || true
+    debug_fail "$1" "$2"
 }
 
 if [ "$CTEST_READY" = "1" ]; then
