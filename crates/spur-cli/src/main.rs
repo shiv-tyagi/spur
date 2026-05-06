@@ -94,6 +94,9 @@ fn main() -> anyhow::Result<()> {
         "sattach" => return runtime.block_on(sattach::main()),
         "scrontab" => return runtime.block_on(scrontab::main()),
         "smd" => return runtime.block_on(smd::main()),
+        "net" => return runtime.block_on(net::main()),
+        "image" => return runtime.block_on(image::main()),
+        "exec" => return runtime.block_on(exec::main()),
         _ => {}
     }
 

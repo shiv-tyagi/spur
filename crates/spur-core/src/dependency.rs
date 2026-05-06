@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn test_afterok_satisfied() {
         let dep_job = make_job(100, JobState::Completed);
-        let mut job = Job::new(
+        let job = Job::new(
             1,
             JobSpec {
                 name: "test".into(),

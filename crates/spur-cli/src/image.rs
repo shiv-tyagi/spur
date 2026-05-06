@@ -200,7 +200,6 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
 /// The tar contains a manifest.json listing layer tarballs.
 fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
     use flate2::read::GzDecoder;
-    use std::io::Read;
 
     let dest = std::path::Path::new(rootfs);
     let mut archive = tar::Archive::new(tar_data);

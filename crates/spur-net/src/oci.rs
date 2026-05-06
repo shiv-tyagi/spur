@@ -258,7 +258,6 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     for (i, layer) in manifest.layers.iter().enumerate() {
         let digest = layer.digest.clone();
         let size = layer.size;
-        let media_type = layer.media_type.clone();
         let cache_path = cache_dir.join(digest.replace(':', "_"));
 
         // Check layer cache
@@ -442,7 +441,6 @@ fn load_docker_config_auth(registry: &str) -> Option<RegistryCredentials> {
     for key in keys_to_try {
         if let Some(entry) = auths.get(key) {
             if let Some(auth_b64) = entry.get("auth").and_then(|a| a.as_str()) {
-                use std::io::Read;
                 let decoded = base64_decode(auth_b64)?;
                 let (user, pass) = decoded.split_once(':')?;
                 return Some(RegistryCredentials {
