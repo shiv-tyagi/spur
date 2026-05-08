@@ -151,12 +151,27 @@ async fn report_account_utilization_by_user(
         }
     }
 
-    for account in &accounts {
-        let acct_cpu = usage.cpu_hours.get(&account.name).copied().unwrap_or(0.0);
-        let acct_gpu = usage.gpu_hours.get(&account.name).copied().unwrap_or(0.0);
-        let acct_jobs = usage.job_count.get(&account.name).copied().unwrap_or(0);
+    // Aggregate entries by account and (user, account)
+    let mut acct_agg: std::collections::HashMap<&str, (f64, f64, u64)> =
+        std::collections::HashMap::new();
+    let mut user_agg: std::collections::HashMap<(&str, &str), (f64, f64, u64)> =
+        std::collections::HashMap::new();
+    for e in &usage.entries {
+        let a = acct_agg.entry(&e.account).or_default();
+        a.0 += e.cpu_hours;
+        a.1 += e.gpu_hours;
+        a.2 += e.job_count;
+        let u = user_agg.entry((&e.user, &e.account)).or_default();
+        u.0 += e.cpu_hours;
+        u.1 += e.gpu_hours;
+        u.2 += e.job_count;
+    }
 
-        // Account summary row
+    for account in &accounts {
+        let &(acct_cpu, acct_gpu, acct_jobs) = acct_agg
+            .get(account.name.as_str())
+            .unwrap_or(&(0.0, 0.0, 0));
+
         println!(
             "{:<20}{}{:<15}{}{:>12.1}{}{:>12.1}{}{:>10}",
             account.name,
@@ -170,12 +185,11 @@ async fn report_account_utilization_by_user(
             acct_jobs
         );
 
-        // Per-user rows under this account
         let account_users: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
         for user in &account_users {
-            let user_cpu = usage.cpu_hours.get(&user.name).copied().unwrap_or(0.0);
-            let user_gpu = usage.gpu_hours.get(&user.name).copied().unwrap_or(0.0);
-            let user_jobs = usage.job_count.get(&user.name).copied().unwrap_or(0);
+            let &(user_cpu, user_gpu, user_jobs) = user_agg
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .unwrap_or(&(0.0, 0.0, 0));
 
             println!(
                 " {:<19}{}{:<15}{}{:>12.1}{}{:>12.1}{}{:>10}",
@@ -238,10 +252,19 @@ async fn report_user_utilization_by_account(
         }
     }
 
+    let mut user_agg: std::collections::HashMap<(&str, &str), (f64, f64, u64)> =
+        std::collections::HashMap::new();
+    for e in &usage.entries {
+        let u = user_agg.entry((&e.user, &e.account)).or_default();
+        u.0 += e.cpu_hours;
+        u.1 += e.gpu_hours;
+        u.2 += e.job_count;
+    }
+
     for user in &users {
-        let cpu = usage.cpu_hours.get(&user.name).copied().unwrap_or(0.0);
-        let gpu = usage.gpu_hours.get(&user.name).copied().unwrap_or(0.0);
-        let jobs = usage.job_count.get(&user.name).copied().unwrap_or(0);
+        let &(cpu, gpu, jobs) = user_agg
+            .get(&(user.name.as_str(), user.account.as_str()))
+            .unwrap_or(&(0.0, 0.0, 0));
 
         println!(
             "{:<15}{}{:<20}{}{:>12.1}{}{:>12.1}{}{:>10}",
@@ -273,8 +296,15 @@ async fn report_job_sizes_by_account(
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
 
-    let total_jobs: u64 = usage.job_count.values().sum();
-    let total_cpu: f64 = usage.cpu_hours.values().sum();
+    let mut acct_agg: std::collections::HashMap<&str, (f64, u64)> =
+        std::collections::HashMap::new();
+    for e in &usage.entries {
+        let a = acct_agg.entry(&e.account).or_default();
+        a.0 += e.cpu_hours;
+        a.1 += e.job_count;
+    }
+    let total_cpu: f64 = acct_agg.values().map(|v| v.0).sum();
+    let total_jobs: u64 = acct_agg.values().map(|v| v.1).sum();
 
     let delimiter = if args.parsable { "|" } else { "  " };
 
@@ -289,8 +319,7 @@ async fn report_job_sizes_by_account(
     }
 
     for account in &accounts {
-        let jobs = usage.job_count.get(&account.name).copied().unwrap_or(0);
-        let cpu = usage.cpu_hours.get(&account.name).copied().unwrap_or(0.0);
+        let &(cpu, jobs) = acct_agg.get(account.name.as_str()).unwrap_or(&(0.0, 0));
         let pct = if total_cpu > 0.0 {
             (cpu / total_cpu) * 100.0
         } else {
@@ -337,8 +366,15 @@ async fn report_job_sizes_by_user(
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
 
-    let total_jobs: u64 = usage.job_count.values().sum();
-    let total_cpu: f64 = usage.cpu_hours.values().sum();
+    let mut user_agg: std::collections::HashMap<(&str, &str), (f64, u64)> =
+        std::collections::HashMap::new();
+    for e in &usage.entries {
+        let u = user_agg.entry((&e.user, &e.account)).or_default();
+        u.0 += e.cpu_hours;
+        u.1 += e.job_count;
+    }
+    let total_cpu: f64 = user_agg.values().map(|v| v.0).sum();
+    let total_jobs: u64 = user_agg.values().map(|v| v.1).sum();
 
     let delimiter = if args.parsable { "|" } else { "  " };
 
@@ -361,8 +397,9 @@ async fn report_job_sizes_by_user(
     }
 
     for user in &users {
-        let jobs = usage.job_count.get(&user.name).copied().unwrap_or(0);
-        let cpu = usage.cpu_hours.get(&user.name).copied().unwrap_or(0.0);
+        let &(cpu, jobs) = user_agg
+            .get(&(user.name.as_str(), user.account.as_str()))
+            .unwrap_or(&(0.0, 0));
         let pct = if total_cpu > 0.0 {
             (cpu / total_cpu) * 100.0
         } else {

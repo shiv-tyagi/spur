@@ -10,7 +10,7 @@ use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::GetFairshareFactorsRequest;
 
 pub struct FairshareCache {
-    factors: RwLock<HashMap<String, f64>>,
+    factors: RwLock<HashMap<(String, String), f64>>,
 }
 
 impl FairshareCache {
@@ -21,7 +21,7 @@ impl FairshareCache {
     }
 
     pub fn get(&self, user: &str, account: &str) -> f64 {
-        let key = format!("{}:{}", user, account);
+        let key = (user.to_owned(), account.to_owned());
         match self.factors.read().get(&key) {
             Some(&factor) => factor,
             None => {
@@ -34,7 +34,7 @@ impl FairshareCache {
         }
     }
 
-    fn replace(&self, new_factors: HashMap<String, f64>) {
+    fn replace(&self, new_factors: HashMap<(String, String), f64>) {
         *self.factors.write() = new_factors;
     }
 
@@ -54,7 +54,6 @@ impl FairshareCache {
                 format!("http://{}", host)
             };
 
-            // Eager first fetch so the cache is populated before the scheduler runs
             match tokio::time::timeout(Duration::from_secs(5), Self::fetch(&uri, halflife_days))
                 .await
             {
@@ -85,11 +84,20 @@ impl FairshareCache {
         });
     }
 
-    async fn fetch(uri: &str, halflife_days: u32) -> anyhow::Result<HashMap<String, f64>> {
+    async fn fetch(
+        uri: &str,
+        halflife_days: u32,
+    ) -> anyhow::Result<HashMap<(String, String), f64>> {
         let mut client: SlurmAccountingClient<Channel> =
             SlurmAccountingClient::connect(uri.to_owned()).await?;
         let req = GetFairshareFactorsRequest { halflife_days };
         let resp = client.get_fairshare_factors(req).await?;
-        Ok(resp.into_inner().factors)
+        let factors = resp
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(|e| ((e.user, e.account), e.factor))
+            .collect();
+        Ok(factors)
     }
 }

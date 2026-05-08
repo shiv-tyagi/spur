@@ -78,17 +78,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         total_shares
     };
 
-    // The server returns keys in "user:account" format. Pre-aggregate by account
-    // and by (user, account) for lookups below.
+    // Aggregate usage entries by account and by (user, account)
     let mut account_cpu_hours: std::collections::HashMap<&str, f64> =
         std::collections::HashMap::new();
     let mut user_account_cpu_hours: std::collections::HashMap<(&str, &str), f64> =
         std::collections::HashMap::new();
-    for (key, &hours) in &usage.cpu_hours {
-        if let Some((user, account)) = key.split_once(':') {
-            *account_cpu_hours.entry(account).or_default() += hours;
-            *user_account_cpu_hours.entry((user, account)).or_default() += hours;
-        }
+    for entry in &usage.entries {
+        *account_cpu_hours.entry(&entry.account).or_default() += entry.cpu_hours;
+        *user_account_cpu_hours
+            .entry((&entry.user, &entry.account))
+            .or_default() += entry.cpu_hours;
     }
 
     // Compute total usage for normalization

@@ -207,22 +207,18 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut cpu_hours = std::collections::HashMap::new();
-        let mut gpu_hours = std::collections::HashMap::new();
-        let mut job_count = std::collections::HashMap::new();
+        let entries = records
+            .iter()
+            .map(|r| UsageEntry {
+                user: r.user_name.clone(),
+                account: r.account.clone(),
+                cpu_hours: r.cpu_seconds as f64 / 3600.0,
+                gpu_hours: r.gpu_seconds as f64 / 3600.0,
+                job_count: r.job_count,
+            })
+            .collect();
 
-        for r in &records {
-            let key = format!("{}:{}", r.user_name, r.account);
-            *cpu_hours.entry(key.clone()).or_insert(0.0) += r.cpu_seconds as f64 / 3600.0;
-            *gpu_hours.entry(key.clone()).or_insert(0.0) += r.gpu_seconds as f64 / 3600.0;
-            *job_count.entry(key).or_insert(0u64) += r.job_count;
-        }
-
-        Ok(Response::new(GetUsageResponse {
-            cpu_hours,
-            gpu_hours,
-            job_count,
-        }))
+        Ok(Response::new(GetUsageResponse { entries }))
     }
 
     // ============================================================
@@ -452,12 +448,16 @@ impl SlurmAccounting for AccountingService {
         let raw_factors =
             fairshare::compute_fairshare(&usage, &account_weights, halflife_days, now);
 
-        let factors = raw_factors
+        let entries = raw_factors
             .into_iter()
-            .map(|((user, account), factor)| (format!("{}:{}", user, account), factor))
+            .map(|((user, account), factor)| FairshareEntry {
+                user,
+                account,
+                factor,
+            })
             .collect();
 
-        Ok(Response::new(GetFairshareFactorsResponse { factors }))
+        Ok(Response::new(GetFairshareFactorsResponse { entries }))
     }
 }
 
