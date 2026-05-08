@@ -73,7 +73,7 @@ jobs:
             ${{ runner.os }}-cargo-clippy-
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude spur-ffi --all-targets -- -W clippy::all
+        run: cargo clippy --workspace --exclude spur-ffi --all-targets -- -W clippy::all -D unused
 
   cluster:
     name: Cluster Tests (2x MI300X)
