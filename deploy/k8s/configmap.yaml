@@ -22,8 +22,7 @@ data:
     plugin = "backfill"
 
     [accounting]
-    enabled = true
-    address = "spurdbd.spur.svc.cluster.local:6819"
+    host = "spurdbd.spur.svc.cluster.local:6819"
 
     [[partitions]]
     name = "default"
