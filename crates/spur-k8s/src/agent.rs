@@ -415,6 +415,13 @@ impl SlurmAgent for VirtualAgent {
                     error: String::new(),
                 }))
             }
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                info!(job_id, pod = %pod_name, namespace = %ns, target = %req.target_node, "K8s Pod already exists, treating as success");
+                Ok(Response::new(LaunchJobResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
             Err(e) => {
                 error!(job_id, error = %e, "failed to create K8s Pod");
                 Ok(Response::new(LaunchJobResponse {
