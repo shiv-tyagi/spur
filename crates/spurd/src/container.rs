@@ -1147,7 +1147,7 @@ pub fn container_init(
             .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")?;
     } else {
         setup_user_namespace(config.uid, config.gid)
-            .context("user namespace required for rootless containers — check that unprivileged user namespaces are enabled (sysctl kernel.unprivileged_userns_clone=1)")?;
+            .context("rootless container setup failed while setting up user namespace")?;
     }
 
     set_mount_propagation_private()?;

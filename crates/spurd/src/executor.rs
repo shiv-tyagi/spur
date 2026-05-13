@@ -717,7 +717,7 @@ async fn launch_container_job(
             let hook_env = match crate::container::container_init(config, &rootfs) {
                 Ok(env) => env,
                 Err(e) => {
-                    let msg = format!("E:{}", e);
+                    let msg = format!("E:{:#}", e);
                     unsafe {
                         libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
                     }
