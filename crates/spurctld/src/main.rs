@@ -237,5 +237,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         licenses: std::collections::HashMap::new(),
         update: Default::default(),
         metrics: Default::default(),
+        hooks: Default::default(),
     }
 }

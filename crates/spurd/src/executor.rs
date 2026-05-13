@@ -17,6 +17,27 @@ use tracing::{debug, info, warn};
 use spur_core::job::JobId;
 use spur_spank::SpankHost;
 
+/// Typed launch errors so callers can distinguish prolog failure from other failures.
+pub enum LaunchError {
+    PrologFailed(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrologFailed(e) => write!(f, "prolog failed: {e}"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for LaunchError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
 use crate::container::ContainerConfig;
 
 /// Cgroup root for slurmd-managed jobs.
@@ -46,6 +67,9 @@ pub struct JobLaunchConfig {
     pub uid: u32,
     pub gid: u32,
     pub container: Option<ContainerLaunchConfig>,
+    pub prolog_script: Option<String>,
+    pub partition: String,
+    pub nodelist: String,
 }
 
 /// A running job process — either a tokio-managed child or a raw-forked container.
@@ -153,6 +177,34 @@ impl RunningJob {
 pub async fn launch_job(
     cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
+) -> Result<RunningJob, LaunchError> {
+    // Run prolog before anything else
+    if let Some(ref prolog) = cfg.prolog_script {
+        let ctx = spur_core::hooks::HookContext {
+            job_id: cfg.job_id,
+            work_dir: cfg.work_dir.clone(),
+            uid: cfg.uid,
+            gid: cfg.gid,
+            partition: cfg.partition.clone(),
+            nodelist: cfg.nodelist.clone(),
+            script_context: "prolog_slurmd".into(),
+            gpu_devices: cfg.gpu_devices.clone(),
+            cpus: cfg.cpus,
+            memory_mb: cfg.memory_mb,
+        };
+        spur_core::hooks::run_hook(prolog, &ctx)
+            .await
+            .map_err(LaunchError::PrologFailed)?;
+    }
+
+    spawn_job_process(cfg, spank)
+        .await
+        .map_err(LaunchError::Other)
+}
+
+async fn spawn_job_process(
+    cfg: &JobLaunchConfig,
+    spank: Option<&SpankHost>,
 ) -> anyhow::Result<RunningJob> {
     let JobLaunchConfig {
         job_id,
@@ -169,15 +221,9 @@ pub async fn launch_job(
         uid,
         gid,
         ref container,
+        ..
     } = *cfg;
     info!(job_id, work_dir, "launching job");
-
-    // Run prolog if configured
-    if let Ok(prolog) = std::env::var("SPUR_PROLOG") {
-        if !prolog.is_empty() {
-            run_hook(&prolog, job_id, work_dir, "prolog").await?;
-        }
-    }
 
     // Invoke SPANK Init hook (after prolog, before process spawn)
     if let Some(spank) = spank {
@@ -591,36 +637,6 @@ fn get_child_pids(pid: i32) -> Vec<i32> {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect()
-}
-
-/// Run a prolog/epilog hook script.
-async fn run_hook(
-    script_path: &str,
-    job_id: JobId,
-    work_dir: &str,
-    hook_name: &str,
-) -> anyhow::Result<()> {
-    info!(
-        job_id,
-        hook = hook_name,
-        script = script_path,
-        "running hook"
-    );
-
-    let status = Command::new(script_path)
-        .env("SPUR_JOB_ID", job_id.to_string())
-        .env("SPUR_JOB_WORK_DIR", work_dir)
-        .current_dir(work_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .with_context(|| format!("{} script failed to execute", hook_name))?;
-
-    if !status.success() {
-        anyhow::bail!("{} script exited with {}", hook_name, status);
-    }
-    Ok(())
 }
 
 /// Resolve output path patterns (%j → job_id, etc.)

@@ -593,6 +593,9 @@ message ReportJobStatusRequest {
   JobState state = 2;
   int32 exit_code = 3;
   string message = 4;  // Pod status message or error
+  bool drain_node = 5;     // Agent requests its node be drained (e.g. prolog/epilog failure)
+  string drain_reason = 6; // Reason for drain request
+  string reporting_node = 7; // Hostname of the reporting agent (for drain targeting)
 }
 
 // ============================================================

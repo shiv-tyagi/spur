@@ -83,6 +83,10 @@ pub struct SlurmConfig {
     /// OpenMetrics HTTP export (spurctld, default port 6822).
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Prolog/epilog hook scripts.
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -210,6 +214,31 @@ impl MetricsConfig {
             MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
         })
     }
+}
+
+/// Prolog and epilog hook script configuration.
+///
+/// All fields are optional — `None` means no hook is configured for that point.
+/// Paths must be fully qualified; no search path is set for security reasons.
+/// Hook lifecycle and failure semantics match Slurm.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    /// Script run on compute nodes before job launch (Slurm `Prolog`).
+    pub prolog: Option<String>,
+    /// Script run on compute nodes at job termination (Slurm `Epilog`).
+    pub epilog: Option<String>,
+    /// Script run on the controller at job allocation (Slurm `PrologSlurmctld`).
+    pub prolog_slurmctld: Option<String>,
+    /// Script run on the controller at job termination (Slurm `EpilogSlurmctld`).
+    pub epilog_slurmctld: Option<String>,
+    /// Script run on compute nodes before each job step (Slurm `TaskProlog`).
+    pub task_prolog: Option<String>,
+    /// Script run on compute nodes after each job step (Slurm `TaskEpilog`).
+    pub task_epilog: Option<String>,
+    /// Script run on the srun invocation node before step dispatch (Slurm `SrunProlog`).
+    pub srun_prolog: Option<String>,
+    /// Script run on the srun invocation node after step completion (Slurm `SrunEpilog`).
+    pub srun_epilog: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

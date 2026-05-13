@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -113,6 +114,14 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_remap_root: bool,
 
+    /// Prolog script to run locally before step dispatch
+    #[arg(long)]
+    pub prolog: Option<String>,
+
+    /// Epilog script to run locally after step completion
+    #[arg(long)]
+    pub epilog: Option<String>,
+
     /// Controller address
     #[arg(
         long,
@@ -138,18 +147,36 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Resolve hooks: CLI flags override config file
+    let mut hooks = load_hooks_config();
+    if let Some(ref prolog) = args.prolog {
+        hooks.srun_prolog = Some(prolog.clone());
+    }
+    if let Some(ref epilog) = args.epilog {
+        hooks.srun_epilog = Some(epilog.clone());
+    }
+
+    let work_dir = args
+        .chdir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
+
+    // SrunProlog: run locally before dispatching
+    if let Some(ref srun_prolog) = hooks.srun_prolog {
+        let ctx = srun_hook_context("prolog_srun", &work_dir);
+        spur_core::hooks::run_hook(srun_prolog, &ctx)
+            .await
+            .context("SrunProlog failed — step not dispatched")?;
+    }
+
     // Step mode: if running inside an allocation, create a step instead of a new job
     if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
         if let Ok(job_id) = parent_job_id.parse::<u32>() {
-            return run_as_step(&args, job_id).await;
+            return run_as_step(&args, job_id, &hooks, &work_dir).await;
         }
     }
 
     let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
-
-    let work_dir = args
-        .chdir
-        .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
 
     // Build a wrapper script from the command
     let cmd_line = args.command.join(" ");
@@ -289,7 +316,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                         | JobState::JobTimeout
                         | JobState::JobNodeFail),
                     ) => {
-                        handle_terminal_state(state, job_id, job.exit_code, &work_dir).await;
+                        handle_terminal_state(
+                            state,
+                            job_id,
+                            job.exit_code,
+                            &work_dir,
+                            &hooks,
+                            false,
+                        )
+                        .await;
                     }
                     Ok(_) => {}
                     Err(_) if !warned_unknown_state => {
@@ -309,30 +344,25 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    // Try streaming output from the agent
-    let streamed = try_stream_output(&mut client, &nodelist, job_id).await;
-
-    if !streamed {
-        // Fallback: poll for completion and read output file
-        poll_for_completion(&mut client, job_id, &work_dir).await;
-    }
+    // Stream output if possible (best-effort), then poll for terminal state.
+    let output_streamed = try_stream_output(&mut client, &nodelist, job_id).await;
+    poll_for_completion(&mut client, job_id, &work_dir, &hooks, output_streamed).await;
 
     Ok(())
 }
 
-/// Try to stream live output from the agent. Returns true if streaming succeeded.
+/// Try to stream live output from the agent.
+/// Returns true if streaming connected and delivered output.
 async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
     job_id: u32,
 ) -> bool {
-    // Get the first node's agent address
     let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
     if first_node.is_empty() {
         return false;
     }
 
-    // Verify the node exists, then try connecting to the agent on the standard port.
     if controller
         .get_node(GetNodeRequest {
             name: first_node.to_string(),
@@ -350,77 +380,30 @@ async fn try_stream_output(
         Err(_) => return false,
     };
 
-    let stream_result = agent
+    let mut stream = match agent
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
         })
-        .await;
-
-    let mut stream = match stream_result {
+        .await
+    {
         Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            if e.code() == tonic::Code::Unimplemented {
-                // Old agent without streaming support
-                return false;
-            }
-            return false;
-        }
+        Err(_) => return false,
     };
 
-    // Stream chunks to stdout
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     loop {
         match stream.message().await {
             Ok(Some(chunk)) => {
                 if chunk.eof {
-                    break;
+                    return true;
                 }
                 let _ = handle.write_all(&chunk.data);
                 let _ = handle.flush();
             }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    drop(handle);
-
-    // Wait for terminal state and get exit code
-    let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    let mut warned_unknown_state = false;
-    loop {
-        poll_interval.tick().await;
-        match controller.get_job(GetJobRequest { job_id }).await {
-            Ok(resp) => {
-                let job = resp.into_inner();
-                match JobState::try_from(job.state) {
-                    Ok(JobState::JobCompleted) => {
-                        std::process::exit(job.exit_code);
-                    }
-                    Ok(
-                        JobState::JobFailed
-                        | JobState::JobCancelled
-                        | JobState::JobTimeout
-                        | JobState::JobNodeFail,
-                    ) => {
-                        std::process::exit(job.exit_code.max(1));
-                    }
-                    Ok(_) => {}
-                    Err(_) if !warned_unknown_state => {
-                        warned_unknown_state = true;
-                        eprintln!(
-                            "srun: warning: job {} has unrecognized state {} \
-                             (controller may be newer than client)",
-                            job_id, job.state
-                        );
-                    }
-                    Err(_) => {}
-                }
-            }
-            Err(e) => {
-                eprintln!("srun: warning: failed to get job status: {}", e.message());
-            }
+            Ok(None) => return true,
+            Err(_) => return false,
         }
     }
 }
@@ -430,6 +413,8 @@ async fn poll_for_completion(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
     job_id: u32,
     work_dir: &str,
+    hooks: &HooksConfig,
+    output_streamed: bool,
 ) {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut warned_unknown_state = false;
@@ -446,7 +431,15 @@ async fn poll_for_completion(
                         | JobState::JobTimeout
                         | JobState::JobNodeFail),
                     ) => {
-                        handle_terminal_state(state, job_id, job.exit_code, work_dir).await;
+                        handle_terminal_state(
+                            state,
+                            job_id,
+                            job.exit_code,
+                            work_dir,
+                            hooks,
+                            output_streamed,
+                        )
+                        .await;
                     }
                     Ok(_) => {}
                     Err(_) if !warned_unknown_state => {
@@ -467,14 +460,33 @@ async fn poll_for_completion(
     }
 }
 
-async fn handle_terminal_state(state: JobState, job_id: u32, exit_code: i32, work_dir: &str) -> ! {
+async fn handle_terminal_state(
+    state: JobState,
+    job_id: u32,
+    exit_code: i32,
+    work_dir: &str,
+    hooks: &HooksConfig,
+    output_streamed: bool,
+) -> ! {
+    // SrunEpilog: run locally after job reaches terminal state
+    if let Some(ref srun_epilog) = hooks.srun_epilog {
+        let ctx = srun_hook_context("epilog_srun", work_dir);
+        if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
+            eprintln!("srun: warning: SrunEpilog failed: {}", e);
+        }
+    }
+
     match state {
         JobState::JobCompleted => {
-            print_job_output(work_dir, job_id).await;
+            if !output_streamed {
+                print_job_output(work_dir, job_id).await;
+            }
             std::process::exit(exit_code);
         }
         JobState::JobFailed => {
-            print_job_output(work_dir, job_id).await;
+            if !output_streamed {
+                print_job_output(work_dir, job_id).await;
+            }
             eprintln!("srun: job {} failed with exit code {}", job_id, exit_code);
             std::process::exit(exit_code.max(1));
         }
@@ -514,7 +526,12 @@ async fn print_job_output(work_dir: &str, job_id: u32) {
 /// Closes #146 — previously this ran the command locally, so `srun hostname`
 /// inside `salloc` printed the controller's hostname instead of the
 /// allocated compute node's.
-async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
+async fn run_as_step(
+    args: &SrunArgs,
+    job_id: u32,
+    hooks: &HooksConfig,
+    work_dir: &str,
+) -> Result<()> {
     use spur_proto::proto::RunStepRequest;
 
     let mut client = SlurmControllerClient::connect(args.controller.clone())
@@ -533,13 +550,6 @@ async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
         .await
         .context("failed to create job step")?;
 
-    let work_dir = args.chdir.as_deref().map(String::from).unwrap_or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
-
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
 
     let resp = client
@@ -548,7 +558,7 @@ async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
             command: args.command.clone(),
             uid: nix::unistd::geteuid().as_raw(),
             gid: nix::unistd::getegid().as_raw(),
-            work_dir,
+            work_dir: work_dir.to_string(),
             environment: env,
         })
         .await
@@ -564,6 +574,15 @@ async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
     if !resp.stderr.is_empty() {
         eprint!("{}", resp.stderr);
     }
+
+    // SrunEpilog: run locally after step completes (failure logged only)
+    if let Some(ref srun_epilog) = hooks.srun_epilog {
+        let ctx = srun_hook_context("epilog_srun", work_dir);
+        if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
+            eprintln!("srun: warning: SrunEpilog failed: {}", e);
+        }
+    }
+
     std::process::exit(resp.exit_code);
 }
 
@@ -576,5 +595,32 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
         Ok(mb.parse().context("invalid memory value")?)
     } else {
         Ok(s.parse().context("invalid memory value")?)
+    }
+}
+
+fn load_hooks_config() -> HooksConfig {
+    let path_str = std::env::var("SPUR_CONF").unwrap_or_else(|_| "/etc/spur/spur.conf".to_string());
+    let path = std::path::Path::new(&path_str);
+    match spur_core::config::SlurmConfig::load_from_file(path) {
+        Ok(config) => config.hooks,
+        Err(_) => HooksConfig::default(),
+    }
+}
+
+fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::HookContext {
+    spur_core::hooks::HookContext {
+        job_id: std::env::var("SPUR_JOB_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        work_dir: work_dir.to_string(),
+        uid: nix::unistd::getuid().as_raw(),
+        gid: nix::unistd::getgid().as_raw(),
+        partition: String::new(),
+        nodelist: String::new(),
+        script_context: script_context.into(),
+        gpu_devices: Vec::new(),
+        cpus: 1,
+        memory_mb: 0,
     }
 }

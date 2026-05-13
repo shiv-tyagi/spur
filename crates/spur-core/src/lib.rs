@@ -6,6 +6,7 @@ pub mod array;
 pub mod auth;
 pub mod config;
 pub mod dependency;
+pub mod hooks;
 pub mod hostlist;
 pub mod job;
 pub mod node;

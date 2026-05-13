@@ -96,8 +96,6 @@ crates/
 |----------|---------|-------------|
 | `SPUR_CONTROLLER_ADDR` | CLI, spurd, spurrestd | Controller gRPC address (default: `http://localhost:6817`) |
 | `SPUR_WG_INTERFACE` | spurd | WireGuard interface name for address detection (default: `spur0`) |
-| `SPUR_PROLOG` | spurd | Script to run before each job |
-| `SPUR_EPILOG` | spurd | Script to run after each job |
 
 ## Do Not
 

@@ -20,6 +20,8 @@ use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankHook, SpankHost};
 
+use spur_core::config::HooksConfig;
+
 use crate::executor;
 use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
@@ -31,6 +33,14 @@ struct TrackedJob {
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
+    work_dir: String,
+    uid: u32,
+    gid: u32,
+    partition: String,
+    gpu_devices: Vec<u32>,
+    cpus: u32,
+    memory_mb: u64,
+    nodelist: String,
 }
 
 struct CompletedJob {
@@ -39,6 +49,14 @@ struct CompletedJob {
     rootfs_mode: crate::container::RootfsMode,
     allocation: Option<AllocationResult>,
     cgroup: Option<std::path::PathBuf>,
+    work_dir: String,
+    uid: u32,
+    gid: u32,
+    partition: String,
+    gpu_devices: Vec<u32>,
+    cpus: u32,
+    memory_mb: u64,
+    nodelist: String,
 }
 
 pub struct AgentService {
@@ -47,10 +65,11 @@ pub struct AgentService {
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
     pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
+    hooks: Arc<HooksConfig>,
 }
 
 impl AgentService {
-    pub fn new(reporter: Arc<NodeReporter>) -> Self {
+    pub fn new(reporter: Arc<NodeReporter>, hooks: HooksConfig) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
@@ -108,6 +127,7 @@ impl AgentService {
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
+            hooks: Arc::new(hooks),
         }
     }
 
@@ -117,6 +137,7 @@ impl AgentService {
         let allocation = self.allocation.clone();
         let spank = self.spank.clone();
         let pmi_servers = self.pmi_servers.clone();
+        let hooks = self.hooks.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -134,6 +155,14 @@ impl AgentService {
                                 rootfs_mode: tracked.rootfs_mode.clone(),
                                 allocation: tracked.allocation.take(),
                                 cgroup: tracked.job.take_cgroup(),
+                                work_dir: tracked.work_dir.clone(),
+                                uid: tracked.uid,
+                                gid: tracked.gid,
+                                partition: tracked.partition.clone(),
+                                gpu_devices: tracked.gpu_devices.clone(),
+                                cpus: tracked.cpus,
+                                memory_mb: tracked.memory_mb,
+                                nodelist: tracked.nodelist.clone(),
                             });
                         }
                         Ok(None) => {}
@@ -149,11 +178,9 @@ impl AgentService {
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
-                    // Release GPU/CPU allocation
                     if let Some(ref alloc) = c.allocation {
                         allocation.lock().await.release(alloc);
                     }
-                    // Cleanup PMI server if one was started for this job
                     if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
                         pmi.cleanup();
                     }
@@ -163,6 +190,39 @@ impl AgentService {
                 // report_completion blocks new job launches and can lose
                 // completions if the RPC times out.
                 drop(jobs);
+
+                let local_hostname = hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "localhost".into());
+
+                let mut drain_jobs: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                // Run epilog hook for completed jobs
+                if let Some(ref epilog_script) = hooks.epilog {
+                    for c in &completed {
+                        let ctx = spur_core::hooks::HookContext {
+                            job_id: c.job_id,
+                            work_dir: c.work_dir.clone(),
+                            uid: c.uid,
+                            gid: c.gid,
+                            partition: c.partition.clone(),
+                            nodelist: c.nodelist.clone(),
+                            script_context: "epilog_slurmd".into(),
+                            gpu_devices: c.gpu_devices.clone(),
+                            cpus: c.cpus,
+                            memory_mb: c.memory_mb,
+                        };
+                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+                            error!(
+                                job_id = c.job_id,
+                                error = %e,
+                                "epilog hook failed — requesting node drain"
+                            );
+                            drain_jobs.insert(c.job_id);
+                        }
+                    }
+                }
 
                 // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
                 if let Some(ref spank_host) = *spank {
@@ -177,14 +237,33 @@ impl AgentService {
                 }
 
                 for c in &completed {
-                    report_completion(&controller_addr, c.job_id, c.exit_code).await;
+                    let drain = if drain_jobs.contains(&c.job_id) {
+                        Some(DrainRequest {
+                            reason: "epilog script failed".into(),
+                            node_name: local_hostname.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    report_completion(&controller_addr, c.job_id, c.exit_code, drain.as_ref())
+                        .await;
                 }
             }
         });
     }
 }
 
-async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
+struct DrainRequest {
+    reason: String,
+    node_name: String,
+}
+
+async fn report_completion(
+    controller_addr: &str,
+    job_id: u32,
+    exit_code: i32,
+    drain: Option<&DrainRequest>,
+) {
     use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
     let state = if exit_code == 0 {
@@ -209,6 +288,12 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
                     state,
                     exit_code,
                     message: format!("exit_code={}", exit_code),
+                    drain_node: drain.is_some(),
+                    drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
+                    reporting_node: drain
+                        .as_ref()
+                        .map(|d| d.node_name.clone())
+                        .unwrap_or_default(),
                 };
                 match client.report_job_status(req).await {
                     Ok(_) => {
@@ -618,6 +703,9 @@ impl SlurmAgent for AgentService {
             uid: spec.uid,
             gid: spec.gid,
             container: container_launch,
+            prolog_script: self.hooks.prolog.clone(),
+            partition: spec.partition.clone(),
+            nodelist: spec.nodelist.clone(),
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
@@ -633,6 +721,14 @@ impl SlurmAgent for AgentService {
                         stdout_path: launch_cfg.stdout_path,
                         stderr_path: launch_cfg.stderr_path,
                         has_pid_namespace: nix::unistd::geteuid().is_root(),
+                        work_dir: launch_cfg.work_dir,
+                        uid: launch_cfg.uid,
+                        gid: launch_cfg.gid,
+                        partition: launch_cfg.partition,
+                        gpu_devices: launch_cfg.gpu_devices,
+                        cpus: launch_cfg.cpus,
+                        memory_mb: launch_cfg.memory_mb,
+                        nodelist: launch_cfg.nodelist,
                     },
                 );
                 Ok(Response::new(LaunchJobResponse {
@@ -645,10 +741,27 @@ impl SlurmAgent for AgentService {
                 if let Some(ref alloc) = alloc_result {
                     self.allocation.lock().await.release(alloc);
                 }
-                error!(job_id, error = %e, "failed to launch job");
+
+                let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
+                let err_msg = e.to_string();
+                error!(job_id, error = %err_msg, "failed to launch job");
+
+                if is_prolog_failure {
+                    let controller = self.reporter.controller_addr.clone();
+                    let node_name = self.reporter.hostname.clone();
+                    let drain_reason = format!("prolog failed: {}", err_msg);
+                    tokio::spawn(async move {
+                        let drain = DrainRequest {
+                            reason: drain_reason,
+                            node_name,
+                        };
+                        report_completion(&controller, job_id, -1, Some(&drain)).await;
+                    });
+                }
+
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
-                    error: e.to_string(),
+                    error: err_msg,
                 }))
             }
         }
@@ -782,10 +895,62 @@ impl SlurmAgent for AgentService {
             "RunCommand: executing one-shot step"
         );
 
+        // TaskProlog: run before the step command
+        if let Some(ref task_prolog) = self.hooks.task_prolog {
+            let job_id = req
+                .environment
+                .get("SPUR_JOB_ID")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: String::new(),
+                nodelist: hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "localhost".into()),
+                script_context: "prolog_task".into(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
+                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
+            }
+        }
+
         let output = cmd
             .output()
             .await
             .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
+
+        // TaskEpilog: run after the step command (failure logged, not fatal)
+        if let Some(ref task_epilog) = self.hooks.task_epilog {
+            let job_id = req
+                .environment
+                .get("SPUR_JOB_ID")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: String::new(),
+                nodelist: hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "localhost".into()),
+                script_context: "epilog_task".into(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(task_epilog, &ctx).await {
+                warn!(error = %e, "TaskEpilog failed");
+            }
+        }
 
         Ok(Response::new(RunCommandResponse {
             exit_code: output.status.code().unwrap_or(-1),
@@ -1147,6 +1312,14 @@ impl TrackedJob {
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
         }
     }
 }
@@ -1184,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_in_job_returns_without_deadlock() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let pid = std::process::id();
         svc.insert_test_job(42, TrackedJob::dummy(pid)).await;
 
@@ -1199,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_in_job_not_found() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
 
         let req = Request::new(ExecInJobRequest {
             job_id: 999,
@@ -1224,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_executes_simple_command() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hello-from-agent".into()],
             uid: 0,
@@ -1240,7 +1413,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_propagates_nonzero_exit_code() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let req = Request::new(RunCommandRequest {
             command: vec!["false".into()],
             uid: 0,
@@ -1254,7 +1427,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_passes_environment() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let mut env = HashMap::new();
         env.insert("SPUR_TEST_VAR".into(), "step-dispatched".into());
         let req = Request::new(RunCommandRequest {
@@ -1271,7 +1444,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_empty_command_is_rejected() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let req = Request::new(RunCommandRequest {
             command: vec![],
             uid: 0,
@@ -1290,7 +1463,7 @@ mod tests {
         // assert it's a specific directory without mounting a tempdir as
         // the agent's cwd. Instead use `pwd` and assert it matches the
         // dir we passed.
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         let tmp = std::env::temp_dir();
         // Resolve symlinks (e.g., macOS /tmp -> /private/tmp).
         let tmp_canonical = std::fs::canonicalize(&tmp).unwrap_or(tmp.clone());
@@ -1321,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_cancel_sigterm_responsive() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 900;
@@ -1337,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_cancel_escalates_to_sigkill() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 901;
@@ -1358,6 +1531,14 @@ mod tests {
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
         };
         svc.insert_test_job(job_id, tracked).await;
 
@@ -1372,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_explicit_signal_kills_job() {
-        let svc = AgentService::new(test_reporter());
+        let svc = AgentService::new(test_reporter(), HooksConfig::default());
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 902;

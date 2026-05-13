@@ -1799,6 +1799,7 @@ mod tests {
             licenses: HashMap::new(),
             update: Default::default(),
             metrics: Default::default(),
+            hooks: Default::default(),
         }
     }
 
