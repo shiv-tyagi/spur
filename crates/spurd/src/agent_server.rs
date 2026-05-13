@@ -658,37 +658,11 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
-        let signal = req.signal;
 
-        {
-            let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
-                return Ok(Response::new(()));
-            };
-
-            let sig = if signal > 0 {
-                info!(job_id, signal, "sending signal to job");
-                nix::sys::signal::Signal::try_from(signal)
-                    .unwrap_or(nix::sys::signal::Signal::SIGTERM)
-            } else {
-                info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
-                nix::sys::signal::Signal::SIGTERM
-            };
-
-            let _ = tracked.job.kill_signal(sig);
-        }
-
-        if signal == 0 {
-            let running = self.running.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                let mut jobs = running.lock().await;
-                if let Some(tracked) = jobs.get(&job_id) {
-                    info!(job_id, "grace period expired, sending SIGKILL");
-                    let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                    jobs.remove(&job_id);
-                }
-            });
+        if req.signal > 0 {
+            self.send_explicit_signal(job_id, req.signal).await;
+        } else {
+            self.graceful_cancel(job_id).await;
         }
 
         Ok(Response::new(()))
@@ -1107,6 +1081,41 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Send a user-specified signal to a running job.
+    async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id) else {
+            return;
+        };
+        let sig =
+            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+        info!(job_id, signal, "sending explicit signal to job");
+        let _ = tracked.job.kill_signal(sig);
+    }
+
+    /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
+    async fn graceful_cancel(&self, job_id: u32) {
+        {
+            let jobs = self.running.lock().await;
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+            let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
+        }
+
+        let running = self.running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let jobs = running.lock().await;
+            if let Some(tracked) = jobs.get(&job_id) {
+                info!(job_id, "grace period expired, sending SIGKILL");
+                let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                // Job stays in `running` and monitor loop reaps it and does full cleanup.
+            }
+        });
+    }
+
     /// Read environment variables from a running process via /proc.
     fn read_proc_env(pid: u32) -> Vec<(String, String)> {
         let path = format!("/proc/{}/environ", pid);
