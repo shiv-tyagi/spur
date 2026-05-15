@@ -18,16 +18,17 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 static SUITE: OnceCell<SuiteContext> = OnceCell::const_new();
 
-/// Get (or create) the suite-wide K8s context (namespace + CRD + RBAC).
+/// Get (or create) the suite-wide K8s context (namespace + CRD).
 /// The namespace is created on first call and persists after the test
-/// process exits. CI workflows provision and tear down namespaces
-/// externally; local runs are cleaned up manually when needed.
+/// process exits. RBAC is applied by the CI workflow before tests run.
+/// CI workflows provision and tear down namespaces externally; local
+/// runs are cleaned up manually when needed.
 pub async fn suite_context() -> &'static SuiteContext {
     SUITE
         .get_or_init(|| async {
             SuiteContext::setup()
                 .await
-                .expect("failed to set up K8s test suite (namespace + CRD + RBAC)")
+                .expect("failed to set up K8s test suite (namespace + CRD)")
         })
         .await
 }
