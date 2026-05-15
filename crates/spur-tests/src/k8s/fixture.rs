@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, ServiceAccount};
-use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::Client;
 use kube::CustomResourceExt;
@@ -13,7 +12,12 @@ use tracing::info;
 
 const APPLY_MANAGER: &str = "spur-k8s-tests";
 
+/// `SPUR_DEPLOY_DIR` overrides where K8s manifests are read from.
+/// Falls back to `deploy/k8s/` relative to the workspace root.
 fn deploy_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("SPUR_DEPLOY_DIR") {
+        return PathBuf::from(dir);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -59,7 +63,6 @@ impl SuiteContext {
 
         ctx.apply_namespace().await?;
         ctx.apply_crd().await?;
-        ctx.apply_rbac().await?;
 
         Ok(ctx)
     }
@@ -67,19 +70,10 @@ impl SuiteContext {
     pub async fn teardown(&self) -> Result<()> {
         let dp = DeleteParams::default();
 
-        // CRD is cluster-scoped
         let crds: Api<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition> =
             Api::all(self.client.clone());
         let _ = crds.delete("spurjobs.spur.ai", &dp).await;
 
-        // ClusterRole and ClusterRoleBinding are cluster-scoped
-        let cr_api: Api<ClusterRole> = Api::all(self.client.clone());
-        let _ = cr_api.delete("spur-operator", &dp).await;
-
-        let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
-        let _ = crb_api.delete("spur-operator", &dp).await;
-
-        // Deleting the namespace cascades all namespaced resources
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
         let _ = ns_api.delete(&self.namespace, &dp).await;
 
@@ -122,61 +116,6 @@ impl SuiteContext {
         .await
         .context("failed to apply SpurJob CRD")?;
         info!("SpurJob CRD applied");
-        Ok(())
-    }
-
-    async fn apply_rbac(&self) -> Result<()> {
-        let yaml = std::fs::read_to_string(deploy_root().join("rbac.yaml"))
-            .context("failed to read rbac.yaml")?;
-
-        for doc in yaml.split("\n---") {
-            let doc = doc.trim();
-            if doc.is_empty() {
-                continue;
-            }
-            let mut value: serde_json::Value =
-                serde_yaml::from_str(doc).context("failed to parse rbac.yaml document")?;
-            patch_namespace_in_value(&mut value, &self.namespace);
-
-            let kind = value["kind"].as_str().unwrap_or("").to_string();
-            let name = value["metadata"]["name"].as_str().unwrap_or("").to_string();
-
-            match kind.as_str() {
-                "ServiceAccount" => {
-                    let api: Api<ServiceAccount> =
-                        Api::namespaced(self.client.clone(), &self.namespace);
-                    let sa: ServiceAccount = serde_json::from_value(value)?;
-                    api.patch(
-                        &name,
-                        &PatchParams::apply(APPLY_MANAGER).force(),
-                        &Patch::Apply(sa),
-                    )
-                    .await?;
-                }
-                "ClusterRole" => {
-                    let api: Api<ClusterRole> = Api::all(self.client.clone());
-                    let cr: ClusterRole = serde_json::from_value(value)?;
-                    api.patch(
-                        &name,
-                        &PatchParams::apply(APPLY_MANAGER).force(),
-                        &Patch::Apply(cr),
-                    )
-                    .await?;
-                }
-                "ClusterRoleBinding" => {
-                    let api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
-                    let crb: ClusterRoleBinding = serde_json::from_value(value)?;
-                    api.patch(
-                        &name,
-                        &PatchParams::apply(APPLY_MANAGER).force(),
-                        &Patch::Apply(crb),
-                    )
-                    .await?;
-                }
-                _ => bail!("unexpected kind in rbac.yaml: {kind}"),
-            }
-        }
-        info!("RBAC applied");
         Ok(())
     }
 }
