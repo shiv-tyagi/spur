@@ -12,6 +12,11 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+permissions:
+  statuses: write
+  actions: read
+  contents: read
+
 jobs:
   bare-metal:
     name: Bare-Metal Cluster (2x MI300X)
@@ -101,7 +106,7 @@ jobs:
           ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
           ~/spur/etc/stop-all.sh || true
 
-      - name: Report status to PR
+      - name: Report status
         if: always()
         uses: actions/github-script@v7
         with:
@@ -122,18 +127,6 @@ jobs:
     outputs:
       image_tag: ${{ steps.tag.outputs.value }}
     steps:
-      - name: Set pending status
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'pending',
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Push Image'
-            });
-
       - name: Set image tag
         id: tag
         run: echo "value=${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
@@ -157,20 +150,6 @@ jobs:
           docker load -i /tmp/spur-image.tar
           docker tag spur:ci ${{ steps.tag.outputs.value }}
           docker push ${{ steps.tag.outputs.value }}
-
-      - name: Report status to PR
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Push Image',
-              description: '${{ job.status }}'
-            });
 
   k8s:
     name: K8s Integration
@@ -300,7 +279,7 @@ jobs:
           kubectl delete clusterrole spur-operator --ignore-not-found
           kubectl delete crd spurjobs.spur.ai --ignore-not-found --timeout=120s || true
 
-      - name: Report status to PR
+      - name: Report status
         if: always()
         uses: actions/github-script@v7
         with:
