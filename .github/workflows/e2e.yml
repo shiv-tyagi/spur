@@ -19,12 +19,16 @@ permissions:
 
 jobs:
   bare-metal:
-    name: Bare-Metal Cluster (2x MI300X)
-    runs-on: [self-hosted, mi300x, primary]
+    name: Bare-Metal
+    runs-on: [self-hosted, amd-aac02-rocm]
     if: github.event.workflow_run.conclusion == 'success'
     concurrency:
       group: bare-metal-cluster
       cancel-in-progress: true
+    env:
+      BM_NODES: ${{ secrets.BM_NODES }}
+      BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+      BM_REMOTE_BASE: /tmp/spur-bm-${{ github.run_id }}
     steps:
       - name: Set pending status
         uses: actions/github-script@v7
@@ -46,65 +50,132 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout test scripts from main
+      - name: Download E2E test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k8s-test-binary
+          path: /tmp/e2e-bin
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout GPU test assets from main
         uses: actions/checkout@v4
         with:
           sparse-checkout: deploy/bare-metal
           sparse-checkout-cone-mode: false
           path: trusted-repo
 
-      - name: Stop any running cluster and clear state
+      - name: Load SSH key into agent
         run: |
-          ssh mi300-2 '~/spur/etc/stop-agent.sh' 2>/dev/null || true
-          ~/spur/etc/stop-all.sh 2>/dev/null || true
-          sleep 2
-          rm -rf ~/spur/state/*
-          ssh mi300-2 'rm -rf ~/spur/state/*' 2>/dev/null || true
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$BM_SSH_KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+        env:
+          BM_SSH_KEY: ${{ secrets.BM_SSH_KEY }}
 
-      - name: Deploy fresh binaries and test scripts
+      - name: Load AppArmor profiles for rootless containers
         run: |
-          chmod +x /tmp/release-binaries/*
-          cp /tmp/release-binaries/* ~/spur/bin/
-          rsync -a --checksum \
-            /tmp/release-binaries/spur \
-            /tmp/release-binaries/spurd \
-            mi300-2:~/spur/bin/
-          chmod +x trusted-repo/deploy/bare-metal/*.sh
-          cp trusted-repo/deploy/bare-metal/inference_test.py \
-             trusted-repo/deploy/bare-metal/inference_job.sh \
-             trusted-repo/deploy/bare-metal/distributed_test.py \
-             trusted-repo/deploy/bare-metal/distributed_job.sh \
-             ~/spur/
-          rsync -a --checksum \
-            trusted-repo/deploy/bare-metal/inference_test.py \
-            trusted-repo/deploy/bare-metal/inference_job.sh \
-            trusted-repo/deploy/bare-metal/distributed_test.py \
-            trusted-repo/deploy/bare-metal/distributed_job.sh \
-            mi300-2:~/spur/
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for step in single-node multi-node gpu-single-node gpu-multi-node; do
+            SPURD="${BM_REMOTE_BASE}/${step}/bin/spurd"
+            PROF="abi <abi/4.0>,
+          profile spur-ci-${step} ${SPURD} flags=(unconfined) {
+            userns,
+          }"
+            for node in "${NODES[@]}"; do
+              ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" \
+                "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
+            done
+          done
 
-      - name: Start cluster
+      - name: Run single-node bare-metal tests
+        env:
+          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/single-node
+          RUST_LOG: info
         run: |
-          ~/spur/etc/start-controller.sh
-          ssh mi300-2 '~/spur/etc/start-agent.sh'
-          sleep 5
+          chmod +x /tmp/e2e-bin/spur-k8s-tests
+          /tmp/e2e-bin/spur-k8s-tests bare_metal::single_node -- --ignored --test-threads=1
 
-      - name: Verify both nodes idle
-        run: |
-          ~/spur/bin/sinfo
-          if ! ~/spur/bin/sinfo | grep -qE "2\s+idle"; then
-            echo "ERROR: Expected 2 idle nodes, got:"
-            ~/spur/bin/sinfo
-            exit 1
-          fi
+      - name: Run multi-node bare-metal tests
+        env:
+          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/multi-node
+          RUST_LOG: info
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::multi_node -- --ignored --test-threads=1
 
-      - name: Run E2E tests
-        run: bash trusted-repo/deploy/bare-metal/cluster_test.sh
+      - name: Run single-node GPU bare-metal tests
+        env:
+          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-single-node
+          RUST_LOG: info
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::single_node -- --ignored --test-threads=1
 
-      - name: Stop cluster
+      - name: Run multi-node GPU bare-metal tests
+        env:
+          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-multi-node
+          RUST_LOG: info
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node -- --ignored --test-threads=1
+
+      - name: Collect cluster logs
         if: always()
         run: |
-          ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
-          ~/spur/etc/stop-all.sh || true
+          set -euo pipefail
+          mkdir -p /tmp/bm-logs
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            node_dir="/tmp/bm-logs/${node}"
+            mkdir -p "$node_dir"
+            for step in single-node multi-node gpu-single-node gpu-multi-node; do
+              remote="${BM_REMOTE_BASE}/${step}/log"
+              local_step="${node_dir}/${step}"
+              mkdir -p "$local_step"
+              scp -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+                "${BM_SSH_USER}@${node}:${remote}/*.log" "$local_step/" 2>/dev/null || true
+            done
+          done
+          echo "Collected logs:"
+          find /tmp/bm-logs -type f -name '*.log' | head -20
+
+      - name: Upload cluster logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bare-metal-logs
+          path: /tmp/bm-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Cleanup remote dirs and AppArmor profiles
+        if: always()
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" "
+              rm -rf '${BM_REMOTE_BASE}'
+              sudo aa-status 2>/dev/null | grep -o 'spur-ci-[^ ]*' | sort -u | while read -r prof; do
+                sudo apparmor_parser -R /dev/stdin 2>/dev/null <<< \"profile \$prof /dev/null {}\" || true
+              done
+            " || true
+          done
+
+      - name: Kill SSH agent
+        if: always()
+        run: ssh-agent -k || true
 
       - name: Report status
         if: always()
@@ -148,7 +219,7 @@ jobs:
           docker push "$IMAGE_TAG"
 
   k8s:
-    name: K8s Integration
+    name: K8s
     runs-on: [self-hosted, amd-aac02-rocm]
     needs: push-image
     concurrency:
