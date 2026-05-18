@@ -39,7 +39,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: 'pending',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Bare-Metal Cluster'
+              context: 'E2E / Bare-Metal'
             });
 
       - name: Download release binaries
@@ -209,6 +209,16 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Cleanup remote processes
+        if: always()
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" \
+              "pkill -f spurctld 2>/dev/null; pkill -f spurd 2>/dev/null" || true
+          done
+
       - name: Cleanup remote dirs
         if: always()
         run: |
@@ -254,7 +264,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Bare-Metal Cluster',
+              context: 'E2E / Bare-Metal',
               description: '${{ job.status }}'
             });
 
@@ -307,7 +317,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: 'pending',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / K8s Integration'
+              context: 'E2E / K8s'
             });
 
       - name: Download K8s test binary
@@ -441,7 +451,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / K8s Integration',
+              context: 'E2E / K8s',
               description: '${{ job.status }}'
             });
 
