@@ -76,8 +76,6 @@ jobs:
 
       - name: Load AppArmor profiles for rootless containers
         run: |
-          echo "DEBUG: SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
-          ssh-add -l
           IFS=',' read -ra NODES <<< "$BM_NODES"
           for step in single-node multi-node gpu-single-node gpu-multi-node; do
             SPURD="${BM_REMOTE_BASE}/${step}/bin/spurd"
