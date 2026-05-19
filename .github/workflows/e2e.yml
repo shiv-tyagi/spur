@@ -167,6 +167,7 @@ jobs:
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
           SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-single-node
+          SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
           RUST_LOG: info
         run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::single_node --ignored --test-threads=1
 
@@ -177,6 +178,7 @@ jobs:
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
           SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-multi-node
+          SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
           RUST_LOG: info
         run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node --ignored --test-threads=1
 
