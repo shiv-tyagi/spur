@@ -19,7 +19,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release \
+RUN cargo build --release --locked \
     --bin spur \
     --bin spurctld \
     --bin spurd \
