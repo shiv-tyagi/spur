@@ -339,12 +339,12 @@ pub struct Job {
 
 impl Job {
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
-        let priority = spec.priority.unwrap_or(1000);
-        let state = if spec.hold {
-            JobState::Pending
+        let priority = if spec.hold {
+            0
         } else {
-            JobState::Pending
+            spec.priority.unwrap_or(1000)
         };
+        let state = JobState::Pending;
         let pending_reason = if spec.hold {
             PendingReason::Held
         } else {

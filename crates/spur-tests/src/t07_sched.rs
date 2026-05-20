@@ -1027,6 +1027,7 @@ mod tests {
             },
         );
         assert_eq!(job.pending_reason, spur_core::job::PendingReason::Held);
+        assert_eq!(job.priority, 0);
     }
 
     #[test]

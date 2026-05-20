@@ -115,6 +115,7 @@ mod tests {
         );
         assert_eq!(job.state, spur_core::job::JobState::Pending);
         assert_eq!(job.pending_reason, spur_core::job::PendingReason::Held);
+        assert_eq!(job.priority, 0);
     }
 
     // ── T17.9: Array spec ────────────────────────────────────────

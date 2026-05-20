@@ -58,6 +58,7 @@ mod tests {
         );
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.pending_reason, PendingReason::Held);
+        assert_eq!(job.priority, 0);
     }
 
     // ── T06.5: Held jobs not in schedulable pending ──────────────
