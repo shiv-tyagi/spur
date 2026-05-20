@@ -410,11 +410,13 @@ fn parse_netrc(content: &str, registry: &str) -> Option<RegistryCredentials> {
             }
             _ => i += 1,
         }
-        if machine_match && username.is_some() && password.is_some() {
-            return Some(RegistryCredentials {
-                username: username.unwrap(),
-                password: password.unwrap(),
-            });
+        if machine_match {
+            if let (Some(u), Some(p)) = (&username, &password) {
+                return Some(RegistryCredentials {
+                    username: u.clone(),
+                    password: p.clone(),
+                });
+            }
         }
     }
     None
