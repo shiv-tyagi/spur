@@ -161,6 +161,6 @@ mod tests {
     fn semver_equal_not_update() {
         let v1 = Version::parse("0.2.2").unwrap();
         let v2 = Version::parse("0.2.2").unwrap();
-        assert!(!(v2 > v1));
+        assert!(v2 <= v1);
     }
 }
