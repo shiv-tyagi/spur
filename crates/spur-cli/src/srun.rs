@@ -6,7 +6,7 @@ use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec,
+    CancelJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec, JobState,
     StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
@@ -273,20 +273,24 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                match job.state {
-                    1 => {
-                        // RUNNING
+                match JobState::try_from(job.state) {
+                    Ok(JobState::JobRunning) => {
                         nodelist = job.nodelist.clone();
                         if !nodelist.is_empty() {
                             eprintln!("srun: job {} running on {}", job_id, nodelist);
                         }
                         break;
                     }
-                    3 | 4 | 5 | 6 | 7 => {
-                        // Already terminal
-                        handle_terminal_state(job.state, job_id, job.exit_code, &work_dir).await;
+                    Ok(
+                        state @ (JobState::JobCompleted
+                        | JobState::JobFailed
+                        | JobState::JobCancelled
+                        | JobState::JobTimeout
+                        | JobState::JobNodeFail),
+                    ) => {
+                        handle_terminal_state(state, job_id, job.exit_code, &work_dir).await;
                     }
-                    _ => {} // Still pending
+                    _ => {}
                 }
             }
             Err(e) => {
@@ -379,14 +383,19 @@ async fn try_stream_output(
         match controller.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                if job.state >= 3 {
-                    // Terminal
-                    let code = if job.state == 3 {
-                        job.exit_code
-                    } else {
-                        job.exit_code.max(1)
-                    };
-                    std::process::exit(code);
+                if let Ok(state) = JobState::try_from(job.state) {
+                    match state {
+                        JobState::JobCompleted => {
+                            std::process::exit(job.exit_code);
+                        }
+                        JobState::JobFailed
+                        | JobState::JobCancelled
+                        | JobState::JobTimeout
+                        | JobState::JobNodeFail => {
+                            std::process::exit(job.exit_code.max(1));
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(_) => {}
@@ -406,8 +415,15 @@ async fn poll_for_completion(
         match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                if job.state >= 3 {
-                    handle_terminal_state(job.state, job_id, job.exit_code, work_dir).await;
+                if let Ok(
+                    state @ (JobState::JobCompleted
+                    | JobState::JobFailed
+                    | JobState::JobCancelled
+                    | JobState::JobTimeout
+                    | JobState::JobNodeFail),
+                ) = JobState::try_from(job.state)
+                {
+                    handle_terminal_state(state, job_id, job.exit_code, work_dir).await;
                 }
             }
             Err(e) => {
@@ -417,33 +433,31 @@ async fn poll_for_completion(
     }
 }
 
-async fn handle_terminal_state(state: i32, job_id: u32, exit_code: i32, work_dir: &str) -> ! {
+async fn handle_terminal_state(state: JobState, job_id: u32, exit_code: i32, work_dir: &str) -> ! {
     match state {
-        3 => {
-            // COMPLETED
+        JobState::JobCompleted => {
             print_job_output(work_dir, job_id).await;
             std::process::exit(exit_code);
         }
-        4 => {
-            // FAILED
+        JobState::JobFailed => {
             print_job_output(work_dir, job_id).await;
             eprintln!("srun: job {} failed with exit code {}", job_id, exit_code);
             std::process::exit(exit_code.max(1));
         }
-        5 => {
+        JobState::JobCancelled => {
             eprintln!("srun: job {} cancelled", job_id);
             std::process::exit(1);
         }
-        6 => {
+        JobState::JobTimeout => {
             eprintln!("srun: job {} timed out", job_id);
             std::process::exit(1);
         }
-        7 => {
+        JobState::JobNodeFail => {
             eprintln!("srun: job {} failed (node failure)", job_id);
             std::process::exit(1);
         }
         _ => {
-            eprintln!("srun: job {} ended with state {}", job_id, state);
+            eprintln!("srun: job {} ended with state {:?}", job_id, state);
             std::process::exit(1);
         }
     }
