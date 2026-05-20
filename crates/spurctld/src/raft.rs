@@ -268,12 +268,12 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
         self.persist_vote(vote).map_err(|e| {
             StorageError::from_io_error(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
         })?;
-        self.inner.write().vote = Some(vote.clone());
+        self.inner.write().vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.read().vote.clone())
+        Ok(self.inner.read().vote)
     }
 
     async fn append_to_log<I: IntoIterator<Item = Entry<SpurTypeConfig>> + Send>(
