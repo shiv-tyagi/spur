@@ -7,3 +7,6 @@ edition.workspace = true
 spur-core = { path = "../spur-core" }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -9,3 +9,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 libloading = "0.9.0"
 thiserror.workspace = true
+
+[lints]
+workspace = true

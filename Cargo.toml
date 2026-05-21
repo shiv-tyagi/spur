@@ -89,3 +89,29 @@ base64 = "0.22"
 
 # Internal
 spur-update = { path = "crates/spur-update" }
+
+[workspace.lints.clippy]
+unnecessary_unwrap = "warn"
+clone_on_copy = "warn"
+if_same_then_else = "warn"
+not_unsafe_ptr_arg_deref = "warn"
+redundant_field_names = "warn"
+redundant_pattern_matching = "warn"
+collapsible_str_replace = "warn"
+manual_ok_err = "warn"
+manual_range_patterns = "warn"
+derivable_impls = "warn"
+useless_vec = "warn"
+for_kv_map = "warn"
+nonminimal_bool = "warn"
+let_and_return = "warn"
+redundant_closure = "warn"
+single_match = "warn"
+needless_return = "warn"
+doc_lazy_continuation = "warn"
+# TODO: enable after fixing remaining violations
+# should_implement_trait = "warn"
+# too_many_arguments = "warn"
+# large_enum_variant = "warn"
+# result_large_err = "warn"
+# type_complexity = "warn"
