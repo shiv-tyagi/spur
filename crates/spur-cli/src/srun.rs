@@ -418,7 +418,9 @@ async fn try_stream_output(
                     Err(_) => {}
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                eprintln!("srun: warning: failed to get job status: {}", e.message());
+            }
         }
     }
 }
