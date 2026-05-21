@@ -131,30 +131,24 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Hold { job_id } => {
-            update_job(
+            send_job_update(
                 &args.controller,
-                job_id,
-                None,
-                None,
-                Some(true),
-                None,
-                None,
-                None,
-                None,
+                spur_proto::proto::UpdateJobRequest {
+                    job_id,
+                    hold: Some(true),
+                    ..Default::default()
+                },
             )
             .await
         }
         ScontrolCommand::Release { job_id } => {
-            update_job(
+            send_job_update(
                 &args.controller,
-                job_id,
-                None,
-                None,
-                Some(false),
-                None,
-                None,
-                None,
-                None,
+                spur_proto::proto::UpdateJobRequest {
+                    job_id,
+                    hold: Some(false),
+                    ..Default::default()
+                },
             )
             .await
         }
@@ -204,18 +198,30 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             add_accounts,
             remove_accounts,
         } => {
-            update_reservation(
-                &args.controller,
-                &name,
-                duration,
-                &add_nodes,
-                &remove_nodes,
-                &add_users,
-                &remove_users,
-                &add_accounts,
-                &remove_accounts,
-            )
-            .await
+            let split_csv = |s: &str| -> Vec<String> {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+                .await
+                .context("failed to connect to spurctld")?;
+            client
+                .update_reservation(spur_proto::proto::UpdateReservationRequest {
+                    name: name.clone(),
+                    duration_minutes: duration,
+                    add_nodes: split_csv(&add_nodes),
+                    remove_nodes: split_csv(&remove_nodes),
+                    add_users: split_csv(&add_users),
+                    remove_users: split_csv(&remove_users),
+                    add_accounts: split_csv(&add_accounts),
+                    remove_accounts: split_csv(&remove_accounts),
+                })
+                .await
+                .context("failed to update reservation")?;
+            println!("Reservation {} updated", name);
+            Ok(())
         }
         ScontrolCommand::DeleteReservation { name } => {
             delete_reservation(&args.controller, &name).await
@@ -486,41 +492,14 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
     }
 }
 
-async fn update_job(
-    controller: &str,
-    job_id: u32,
-    priority: Option<u32>,
-    time_limit: Option<String>,
-    hold: Option<bool>,
-    partition: Option<String>,
-    account: Option<String>,
-    comment: Option<String>,
-    qos: Option<String>,
-) -> Result<()> {
+async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequest) -> Result<()> {
+    let hold = req.hold;
+    let job_id = req.job_id;
     let mut client = SlurmControllerClient::connect(controller.to_string())
         .await
         .context("failed to connect to spurctld")?;
 
-    let tl = time_limit.as_ref().and_then(|t| {
-        spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
-            seconds: m as i64 * 60,
-            nanos: 0,
-        })
-    });
-
-    client
-        .update_job(spur_proto::proto::UpdateJobRequest {
-            job_id,
-            partition,
-            account,
-            priority,
-            time_limit: tl,
-            hold,
-            comment,
-            qos,
-        })
-        .await
-        .context("update failed")?;
+    client.update_job(req).await.context("update failed")?;
 
     if hold == Some(true) {
         println!("job {} held", job_id);
@@ -572,8 +551,26 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
 
     let jid =
         job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= or NodeName= required"))?;
-    update_job(
-        controller, jid, priority, time_limit, None, partition, account, comment, qos,
+
+    let tl = time_limit.as_ref().and_then(|t| {
+        spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
+            seconds: m as i64 * 60,
+            nanos: 0,
+        })
+    });
+
+    send_job_update(
+        controller,
+        spur_proto::proto::UpdateJobRequest {
+            job_id: jid,
+            priority,
+            time_limit: tl,
+            partition,
+            account,
+            comment,
+            qos,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -658,47 +655,6 @@ async fn create_reservation(
         .context("failed to create reservation")?;
 
     println!("Reservation {} created", name);
-    Ok(())
-}
-
-/// Update a reservation via the controller.
-async fn update_reservation(
-    controller: &str,
-    name: &str,
-    duration: u32,
-    add_nodes: &str,
-    remove_nodes: &str,
-    add_users: &str,
-    remove_users: &str,
-    add_accounts: &str,
-    remove_accounts: &str,
-) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
-        .await
-        .context("failed to connect to spurctld")?;
-
-    let split_csv = |s: &str| -> Vec<String> {
-        s.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
-    client
-        .update_reservation(spur_proto::proto::UpdateReservationRequest {
-            name: name.to_string(),
-            duration_minutes: duration,
-            add_nodes: split_csv(add_nodes),
-            remove_nodes: split_csv(remove_nodes),
-            add_users: split_csv(add_users),
-            remove_users: split_csv(remove_users),
-            add_accounts: split_csv(add_accounts),
-            remove_accounts: split_csv(remove_accounts),
-        })
-        .await
-        .context("failed to update reservation")?;
-
-    println!("Reservation {} updated", name);
     Ok(())
 }
 
