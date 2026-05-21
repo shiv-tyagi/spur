@@ -98,10 +98,22 @@ mod tests {
 
     #[test]
     fn t21_9_qos_preempt_modes() {
-        assert_eq!(QosPreemptMode::from_str("cancel"), QosPreemptMode::Cancel);
-        assert_eq!(QosPreemptMode::from_str("requeue"), QosPreemptMode::Requeue);
-        assert_eq!(QosPreemptMode::from_str("suspend"), QosPreemptMode::Suspend);
-        assert_eq!(QosPreemptMode::from_str("off"), QosPreemptMode::Off);
+        assert_eq!(
+            "cancel".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Cancel
+        );
+        assert_eq!(
+            "requeue".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Requeue
+        );
+        assert_eq!(
+            "suspend".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Suspend
+        );
+        assert_eq!(
+            "off".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Off
+        );
     }
 
     // ── T21.10: QOS limit enforcement ────────────────────────────

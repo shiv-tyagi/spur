@@ -48,17 +48,17 @@ mod tests {
 
     #[test]
     fn t01_5_cpu_bind_types() {
-        assert_eq!(CpuBind::from_str("cores"), CpuBind::Cores);
-        assert_eq!(CpuBind::from_str("threads"), CpuBind::Threads);
-        assert_eq!(CpuBind::from_str("sockets"), CpuBind::Sockets);
-        assert_eq!(CpuBind::from_str("ldoms"), CpuBind::Ldoms);
-        assert_eq!(CpuBind::from_str("rank"), CpuBind::Rank);
-        assert_eq!(CpuBind::from_str("none"), CpuBind::None);
+        assert_eq!("cores".parse::<CpuBind>().unwrap(), CpuBind::Cores);
+        assert_eq!("threads".parse::<CpuBind>().unwrap(), CpuBind::Threads);
+        assert_eq!("sockets".parse::<CpuBind>().unwrap(), CpuBind::Sockets);
+        assert_eq!("ldoms".parse::<CpuBind>().unwrap(), CpuBind::Ldoms);
+        assert_eq!("rank".parse::<CpuBind>().unwrap(), CpuBind::Rank);
+        assert_eq!("none".parse::<CpuBind>().unwrap(), CpuBind::None);
     }
 
     #[test]
     fn t01_6_cpu_bind_map() {
-        match CpuBind::from_str("map_cpu:0,4,8,12") {
+        match "map_cpu:0,4,8,12".parse::<CpuBind>().unwrap() {
             CpuBind::Map(s) => assert_eq!(s, "0,4,8,12"),
             other => panic!("expected Map, got {:?}", other),
         }
@@ -68,13 +68,13 @@ mod tests {
 
     #[test]
     fn t01_7_gpu_bind_types() {
-        assert_eq!(GpuBind::from_str("closest"), GpuBind::Closest);
-        assert_eq!(GpuBind::from_str("none"), GpuBind::None);
+        assert_eq!("closest".parse::<GpuBind>().unwrap(), GpuBind::Closest);
+        assert_eq!("none".parse::<GpuBind>().unwrap(), GpuBind::None);
     }
 
     #[test]
     fn t01_8_gpu_bind_map() {
-        match GpuBind::from_str("map_gpu:0,1,2,3") {
+        match "map_gpu:0,1,2,3".parse::<GpuBind>().unwrap() {
             GpuBind::Map(s) => assert_eq!(s, "0,1,2,3"),
             other => panic!("expected Map, got {:?}", other),
         }
