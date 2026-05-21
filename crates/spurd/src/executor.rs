@@ -27,6 +27,27 @@ pub struct ContainerLaunchConfig {
     pub rootfs: PathBuf,
 }
 
+/// Everything an agent needs to launch a job process on this node.
+///
+/// Groups the resolved execution parameters that come from multiple sources
+/// (JobSpec, scheduler allocation, agent config) into a single value.
+pub struct JobLaunchConfig {
+    pub job_id: JobId,
+    pub script: String,
+    pub work_dir: String,
+    pub environment: HashMap<String, String>,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub gpu_devices: Vec<u32>,
+    pub cpu_ids: Vec<u32>,
+    pub open_mode: Option<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub container: Option<ContainerLaunchConfig>,
+}
+
 /// A running job process — either a tokio-managed child or a raw-forked container.
 pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
@@ -130,22 +151,25 @@ impl RunningJob {
 /// Otherwise, it uses the standard `tokio::Command` path with optional
 /// `build_namespace_wrapper()` for non-container namespace isolation.
 pub async fn launch_job(
-    job_id: JobId,
-    script: &str,
-    work_dir: &str,
-    environment: &HashMap<String, String>,
-    stdout_path: &str,
-    stderr_path: &str,
-    cpus: u32,
-    memory_mb: u64,
-    gpu_devices: &[u32],
-    cpu_ids: &[u32],
+    cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
-    open_mode: Option<&str>,
-    uid: u32,
-    gid: u32,
-    container: Option<ContainerLaunchConfig>,
 ) -> anyhow::Result<RunningJob> {
+    let JobLaunchConfig {
+        job_id,
+        ref script,
+        ref work_dir,
+        ref environment,
+        ref stdout_path,
+        ref stderr_path,
+        cpus,
+        memory_mb,
+        ref gpu_devices,
+        ref cpu_ids,
+        ref open_mode,
+        uid,
+        gid,
+        ref container,
+    } = *cfg;
     info!(job_id, work_dir, "launching job");
 
     // Run prolog if configured
@@ -221,6 +245,7 @@ pub async fn launch_job(
     }
 
     let use_append = open_mode
+        .as_deref()
         .map(|m| m.eq_ignore_ascii_case("append"))
         .unwrap_or(false);
 
@@ -308,16 +333,12 @@ pub async fn launch_job(
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {
         return launch_container_job(
-            job_id,
-            &ctn,
+            cfg,
+            ctn,
             &env,
+            use_append,
             &stdout_resolved,
             &stderr_resolved,
-            use_append,
-            cpus,
-            memory_mb,
-            cpu_ids,
-            work_dir,
         )
         .await;
     }
@@ -630,20 +651,16 @@ fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
 ///
 /// The parent tracks the child PID via a sync pipe and wraps waitpid in a
 /// blocking tokio task so it doesn't stall the async runtime.
-#[allow(clippy::too_many_arguments)]
 async fn launch_container_job(
-    job_id: JobId,
+    cfg: &JobLaunchConfig,
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
+    use_append: bool,
     stdout_path: &str,
     stderr_path: &str,
-    use_append: bool,
-    cpus: u32,
-    memory_mb: u64,
-    cpu_ids: &[u32],
-    _work_dir: &str,
 ) -> anyhow::Result<RunningJob> {
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let job_id = cfg.job_id;
+    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
 
     // Open stdout/stderr files before fork (child will dup2 these)
     let stdout_fd: std::fs::File = if use_append {

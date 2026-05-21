@@ -587,12 +587,6 @@ impl SlurmAgent for AgentService {
             spec.stderr_path.clone()
         };
 
-        // Launch the job
-        let open_mode = if spec.open_mode.is_empty() {
-            None
-        } else {
-            Some(spec.open_mode.as_str())
-        };
         // Build container launch config if this is a containerized job
         let container_launch = if !spec.container_image.is_empty() {
             Some(executor::ContainerLaunchConfig {
@@ -603,39 +597,42 @@ impl SlurmAgent for AgentService {
             None
         };
 
-        match executor::launch_job(
+        let launch_cfg = executor::JobLaunchConfig {
             job_id,
-            &launch_script,
-            &work_dir,
-            &env,
-            &stdout_path,
-            &stderr_path,
-            spec.cpus_per_task.max(1),
-            spec.memory_per_node_mb,
-            &gpu_devices,
-            &cpu_ids,
-            (*self.spank).as_ref(),
-            open_mode,
-            spec.uid,
-            spec.gid,
-            container_launch,
-        )
-        .await
-        {
+            script: launch_script,
+            work_dir: work_dir.clone(),
+            environment: env,
+            stdout_path,
+            stderr_path,
+            cpus: spec.cpus_per_task.max(1),
+            memory_mb: spec.memory_per_node_mb,
+            gpu_devices,
+            cpu_ids,
+            open_mode: if spec.open_mode.is_empty() {
+                None
+            } else {
+                Some(spec.open_mode.clone())
+            },
+            uid: spec.uid,
+            gid: spec.gid,
+            container: container_launch,
+        };
+
+        match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(running_job) => {
                 let mut jobs = self.running.lock().await;
+                info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 jobs.insert(
                     job_id,
                     TrackedJob {
                         job: running_job,
                         rootfs_mode: rootfs_mode.clone(),
                         allocation: alloc_result,
-                        stdout_path,
-                        stderr_path,
+                        stdout_path: launch_cfg.stdout_path,
+                        stderr_path: launch_cfg.stderr_path,
                         has_pid_namespace: nix::unistd::geteuid().is_root(),
                     },
                 );
-                info!(job_id, gpus = ?gpu_devices, "job launched successfully");
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
