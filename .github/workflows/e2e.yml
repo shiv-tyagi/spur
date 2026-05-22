@@ -16,6 +16,7 @@ permissions:
   statuses: write
   actions: read
   contents: read
+  packages: write
 
 jobs:
   bare-metal:
@@ -298,12 +299,20 @@ jobs:
             });
 
   push-image:
-    name: Push Image to Registry
+    name: Push Image to GHCR
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success'
-    env:
-      IMAGE_TAG: ${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}
     steps:
+      - name: Compute GHCR image reference
+        id: image
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const sha = '${{ github.event.workflow_run.head_sha }}';
+            const repo = '${{ github.repository }}'.toLowerCase();
+            return `ghcr.io/${repo}:${sha}`;
+
       - name: Download image artifact
         uses: actions/download-artifact@v4
         with:
@@ -312,13 +321,16 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Load, retag, and push
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.result }}
         run: |
           docker load -i /tmp/spur-image.tar
           docker tag spur:ci "$IMAGE_TAG"
@@ -334,9 +346,23 @@ jobs:
     env:
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
-      SPUR_CI_IMAGE: ${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}
       RUST_LOG: info
     steps:
+      - name: Compute GHCR image reference
+        id: image
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const sha = '${{ github.event.workflow_run.head_sha }}';
+            const repo = '${{ github.repository }}'.toLowerCase();
+            return `ghcr.io/${repo}:${sha}`;
+
+      - name: Set SPUR_CI_IMAGE
+        run: |
+          echo "SPUR_CI_IMAGE=${{ steps.image.outputs.result }}" >> "$GITHUB_ENV"
+          echo "SPUR_CI_IMAGE=${{ steps.image.outputs.result }}"
+
       - name: Set pending status
         uses: actions/github-script@v7
         with:
@@ -409,15 +435,12 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Create registry pull secret
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
           kubectl create secret docker-registry regcred \
-            --docker-server="https://index.docker.io/v1/" \
-            --docker-username="$REGISTRY_USERNAME" \
-            --docker-password="$REGISTRY_PASSWORD" \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
             -n "$SPUR_TEST_NS" \
             --dry-run=client -o yaml | kubectl apply -f -
 
