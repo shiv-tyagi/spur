@@ -2,6 +2,8 @@
 name = "spur-spank"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 spur-core = { path = "../spur-core" }
