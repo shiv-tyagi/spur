@@ -8,17 +8,12 @@ permissions:
   contents: read
 
 jobs:
-  conventional-commits:
+  validate-pr-title:
     runs-on: ubuntu-latest
     env:
       PATTERN: "^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\([a-zA-Z0-9_-]+\\))?!?: .+$"
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Validate PR title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -31,34 +26,6 @@ jobs:
             exit 1
           fi
           echo "PASS: PR title is valid."
-
-      - name: Validate PR commits
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-        run: |
-          COMMITS=$(git log --no-merges --format='%s' "origin/${BASE_REF}"..HEAD)
-
-          if [ -z "$COMMITS" ]; then
-            echo "No commits found between origin/${BASE_REF} and HEAD."
-            exit 0
-          fi
-
-          FAILED=0
-          while IFS= read -r msg; do
-            echo "Checking commit: '$msg'"
-            if ! echo "$msg" | grep -Eq "$PATTERN"; then
-              echo "  FAIL: invalid format."
-              FAILED=1
-            fi
-          done <<< "$COMMITS"
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "FAIL: one or more commit messages do not match conventional commits format."
-            echo "Rebase and reword commits to match: type(scope): description"
-            echo "Valid types: feat fix docs style refactor perf test build ci chore revert"
-            exit 1
-          fi
-          echo "PASS: all commit messages are valid."
 
   license-headers:
     name: SPDX License Headers
