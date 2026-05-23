@@ -6,8 +6,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use backoff::future::retry;
-use backoff::ExponentialBackoffBuilder;
+use backon::{ExponentialBuilder, Retryable};
 
 use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Pod, Service};
@@ -623,17 +622,16 @@ async fn ensure_job_id_label(
         "metadata": { "labels": { "spur.ai/job-id": job_id.to_string() } }
     });
 
-    let backoff = ExponentialBackoffBuilder::new()
-        .with_initial_interval(Duration::from_millis(200))
-        .with_max_elapsed_time(Some(Duration::from_secs(3)))
-        .build();
-
-    retry(backoff, || async {
+    (|| async {
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map(|_| ())
-            .map_err(backoff::Error::transient)
     })
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(200))
+            .with_max_delay(Duration::from_secs(3)),
+    )
     .await
     .inspect(|_| info!(spurjob = %name, job_id, "applied job-id label"))
     .inspect_err(|e| warn!(spurjob = %name, job_id, error = %e, "failed to apply job-id label"))

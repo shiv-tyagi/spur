@@ -4,8 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use backoff::future::retry;
-use backoff::ExponentialBackoffBuilder;
+use backon::{ExponentialBuilder, Retryable};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, HostPathVolumeSource, Pod, PodSpec, ResourceRequirements, Service,
     ServicePort, ServiceSpec, Volume, VolumeMount,
@@ -38,27 +37,26 @@ impl VirtualAgent {
         let api: Api<SpurJob> = Api::all(self.client.clone());
         let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
 
-        let backoff = ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_millis(200))
-            .with_max_elapsed_time(Some(Duration::from_secs(5)))
-            .build();
-
-        retry(backoff, || async {
+        (|| async {
             let list = tokio::time::timeout(Duration::from_millis(300), api.list(&lp))
                 .await
-                .map_err(|_| backoff::Error::transient(Status::unavailable("k8s API timeout")))?
-                .map_err(|e| backoff::Error::permanent(Status::internal(e.to_string())))?;
+                .map_err(|_| Status::unavailable("k8s API timeout"))?
+                .map_err(|e| Status::internal(e.to_string()))?;
 
             list.items
                 .into_iter()
                 .next()
                 .and_then(|j| j.metadata.namespace)
                 .ok_or_else(|| {
-                    backoff::Error::transient(Status::not_found(format!(
-                        "spur.ai/job-id={job_id} label not yet visible"
-                    )))
+                    Status::not_found(format!("spur.ai/job-id={job_id} label not yet visible"))
                 })
         })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(5)),
+        )
+        .when(|e: &Status| matches!(e.code(), tonic::Code::Unavailable | tonic::Code::NotFound))
         .await
         .map_err(|e| {
             Status::not_found(format!(
