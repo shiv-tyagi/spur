@@ -3,6 +3,7 @@ name = "spur-update"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 repository.workspace = true
 description = "Auto-update and version checking for Spur binaries"
 
