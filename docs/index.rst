@@ -12,4 +12,4 @@ An AI-native job scheduler written in Rust. Drop-in compatible with Slurm's CLI,
 
 .. note::
 
-   More sections (user guide, configuration reference, REST API, architecture, deployment, migration from Slurm) are planned.
+   More sections (user guide, configuration reference, REST API, architecture, migration from Slurm) are planned.

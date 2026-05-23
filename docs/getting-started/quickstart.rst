@@ -3,6 +3,10 @@ Quickstart — Single-Node Cluster
 
 The fastest way to try Spur. Everything runs on one machine, no config file needed.
 
+.. note::
+
+   Need binaries first? See the Install section in :doc:`deployment/bare-metal`.
+
 Start the Controller
 --------------------
 

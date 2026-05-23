@@ -1,11 +1,10 @@
 Getting Started
 ===============
 
-Get Spur running on a single machine, or set up a multi-node GPU cluster.
+Try Spur locally, then deploy to a cluster.
 
 .. toctree::
    :maxdepth: 2
 
-   installation
    quickstart
-   multi-node
+   deployment/index
