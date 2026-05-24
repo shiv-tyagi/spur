@@ -6,8 +6,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use backoff::future::retry;
-use backoff::ExponentialBackoffBuilder;
+use backon::{ExponentialBuilder, Retryable};
 
 use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Pod, Service};
@@ -28,6 +27,15 @@ use spur_proto::proto::{
 
 const FINALIZER: &str = "spur.ai/cleanup";
 const MAX_BACKOFF_SECS: u64 = 60;
+const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
+
+fn is_transient_kube_error(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(status) => status.is_conflict() || matches!(status.code, 429 | 503 | 504),
+        kube::Error::HyperError(_) | kube::Error::HttpError(_) | kube::Error::Service(_) => true,
+        _ => false,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -623,18 +631,36 @@ async fn ensure_job_id_label(
         "metadata": { "labels": { "spur.ai/job-id": job_id.to_string() } }
     });
 
-    let backoff = ExponentialBackoffBuilder::new()
-        .with_initial_interval(Duration::from_millis(200))
-        .with_max_elapsed_time(Some(Duration::from_secs(3)))
-        .build();
+    let result = tokio::time::timeout(
+        LABEL_PATCH_BUDGET,
+        (|| async {
+            api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+                .map(|_| ())
+        })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(1))
+                .without_max_times(),
+        )
+        .when(is_transient_kube_error),
+    )
+    .await;
 
-    retry(backoff, || async {
-        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-            .map(|_| ())
-            .map_err(backoff::Error::transient)
-    })
-    .await
+    match result {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(kube::Error::Api(Box::new(
+            kube::core::Status::failure(
+                "TimedOut",
+                &format!(
+                    "label patch timed out after {}s",
+                    LABEL_PATCH_BUDGET.as_secs()
+                ),
+            )
+            .with_code(504),
+        ))),
+    }
     .inspect(|_| info!(spurjob = %name, job_id, "applied job-id label"))
     .inspect_err(|e| warn!(spurjob = %name, job_id, error = %e, "failed to apply job-id label"))
 }
