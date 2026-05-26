@@ -262,13 +262,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     set.spawn(async move {
                         dispatch_to_agent(
                             &agent_addr,
-                            job_id,
-                            &spec,
-                            &peer_addrs,
-                            task_offset,
-                            &target_node,
-                            &allocated,
-                            &allocated_nodelist,
+                            &AgentDispatchParams {
+                                job_id,
+                                spec: &spec,
+                                peer_nodes: &peer_addrs,
+                                task_offset,
+                                target_node: &target_node,
+                                allocated: &allocated,
+                                allocated_nodelist: &allocated_nodelist,
+                            },
                         )
                         .await
                     });
@@ -546,19 +548,25 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
     }
 }
 
+/// Parameters for dispatching a job to a single node agent.
+struct AgentDispatchParams<'a> {
+    job_id: u32,
+    spec: &'a spur_core::job::JobSpec,
+    peer_nodes: &'a [String],
+    task_offset: u32,
+    target_node: &'a str,
+    allocated: &'a spur_core::resource::ResourceSet,
+    allocated_nodelist: &'a str,
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
-    job_id: u32,
-    spec: &spur_core::job::JobSpec,
-    peer_nodes: &[String],
-    task_offset: u32,
-    target_node: &str,
-    allocated: &spur_core::resource::ResourceSet,
-    allocated_nodelist: &str,
+    params: &AgentDispatchParams<'_>,
 ) -> anyhow::Result<()> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
 
+    let spec = params.spec;
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -588,7 +596,7 @@ async fn dispatch_to_agent(
         priority: spec.priority.unwrap_or(0),
         reservation: spec.reservation.clone().unwrap_or_default(),
         dependency: spec.dependency.clone(),
-        nodelist: allocated_nodelist.to_string(),
+        nodelist: params.allocated_nodelist.to_string(),
         exclude: spec.exclude.clone().unwrap_or_default(),
         constraint: spec.constraint.clone().unwrap_or_default(),
         mpi: spec.mpi.clone().unwrap_or_default(),
@@ -634,18 +642,21 @@ async fn dispatch_to_agent(
 
     let response = client
         .launch_job(LaunchJobRequest {
-            job_id,
+            job_id: params.job_id,
             spec: Some(proto_spec),
-            allocated: Some(core_resource_to_proto(allocated)),
-            peer_nodes: peer_nodes.to_vec(),
-            task_offset,
-            target_node: target_node.to_string(),
+            allocated: Some(core_resource_to_proto(params.allocated)),
+            peer_nodes: params.peer_nodes.to_vec(),
+            task_offset: params.task_offset,
+            target_node: params.target_node.to_string(),
         })
         .await?;
 
     let inner = response.into_inner();
     if inner.success {
-        info!(job_id, "job dispatched to agent successfully");
+        info!(
+            job_id = params.job_id,
+            "job dispatched to agent successfully"
+        );
     } else {
         anyhow::bail!("agent rejected job: {}", inner.error);
     }
