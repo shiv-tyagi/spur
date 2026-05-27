@@ -929,6 +929,68 @@ listen_addr = "not-a-socket"
     }
 
     #[test]
+    fn test_load_hooks_config() {
+        let toml = r#"
+cluster_name = "test"
+
+[hooks]
+prolog = "/etc/spur/prolog.sh"
+epilog = "/etc/spur/epilog.sh"
+prolog_slurmctld = "/etc/spur/prolog_slurmctld.sh"
+epilog_slurmctld = "/etc/spur/epilog_slurmctld.sh"
+task_prolog = "/etc/spur/task_prolog.sh"
+task_epilog = "/etc/spur/task_epilog.sh"
+srun_prolog = "/etc/spur/srun_prolog.sh"
+srun_epilog = "/etc/spur/srun_epilog.sh"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.hooks.prolog.as_deref(), Some("/etc/spur/prolog.sh"));
+        assert_eq!(config.hooks.epilog.as_deref(), Some("/etc/spur/epilog.sh"));
+        assert_eq!(
+            config.hooks.prolog_slurmctld.as_deref(),
+            Some("/etc/spur/prolog_slurmctld.sh")
+        );
+        assert_eq!(
+            config.hooks.epilog_slurmctld.as_deref(),
+            Some("/etc/spur/epilog_slurmctld.sh")
+        );
+        assert_eq!(
+            config.hooks.task_prolog.as_deref(),
+            Some("/etc/spur/task_prolog.sh")
+        );
+        assert_eq!(
+            config.hooks.task_epilog.as_deref(),
+            Some("/etc/spur/task_epilog.sh")
+        );
+        assert_eq!(
+            config.hooks.srun_prolog.as_deref(),
+            Some("/etc/spur/srun_prolog.sh")
+        );
+        assert_eq!(
+            config.hooks.srun_epilog.as_deref(),
+            Some("/etc/spur/srun_epilog.sh")
+        );
+        // metrics section omitted — should keep defaults
+        assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn test_hooks_defaults() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.hooks.prolog.is_none());
+        assert!(config.hooks.epilog.is_none());
+        assert!(config.hooks.prolog_slurmctld.is_none());
+        assert!(config.hooks.epilog_slurmctld.is_none());
+        assert!(config.hooks.task_prolog.is_none());
+        assert!(config.hooks.task_epilog.is_none());
+        assert!(config.hooks.srun_prolog.is_none());
+        assert!(config.hooks.srun_epilog.is_none());
+        // hooks section omitted — metrics should keep defaults
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:6822");
+    }
+
+    #[test]
     fn test_load_config() {
         let toml = r#"
 cluster_name = "test-cluster"
