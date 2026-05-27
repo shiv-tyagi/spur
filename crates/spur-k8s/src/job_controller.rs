@@ -488,6 +488,9 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     state: final_state,
                     exit_code: final_exit_code,
                     message: final_message,
+                    drain_node: false,
+                    drain_reason: String::new(),
+                    reporting_node: String::new(),
                 };
                 if let Err(e) = ctrl.report_job_status(req).await {
                     error!(job_id, error = %e, "failed to report job status");

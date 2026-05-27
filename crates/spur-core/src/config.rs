@@ -83,6 +83,10 @@ pub struct SlurmConfig {
     /// OpenMetrics HTTP export (spurctld, default port 6822).
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Prolog/epilog hook scripts.
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -210,6 +214,31 @@ impl MetricsConfig {
             MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
         })
     }
+}
+
+/// Prolog and epilog hook script configuration.
+///
+/// All fields are optional — `None` means no hook is configured for that point.
+/// Paths must be fully qualified; no search path is set for security reasons.
+/// Hook lifecycle and failure semantics match Slurm.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    /// Script run on compute nodes before job launch (Slurm `Prolog`).
+    pub prolog: Option<String>,
+    /// Script run on compute nodes at job termination (Slurm `Epilog`).
+    pub epilog: Option<String>,
+    /// Script run on the controller at job allocation (Slurm `PrologSlurmctld`).
+    pub prolog_slurmctld: Option<String>,
+    /// Script run on the controller at job termination (Slurm `EpilogSlurmctld`).
+    pub epilog_slurmctld: Option<String>,
+    /// Script run on compute nodes before each job step (Slurm `TaskProlog`).
+    pub task_prolog: Option<String>,
+    /// Script run on compute nodes after each job step (Slurm `TaskEpilog`).
+    pub task_epilog: Option<String>,
+    /// Script run on the srun invocation node before step dispatch (Slurm `SrunProlog`).
+    pub srun_prolog: Option<String>,
+    /// Script run on the srun invocation node after step completion (Slurm `SrunEpilog`).
+    pub srun_epilog: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -897,6 +926,68 @@ listen_addr = "not-a-socket"
         )
         .unwrap();
         assert!(config.metrics.effective_listen_addr().is_err());
+    }
+
+    #[test]
+    fn test_load_hooks_config() {
+        let toml = r#"
+cluster_name = "test"
+
+[hooks]
+prolog = "/etc/spur/prolog.sh"
+epilog = "/etc/spur/epilog.sh"
+prolog_slurmctld = "/etc/spur/prolog_slurmctld.sh"
+epilog_slurmctld = "/etc/spur/epilog_slurmctld.sh"
+task_prolog = "/etc/spur/task_prolog.sh"
+task_epilog = "/etc/spur/task_epilog.sh"
+srun_prolog = "/etc/spur/srun_prolog.sh"
+srun_epilog = "/etc/spur/srun_epilog.sh"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.hooks.prolog.as_deref(), Some("/etc/spur/prolog.sh"));
+        assert_eq!(config.hooks.epilog.as_deref(), Some("/etc/spur/epilog.sh"));
+        assert_eq!(
+            config.hooks.prolog_slurmctld.as_deref(),
+            Some("/etc/spur/prolog_slurmctld.sh")
+        );
+        assert_eq!(
+            config.hooks.epilog_slurmctld.as_deref(),
+            Some("/etc/spur/epilog_slurmctld.sh")
+        );
+        assert_eq!(
+            config.hooks.task_prolog.as_deref(),
+            Some("/etc/spur/task_prolog.sh")
+        );
+        assert_eq!(
+            config.hooks.task_epilog.as_deref(),
+            Some("/etc/spur/task_epilog.sh")
+        );
+        assert_eq!(
+            config.hooks.srun_prolog.as_deref(),
+            Some("/etc/spur/srun_prolog.sh")
+        );
+        assert_eq!(
+            config.hooks.srun_epilog.as_deref(),
+            Some("/etc/spur/srun_epilog.sh")
+        );
+        // metrics section omitted — should keep defaults
+        assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn test_hooks_defaults() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.hooks.prolog.is_none());
+        assert!(config.hooks.epilog.is_none());
+        assert!(config.hooks.prolog_slurmctld.is_none());
+        assert!(config.hooks.epilog_slurmctld.is_none());
+        assert!(config.hooks.task_prolog.is_none());
+        assert!(config.hooks.task_epilog.is_none());
+        assert!(config.hooks.srun_prolog.is_none());
+        assert!(config.hooks.srun_epilog.is_none());
+        // hooks section omitted — metrics should keep defaults
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:6822");
     }
 
     #[test]

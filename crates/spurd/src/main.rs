@@ -13,7 +13,9 @@ mod seccomp;
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
+
+use spur_core::config::HooksConfig;
 
 use reporter::NodeReporter;
 
@@ -87,11 +89,27 @@ async fn main() -> anyhow::Result<()> {
         "spurd starting"
     );
 
+    // Load hooks config from spur.conf (best-effort: missing file is fine)
+    let hooks_config = match spur_core::config::SlurmConfig::load_from_file(&args.config) {
+        Ok(config) => {
+            info!(path = %args.config.display(), "loaded spur.conf");
+            config.hooks
+        }
+        Err(e) => {
+            warn!(
+                path = %args.config.display(),
+                error = %e,
+                "failed to load spur.conf, using default hooks config"
+            );
+            HooksConfig::default()
+        }
+    };
+
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
         "ROCm/spur",
         env!("CARGO_PKG_VERSION"),
-        true,  // check_on_startup (spurd doesn't load spur.conf)
+        true,
         false, // auto_update
         "stable",
         "/var/cache/spur",
@@ -145,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start agent gRPC server (receives job launches from spurctld)
-    let agent_service = agent_server::AgentService::new(reporter.clone());
+    let agent_service = agent_server::AgentService::new(reporter.clone(), hooks_config);
     agent_service.start_monitor(args.controller.clone());
 
     let addr = args.listen.parse()?;

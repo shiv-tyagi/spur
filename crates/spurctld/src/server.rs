@@ -522,10 +522,78 @@ impl SlurmController for ControllerService {
 
         if state.is_terminal() {
             let exit_code = req.exit_code;
-            self.cluster
-                .complete_job(req.job_id, exit_code, state)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            match self.cluster.complete_job(req.job_id, exit_code, state) {
+                Ok(()) => {
+                    // Run EpilogSlurmctld if configured (failure is logged, not fatal)
+                    if let Some(ref epilog_ctld) = self.cluster.config.hooks.epilog_slurmctld {
+                        let job = self.cluster.get_job(req.job_id);
+                        let ctx = spur_core::hooks::HookContext {
+                            job_id: req.job_id,
+                            work_dir: job
+                                .as_ref()
+                                .map(|j| j.spec.work_dir.clone())
+                                .unwrap_or_else(|| "/tmp".into()),
+                            uid: job.as_ref().map(|j| j.spec.uid).unwrap_or(0),
+                            gid: job.as_ref().map(|j| j.spec.gid).unwrap_or(0),
+                            partition: job
+                                .as_ref()
+                                .and_then(|j| j.spec.partition.clone())
+                                .unwrap_or_default(),
+                            nodelist: job
+                                .as_ref()
+                                .map(|j| j.allocated_nodes.join(","))
+                                .unwrap_or_default(),
+                            script_context: "epilog_slurmctld".into(),
+                            gpu_devices: Vec::new(),
+                            cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
+                            memory_mb: job
+                                .as_ref()
+                                .and_then(|j| j.spec.memory_per_node_mb)
+                                .unwrap_or(0),
+                        };
+                        if let Err(e) = spur_core::hooks::run_hook(epilog_ctld, &ctx).await {
+                            warn!(
+                                job_id = req.job_id,
+                                error = %e,
+                                "EpilogSlurmctld failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Multi-node jobs: non-first nodes may report after the job
+                    // is already terminal. Log and continue so drain requests
+                    // below are still processed.
+                    warn!(
+                        job_id = req.job_id,
+                        error = %e,
+                        "complete_job failed (likely duplicate report from multi-node job)"
+                    );
+                }
+            }
         }
+
+        // Process drain request regardless of whether complete_job succeeded
+        if req.drain_node && !req.reporting_node.is_empty() {
+            warn!(
+                node = %req.reporting_node,
+                reason = %req.drain_reason,
+                job_id = req.job_id,
+                "agent requested node drain"
+            );
+            if let Err(e) = self.cluster.update_node_state(
+                &req.reporting_node,
+                spur_core::node::NodeState::Drain,
+                Some(req.drain_reason),
+            ) {
+                warn!(
+                    node = %req.reporting_node,
+                    error = %e,
+                    "failed to drain node on agent request"
+                );
+            }
+        }
+
         Ok(Response::new(()))
     }
 

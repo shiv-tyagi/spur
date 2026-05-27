@@ -172,6 +172,39 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 continue;
             }
 
+            // Run PrologSlurmctld if configured
+            if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
+                let ctx = spur_core::hooks::HookContext {
+                    job_id: assignment.job_id,
+                    work_dir: job.spec.work_dir.clone(),
+                    uid: job.spec.uid,
+                    gid: job.spec.gid,
+                    partition: job.spec.partition.clone().unwrap_or_default(),
+                    nodelist: assignment.nodes.join(","),
+                    script_context: "prolog_slurmctld".into(),
+                    gpu_devices: Vec::new(),
+                    cpus: job.spec.cpus_per_task,
+                    memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
+                };
+                if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
+                    error!(
+                        job_id = assignment.job_id,
+                        error = %e,
+                        "PrologSlurmctld failed"
+                    );
+                    if job.spec.interactive {
+                        if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
+                            error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
+                        }
+                    } else {
+                        if let Err(re) = cluster.requeue_job(assignment.job_id) {
+                            error!(job_id = assignment.job_id, error = %re, "failed to requeue job after PrologSlurmctld failure");
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Dispatch job to ALL assigned nodes
             let job_id = assignment.job_id;
             let spec = job.spec.clone();
@@ -197,6 +230,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // Collect dispatch tasks to track success/failure
             let cluster_ref = cluster.clone();
             let dispatch_nodes = all_nodes.clone();
+            let allocated_nodelist = all_nodes.join(",");
             tokio::spawn(async move {
                 let mut successes = 0u32;
                 let mut failures = 0u32;
@@ -224,15 +258,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     let task_offset = node_idx as u32 * tasks_per_node;
                     let target_node = node_name.clone();
                     let allocated = per_node_alloc.clone();
+                    let allocated_nodelist = allocated_nodelist.clone();
                     set.spawn(async move {
                         dispatch_to_agent(
                             &agent_addr,
-                            job_id,
-                            &spec,
-                            &peer_addrs,
-                            task_offset,
-                            &target_node,
-                            &allocated,
+                            &AgentDispatchParams {
+                                job_id,
+                                spec: &spec,
+                                peer_nodes: &peer_addrs,
+                                task_offset,
+                                target_node: &target_node,
+                                allocated: &allocated,
+                                allocated_nodelist: &allocated_nodelist,
+                            },
                         )
                         .await
                     });
@@ -510,18 +548,25 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
     }
 }
 
+/// Parameters for dispatching a job to a single node agent.
+struct AgentDispatchParams<'a> {
+    job_id: u32,
+    spec: &'a spur_core::job::JobSpec,
+    peer_nodes: &'a [String],
+    task_offset: u32,
+    target_node: &'a str,
+    allocated: &'a spur_core::resource::ResourceSet,
+    allocated_nodelist: &'a str,
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
-    job_id: u32,
-    spec: &spur_core::job::JobSpec,
-    peer_nodes: &[String],
-    task_offset: u32,
-    target_node: &str,
-    allocated: &spur_core::resource::ResourceSet,
+    params: &AgentDispatchParams<'_>,
 ) -> anyhow::Result<()> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
 
+    let spec = params.spec;
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -551,7 +596,7 @@ async fn dispatch_to_agent(
         priority: spec.priority.unwrap_or(0),
         reservation: spec.reservation.clone().unwrap_or_default(),
         dependency: spec.dependency.clone(),
-        nodelist: spec.nodelist.clone().unwrap_or_default(),
+        nodelist: params.allocated_nodelist.to_string(),
         exclude: spec.exclude.clone().unwrap_or_default(),
         constraint: spec.constraint.clone().unwrap_or_default(),
         mpi: spec.mpi.clone().unwrap_or_default(),
@@ -597,18 +642,21 @@ async fn dispatch_to_agent(
 
     let response = client
         .launch_job(LaunchJobRequest {
-            job_id,
+            job_id: params.job_id,
             spec: Some(proto_spec),
-            allocated: Some(core_resource_to_proto(allocated)),
-            peer_nodes: peer_nodes.to_vec(),
-            task_offset,
-            target_node: target_node.to_string(),
+            allocated: Some(core_resource_to_proto(params.allocated)),
+            peer_nodes: params.peer_nodes.to_vec(),
+            task_offset: params.task_offset,
+            target_node: params.target_node.to_string(),
         })
         .await?;
 
     let inner = response.into_inner();
     if inner.success {
-        info!(job_id, "job dispatched to agent successfully");
+        info!(
+            job_id = params.job_id,
+            "job dispatched to agent successfully"
+        );
     } else {
         anyhow::bail!("agent rejected job: {}", inner.error);
     }
