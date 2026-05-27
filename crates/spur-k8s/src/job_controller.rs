@@ -440,19 +440,6 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
             };
 
             if should_report {
-                let final_state = {
-                    let tracker = ctx.pod_tracker.lock().await;
-                    if let Some(t) = tracker.get(&job_id) {
-                        if t.failed {
-                            4 // JOB_FAILED
-                        } else {
-                            state
-                        }
-                    } else {
-                        state
-                    }
-                };
-
                 let final_exit_code = {
                     let tracker = ctx.pod_tracker.lock().await;
                     tracker
@@ -462,8 +449,8 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 };
 
                 let final_message = {
-                    let mut tracker = ctx.pod_tracker.lock().await;
-                    let msg = tracker
+                    let tracker = ctx.pod_tracker.lock().await;
+                    tracker
                         .get(&job_id)
                         .map(|t| {
                             if t.failed && !t.message.is_empty() {
@@ -472,34 +459,78 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                                 format!("Pod {} {}", pod_name, phase)
                             }
                         })
-                        .unwrap_or_else(|| format!("Pod {} {}", pod_name, phase));
-                    // Clean up tracker for terminal jobs
-                    if final_state == 3 || final_state == 4 {
-                        tracker.remove(&job_id);
-                    }
-                    msg
+                        .unwrap_or_else(|| format!("Pod {} {}", pod_name, phase))
                 };
+
+                let spec_node_set = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.node_name.as_ref())
+                    .is_some_and(|n| !n.is_empty());
+
+                let Some(reporting_node) = resolve_reporting_node(&pod) else {
+                    error!(
+                        job_id,
+                        pod = %pod_name,
+                        phase,
+                        "cannot resolve reporting_node (spec.nodeName and spur.ai/target-node both missing)"
+                    );
+                    continue;
+                };
+
+                if !spec_node_set {
+                    warn!(
+                        job_id,
+                        pod = %pod_name,
+                        phase,
+                        node = %reporting_node,
+                        "spec.nodeName empty; using spur.ai/target-node label for reporting_node"
+                    );
+                }
 
                 info!(job_id, pod = %pod_name, phase, "reporting Pod completion to spurctld");
 
                 let mut ctrl = ctx.ctrl_client.lock().await;
+                let report_state =
+                    spur_core::job::JobState::completion_state_for_exit_code(final_exit_code);
                 let req = ReportJobStatusRequest {
                     job_id,
-                    state: final_state,
+                    state: report_state.to_proto_i32(),
                     exit_code: final_exit_code,
                     message: final_message,
                     drain_node: false,
                     drain_reason: String::new(),
-                    reporting_node: String::new(),
+                    reporting_node,
                 };
                 if let Err(e) = ctrl.report_job_status(req).await {
                     error!(job_id, error = %e, "failed to report job status");
+                } else if report_state.is_terminal() {
+                    ctx.pod_tracker.lock().await.remove(&job_id);
                 }
             }
         }
     }
 
     Ok(())
+}
+
+const TARGET_NODE_LABEL: &str = "spur.ai/target-node";
+
+/// Resolve the Spur node name for a terminal Pod completion report.
+fn resolve_reporting_node(pod: &Pod) -> Option<String> {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_ref())
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .or_else(|| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(TARGET_NODE_LABEL))
+                .filter(|n| !n.is_empty())
+                .cloned()
+        })
 }
 
 /// Extract failure details from a Failed pod's container statuses.
@@ -813,6 +844,55 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
+    }
+
+    // --- resolve_reporting_node ---
+
+    fn pod_with_node_and_label(spec_node: Option<&str>, label_node: Option<&str>) -> Pod {
+        use k8s_openapi::api::core::v1::PodSpec;
+        let mut labels = BTreeMap::new();
+        if let Some(n) = label_node {
+            labels.insert(TARGET_NODE_LABEL.to_string(), n.to_string());
+        }
+        Pod {
+            metadata: kube::api::ObjectMeta {
+                labels: if labels.is_empty() {
+                    None
+                } else {
+                    Some(labels)
+                },
+                ..Default::default()
+            },
+            spec: spec_node.map(|node_name| PodSpec {
+                node_name: Some(node_name.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_reporting_node_prefers_spec_node_name() {
+        let pod = pod_with_node_and_label(Some("worker1"), Some("worker2"));
+        assert_eq!(resolve_reporting_node(&pod), Some("worker1".into()));
+    }
+
+    #[test]
+    fn resolve_reporting_node_falls_back_to_target_node_label() {
+        let pod = pod_with_node_and_label(None, Some("worker2"));
+        assert_eq!(resolve_reporting_node(&pod), Some("worker2".into()));
+    }
+
+    #[test]
+    fn resolve_reporting_node_returns_none_when_both_missing() {
+        let pod = pod_with_node_and_label(None, None);
+        assert_eq!(resolve_reporting_node(&pod), None);
+    }
+
+    #[test]
+    fn resolve_reporting_node_ignores_empty_strings() {
+        let pod = pod_with_node_and_label(Some(""), Some("worker2"));
+        assert_eq!(resolve_reporting_node(&pod), Some("worker2".into()));
     }
 
     // --- extract_failure_details ---
