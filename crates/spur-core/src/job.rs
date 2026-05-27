@@ -71,6 +71,40 @@ impl JobState {
         matches!(self, Self::Running | Self::Completing | Self::Suspended)
     }
 
+    /// Per-node completion state implied by one exit code.
+    pub fn completion_state_for_exit_code(exit_code: i32) -> Self {
+        if exit_code == 0 {
+            Self::Completed
+        } else {
+            Self::Failed
+        }
+    }
+
+    /// Validate `ReportJobStatusRequest` terminal state against exit_code.
+    pub fn validate_completion_report_state(
+        reported: Self,
+        exit_code: i32,
+    ) -> Result<(), CompletionReportStateError> {
+        match reported {
+            Self::Completed | Self::Failed => {
+                let expected = Self::completion_state_for_exit_code(exit_code);
+                if reported == expected {
+                    Ok(())
+                } else {
+                    Err(CompletionReportStateError::InvalidStateForExitCode {
+                        reported,
+                        exit_code,
+                        expected,
+                    })
+                }
+            }
+            _ if reported.is_terminal() => {
+                Err(CompletionReportStateError::InvalidCompletionState { reported })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Every core variant, in proto discriminant order for iteration only.
     pub const ALL: [JobState; 10] = [
         Self::Pending,
@@ -404,6 +438,10 @@ pub struct Job {
     /// Component index within a heterogeneous job group (0 = first).
     #[serde(default)]
     pub het_group: Option<u32>,
+
+    /// Per-node exit codes reported while the job is in Completing.
+    #[serde(default)]
+    pub node_completions: HashMap<String, i32>,
 }
 
 impl Job {
@@ -438,7 +476,25 @@ impl Job {
             requeue_count: 0,
             het_job_id: None,
             het_group: None,
+            node_completions: HashMap::new(),
         }
+    }
+
+    /// Derive final job state and exit code from per-node completion reports.
+    pub fn derived_completion(node_completions: &HashMap<String, i32>) -> (JobState, i32) {
+        let exit_code = node_completions
+            .values()
+            .copied()
+            .filter(|c| *c != 0)
+            .max()
+            .unwrap_or(0);
+        let state = JobState::completion_state_for_exit_code(exit_code);
+        (state, exit_code)
+    }
+
+    pub fn all_nodes_completed(&self) -> bool {
+        !self.allocated_nodes.is_empty()
+            && self.node_completions.len() == self.allocated_nodes.len()
     }
 
     /// Compute the run time.
@@ -485,6 +541,47 @@ pub enum JobTransitionError {
     Invalid { from: JobState, to: JobState },
 }
 
+/// Errors from validating completion reports from agents/operators.
+#[derive(Debug, Error)]
+pub enum CompletionReportStateError {
+    #[error("invalid completion state {reported}; only COMPLETED or FAILED are accepted for completion reports")]
+    InvalidCompletionState { reported: JobState },
+
+    #[error(
+        "completion state {reported} does not match exit_code {exit_code}; expected {expected}"
+    )]
+    InvalidStateForExitCode {
+        reported: JobState,
+        exit_code: i32,
+        expected: JobState,
+    },
+}
+
+/// Errors from recording a per-node job completion report.
+#[derive(Debug, Error)]
+pub enum NodeCompleteError {
+    #[error("job {job_id} not found")]
+    JobNotFound { job_id: JobId },
+
+    #[error("node {node} is not allocated to job {job_id}")]
+    NodeNotAllocated { job_id: JobId, node: String },
+
+    #[error("raft propose failed: {source}")]
+    RaftPropose {
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl NodeCompleteError {
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::JobNotFound { .. } | Self::NodeNotAllocated { .. } => false,
+            Self::RaftPropose { .. } => true,
+        }
+    }
+}
+
 impl Job {
     /// Attempt a state transition, enforcing the state machine.
     pub fn transition(&mut self, to: JobState) -> Result<(), JobTransitionError> {
@@ -501,6 +598,7 @@ impl Job {
             (JobState::Running, JobState::Suspended) => true,
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
+            (JobState::Completing, JobState::Cancelled) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
             // Requeue transitions: terminal → Pending (for --requeue jobs)
@@ -556,6 +654,91 @@ mod tests {
 
         job.transition(JobState::Completed).unwrap();
         assert_eq!(job.state, JobState::Completed);
+        assert!(job.end_time.is_some());
+    }
+
+    #[test]
+    fn derived_completion_uses_worst_exit_code() {
+        let mut completions = HashMap::new();
+        completions.insert("n1".into(), 0);
+        completions.insert("n2".into(), 42);
+        let (state, code) = Job::derived_completion(&completions);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 42);
+
+        completions.insert("n2".into(), 0);
+        let (state, code) = Job::derived_completion(&completions);
+        assert_eq!(state, JobState::Completed);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn completion_state_for_exit_code_maps_expected_states() {
+        assert_eq!(
+            JobState::completion_state_for_exit_code(0),
+            JobState::Completed
+        );
+        assert_eq!(
+            JobState::completion_state_for_exit_code(42),
+            JobState::Failed
+        );
+        assert_eq!(
+            JobState::completion_state_for_exit_code(-1),
+            JobState::Failed
+        );
+    }
+
+    #[test]
+    fn validate_completion_report_state_accepts_aligned_pairs() {
+        assert!(JobState::validate_completion_report_state(JobState::Completed, 0).is_ok());
+        assert!(JobState::validate_completion_report_state(JobState::Failed, 7).is_ok());
+    }
+
+    #[test]
+    fn validate_completion_report_state_rejects_mismatch() {
+        let err = JobState::validate_completion_report_state(JobState::Completed, 9).unwrap_err();
+        assert!(matches!(
+            err,
+            CompletionReportStateError::InvalidStateForExitCode {
+                reported: JobState::Completed,
+                exit_code: 9,
+                expected: JobState::Failed
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_completion_report_state_rejects_other_terminal_states() {
+        let err = JobState::validate_completion_report_state(JobState::Cancelled, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            CompletionReportStateError::InvalidCompletionState {
+                reported: JobState::Cancelled
+            }
+        ));
+    }
+
+    #[test]
+    fn node_complete_error_retryable() {
+        assert!(!NodeCompleteError::JobNotFound { job_id: 1 }.retryable());
+        assert!(!NodeCompleteError::NodeNotAllocated {
+            job_id: 1,
+            node: "n1".into(),
+        }
+        .retryable());
+        assert!(NodeCompleteError::RaftPropose {
+            source: anyhow::anyhow!("test"),
+        }
+        .retryable());
+    }
+
+    #[test]
+    fn completing_to_cancelled() {
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completing).unwrap();
+        job.transition(JobState::Cancelled).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
         assert!(job.end_time.is_some());
     }
 

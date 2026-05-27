@@ -369,6 +369,9 @@ pub struct SchedulerConfig {
     /// Default job time limit (minutes), if not set per-partition.
     #[serde(default = "default_time_limit")]
     pub default_time_limit_minutes: u32,
+    /// Max seconds to wait in COMPLETING before force-finishing the job.
+    #[serde(default = "default_complete_wait")]
+    pub complete_wait_secs: u32,
 }
 
 fn default_scheduler_plugin() -> String {
@@ -383,6 +386,9 @@ fn default_halflife() -> u32 {
 fn default_time_limit() -> u32 {
     60
 }
+fn default_complete_wait() -> u32 {
+    300
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -392,6 +398,7 @@ impl Default for SchedulerConfig {
             max_jobs_per_cycle: 10000,
             fairshare_halflife_days: 14,
             default_time_limit_minutes: 60,
+            complete_wait_secs: 300,
         }
     }
 }

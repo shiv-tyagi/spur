@@ -34,6 +34,11 @@ pub enum WalOperation {
         exit_code: i32,
         state: JobState,
     },
+    JobNodeComplete {
+        job_id: JobId,
+        node_name: String,
+        exit_code: i32,
+    },
     JobPriorityChange {
         job_id: JobId,
         old_priority: u32,
