@@ -80,7 +80,9 @@ impl JobState {
         }
     }
 
-    /// Validate `ReportJobStatusRequest` terminal state against exit_code.
+    /// Validate `ReportJobStatusRequest.state` for per-node completion reports.
+    ///
+    /// Only `Completed` and `Failed` are valid; state must match `exit_code`.
     pub fn validate_completion_report_state(
         reported: Self,
         exit_code: i32,
@@ -98,10 +100,7 @@ impl JobState {
                     })
                 }
             }
-            _ if reported.is_terminal() => {
-                Err(CompletionReportStateError::InvalidCompletionState { reported })
-            }
-            _ => Ok(()),
+            _ => Err(CompletionReportStateError::InvalidCompletionState { reported }),
         }
     }
 
@@ -714,6 +713,28 @@ mod tests {
             err,
             CompletionReportStateError::InvalidCompletionState {
                 reported: JobState::Cancelled
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_completion_report_state_rejects_completing() {
+        let err = JobState::validate_completion_report_state(JobState::Completing, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            CompletionReportStateError::InvalidCompletionState {
+                reported: JobState::Completing
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_completion_report_state_rejects_running() {
+        let err = JobState::validate_completion_report_state(JobState::Running, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            CompletionReportStateError::InvalidCompletionState {
+                reported: JobState::Running
             }
         ));
     }

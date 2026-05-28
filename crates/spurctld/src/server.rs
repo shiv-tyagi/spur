@@ -521,16 +521,11 @@ impl SlurmController for ControllerService {
         let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
-        // `state` only gates whether this report enters the per-node completion
-        // path. The final job outcome is still derived from aggregated node
-        // exit codes in `Job::derived_completion`.
-        let completion_result = if state.is_terminal() {
+        // Non-empty `reporting_node` means a per-node completion report. The final
+        // job outcome is still derived from aggregated exit codes in
+        // `Job::derived_completion`.
+        let completion_result = if !req.reporting_node.is_empty() {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
-            if req.reporting_node.is_empty() {
-                return Err(Status::invalid_argument(
-                    "reporting_node is required for job completion reports",
-                ));
-            }
             Some(
                 self.cluster
                     .node_complete(req.job_id, &req.reporting_node, req.exit_code),
@@ -1564,6 +1559,20 @@ mod tests {
     #[test]
     fn completion_report_state_rejects_cancelled() {
         let err = validate_completion_report_state_for_rpc(JobState::Cancelled, 0).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid completion state"));
+    }
+
+    #[test]
+    fn completion_report_state_rejects_completing() {
+        let err = validate_completion_report_state_for_rpc(JobState::Completing, 0).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid completion state"));
+    }
+
+    #[test]
+    fn completion_report_state_rejects_running() {
+        let err = validate_completion_report_state_for_rpc(JobState::Running, 0).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid completion state"));
     }
