@@ -19,6 +19,49 @@ permissions:
   packages: write
 
 jobs:
+  mark-skipped:
+    name: Mark E2E skipped
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion != 'success'
+    permissions:
+      statuses: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/workflows/e2e.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Mark E2E statuses
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const text = fs.readFileSync('.github/workflows/e2e.yml', 'utf8');
+            const matches = [...text.matchAll(/^\s*STATUS_CONTEXT:\s*["']([^"']+)["']\s*$/gm)];
+            const contexts = [...new Set(matches.map((m) => m[1]))];
+
+            if (contexts.length === 0) {
+              core.setFailed('No STATUS_CONTEXT values found in .github/workflows/e2e.yml');
+              return;
+            }
+
+            const sha = '${{ github.event.workflow_run.head_sha }}';
+            const conclusion = '${{ github.event.workflow_run.conclusion }}';
+            const desc = conclusion === 'failure'
+              ? 'Skipped: CI did not pass'
+              : `Skipped: CI ${conclusion}`;
+
+            for (const ctx of contexts) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo, sha,
+                state: 'failure',
+                context: ctx,
+                description: desc,
+                target_url: '${{ github.event.workflow_run.html_url }}'
+              });
+            }
+
   bare-metal:
     name: Bare-Metal
     runs-on: [self-hosted, amd-aac02-rocm]
@@ -27,6 +70,7 @@ jobs:
       group: bare-metal-cluster
       queue: max
     env:
+      STATUS_CONTEXT: "E2E / Bare-Metal"
       BM_NODES: ${{ secrets.BM_NODES }}
       BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
       BM_REMOTE_BASE: /tmp/spur-bm-${{ github.run_id }}
@@ -40,7 +84,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: 'pending',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Bare-Metal'
+              context: '${{ env.STATUS_CONTEXT }}'
             });
 
       - name: Download release binaries
@@ -294,7 +338,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / Bare-Metal',
+              context: '${{ env.STATUS_CONTEXT }}',
               description: '${{ job.status }}'
             });
 
@@ -344,6 +388,7 @@ jobs:
       group: k8s-integration
       queue: max
     env:
+      STATUS_CONTEXT: "E2E / K8s"
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
       RUST_LOG: info
@@ -372,7 +417,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: 'pending',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / K8s'
+              context: '${{ env.STATUS_CONTEXT }}'
             });
 
       - name: Download K8s test binary
@@ -504,7 +549,7 @@ jobs:
               sha: '${{ github.event.workflow_run.head_sha }}',
               state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: 'E2E / K8s',
+              context: '${{ env.STATUS_CONTEXT }}',
               description: '${{ job.status }}'
             });
 

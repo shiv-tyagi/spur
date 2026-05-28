@@ -1,0 +1,45 @@
+# Sets E2E commit statuses to pending as soon as a PR is opened or updated.
+# Uses pull_request_target so fork PRs get write access to the Status API.
+# Never checks out or executes fork code — only reads e2e.yml from the base branch.
+name: Set E2E Pending
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  statuses: write
+  contents: read
+
+jobs:
+  set-pending:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/workflows/e2e.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Set E2E statuses to pending
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const text = fs.readFileSync('.github/workflows/e2e.yml', 'utf8');
+            const matches = [...text.matchAll(/^\s*STATUS_CONTEXT:\s*["']([^"']+)["']\s*$/gm)];
+            const contexts = [...new Set(matches.map((m) => m[1]))];
+
+            if (contexts.length === 0) {
+              core.setFailed('No STATUS_CONTEXT values found in .github/workflows/e2e.yml');
+              return;
+            }
+
+            const sha = context.payload.pull_request.head.sha;
+            for (const ctx of contexts) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo, sha,
+                state: 'pending',
+                context: ctx,
+                description: 'Waiting for CI to complete...'
+              });
+            }
