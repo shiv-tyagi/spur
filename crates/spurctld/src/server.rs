@@ -255,6 +255,76 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn suspend_job(
+        &self,
+        request: Request<SuspendJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.suspend_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward suspend_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        let job_id = req.job_id;
+        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
+        // precondition failure. Snapshot up-front for agent dispatch.
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        self.cluster
+            .suspend_job(job_id, &req.user)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
+        });
+        Ok(Response::new(()))
+    }
+
+    async fn resume_job(&self, request: Request<ResumeJobRequest>) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.resume_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward resume_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        let job_id = req.job_id;
+        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
+        // precondition failure. Allocation is retained across resume, so this
+        // up-front snapshot's allocated_nodes is still valid for agent dispatch.
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        self.cluster
+            .resume_job(job_id, &req.user)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
+        });
+        Ok(Response::new(()))
+    }
+
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
             let proxy = &self.leader_proxy;
