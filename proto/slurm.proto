@@ -280,6 +280,11 @@ service SlurmController {
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
+  // Admission token management
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
 
@@ -442,11 +447,13 @@ message RegisterAgentRequest {
   uint32 port = 5;           // Agent gRPC listen port
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
+  string join_token = 8;     // Admission token for token-based admission
 }
 
 message RegisterAgentResponse {
   bool accepted = 1;
   string message = 2;
+  string node_token = 3;
 }
 
 message HeartbeatRequest {
@@ -454,6 +461,7 @@ message HeartbeatRequest {
   uint32 cpu_load = 2;
   uint64 free_memory_mb = 3;
   repeated RunningJobStatus running_jobs = 4;
+  string node_token = 5;
 }
 
 message RunningJobStatus {
@@ -816,3 +824,35 @@ message ReservationInfo {
   string accounts = 5;
   string users = 6;
 }
+
+// ============================================================
+// Admission token management
+// ============================================================
+
+message CreateTokenRequest {
+  optional uint32 ttl_secs = 1;    // Token lifetime in seconds (0 or absent = no expiry)
+}
+
+message CreateTokenResponse {
+  string token = 1;      // Full <id>.<secret> token string (shown once)
+  string token_id = 2;   // Short ID for reference in list/revoke
+}
+
+message ListTokensRequest {}
+
+message ListTokensResponse {
+  repeated TokenInfo tokens = 1;
+}
+
+message TokenInfo {
+  string id = 1;
+  string created_at = 2;       // RFC 3339
+  string expires_at = 3;       // RFC 3339 or empty if no expiry
+  bool revoked = 4;
+}
+
+message RevokeTokenRequest {
+  string token_id = 1;
+}
+
+message RevokeTokenResponse {}

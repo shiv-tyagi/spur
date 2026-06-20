@@ -19,6 +19,9 @@ regex = { workspace = true }
 tracing = { workspace = true }
 prost-types = { workspace = true }
 jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
 whoami = "2"
 nix = { workspace = true }
 

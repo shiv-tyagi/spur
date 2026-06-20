@@ -91,6 +91,10 @@ pub struct SlurmConfig {
     /// Device discovery, CDI, and GRES configuration.
     #[serde(default)]
     pub devices: DevicesConfig,
+
+    /// Node admission control.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -725,6 +729,29 @@ pub struct DevicesGresEntry {
     pub links: Option<String>,
     #[serde(default)]
     pub flags: Vec<String>,
+}
+
+/// Node admission control configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionConfig {
+    #[serde(default)]
+    pub mode: AdmissionMode,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: AdmissionMode::Open,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AdmissionMode {
+    #[default]
+    Open,
+    Token,
 }
 
 impl SlurmConfig {
