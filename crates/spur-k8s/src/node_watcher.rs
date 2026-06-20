@@ -134,6 +134,7 @@ pub async fn run(
                         port: operator_grpc_port,
                         wg_pubkey: String::new(),
                         labels: std::collections::HashMap::new(),
+                        join_token: String::new(),
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {

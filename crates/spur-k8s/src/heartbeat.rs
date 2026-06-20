@@ -61,6 +61,7 @@ impl HeartbeatManager {
                             cpu_load: 0,
                             free_memory_mb: 0,
                             running_jobs: vec![],
+                            node_token: String::new(),
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -96,6 +97,7 @@ mod tests {
             port: 6818,
             wg_pubkey: String::new(),
             labels: std::collections::HashMap::new(),
+            join_token: String::new(),
         }
     }
 
