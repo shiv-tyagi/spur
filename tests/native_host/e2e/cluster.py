@@ -179,6 +179,7 @@ class SpurCluster:
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
+        self.agent_token: str | None = None
 
     # --- Lifecycle ---
 
@@ -216,17 +217,15 @@ class SpurCluster:
         """
         if not self.node_names:
             raise RuntimeError("provision() must be called before start()")
-        if kill_stale:
-            self._kill_daemons(use_sudo=False)
-            self._kill_daemons(use_sudo=True)
         self.agent_as_root = agent_as_root
         self.agent_labels = agent_labels or {}
-        self.config_overrides = config_overrides or {}
-        self._write_config()
-        self._start_controller()
-        time.sleep(2)
-        self._start_agents()
-        self._wait_all_idle(timeout=120)
+        if kill_stale:
+            self._kill_controller()
+            self._kill_agents(use_sudo=False)
+            self._kill_agents(use_sudo=True)  # best-effort for rootful
+        self.start_controller(config_overrides, kill_stale=False)
+        self.start_agents(kill_stale=False)
+        self.wait_ready()
         logger.info(
             "Cluster ready: %s (agent_as_root=%s)",
             self.node_names,
@@ -235,7 +234,37 @@ class SpurCluster:
 
     def stop(self):
         """Kill all daemons but keep the working directory intact."""
-        self._kill_daemons(use_sudo=self.agent_as_root)
+        self.stop_agents()
+        self.stop_controller()
+
+    def start_controller(self, config_overrides: dict | None = None, kill_stale: bool = True):
+        """Start only spurctld. Writes config and waits for it to be ready.
+
+        Use :meth:`start_agents` afterward to bring up agents separately.
+        """
+        if not self.node_names:
+            raise RuntimeError("provision() must be called first")
+        self.config_overrides = config_overrides or {}
+        if kill_stale:
+            self._kill_controller()
+        self._write_config()
+        self._start_controller()
+        time.sleep(2)
+
+    def start_agents(self, token: str | None = None, kill_stale: bool = True):
+        """Start spurd on all nodes, optionally with a join token."""
+        self.agent_token = token
+        if kill_stale:
+            self._kill_agents(use_sudo=self.agent_as_root)
+        self._start_agents()
+
+    def stop_controller(self):
+        """Kill spurctld only."""
+        self._kill_controller()
+
+    def stop_agents(self):
+        """Kill spurd on all nodes only."""
+        self._kill_agents(use_sudo=self.agent_as_root)
 
     def deploy(
         self,
@@ -671,9 +700,11 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         prefix = self._sudo_prefix() if use_sudo else ""
         node.exec_allow_fail(f"{prefix}pkill -f '{pattern}' 2>/dev/null || true")
 
-    def _kill_daemons(self, *, use_sudo: bool):
+    def _kill_controller(self):
+        self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
+
+    def _kill_agents(self, use_sudo: bool = False):
         for node in self.nodes:
-            self._pkill(node, f"{self.bin_dir}/spurctld", use_sudo=use_sudo)
             self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
 
     def _spurd_start_cmd(self, node_index: int) -> str:
@@ -691,13 +722,14 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         if labels:
             label_args = " ".join(f"--label '{k}={v}'" for k, v in labels.items())
             label_args = f" {label_args}"
+        token_arg = f" --token '{self.agent_token}'" if self.agent_token else ""
         return (
             f"nohup {spurd_bin} "
             f"-f '{self.etc_dir}/spur.conf' "
             f"--controller '{self.controller_addr}' "
             f"--listen '{agent_listen}' "
             f"--hostname '{hostname}' --address '{address}' --log-level info -D"
-            f"{label_args} "
+            f"{label_args}{token_arg} "
             f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"
         )
 
@@ -713,6 +745,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             )
 
     def _wait_all_idle(self, timeout: int):
+        self.wait_ready(timeout)
+
+    def wait_ready(self, timeout: int = 120):
+        """Poll sinfo until all provisioned nodes appear idle."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
