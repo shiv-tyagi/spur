@@ -7,6 +7,7 @@ mod fairshare_cache;
 mod metrics_server;
 mod raft;
 mod raft_server;
+mod rest;
 mod scheduler_loop;
 mod server;
 
@@ -195,6 +196,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if config.rest_api.enabled {
+        let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
+        let rest_cluster = cluster.clone();
+        let rest_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rest::serve(rest_addr, rest_cluster, rest_raft).await {
+                tracing::error!(error = %e, "REST API server failed");
+            }
+        });
+    }
+
     // Start gRPC server
     let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
@@ -238,6 +250,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         licenses: std::collections::HashMap::new(),
         update: Default::default(),
         metrics: Default::default(),
+        rest_api: Default::default(),
         hooks: Default::default(),
         devices: Default::default(),
     }

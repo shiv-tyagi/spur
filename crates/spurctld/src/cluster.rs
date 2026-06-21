@@ -2519,6 +2519,7 @@ mod tests {
             licenses: HashMap::new(),
             update: Default::default(),
             metrics: Default::default(),
+            rest_api: Default::default(),
             hooks: Default::default(),
             devices: Default::default(),
         }

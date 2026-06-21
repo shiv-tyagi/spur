@@ -84,6 +84,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// REST API (Slurm-compatible HTTP, default port 6820).
+    #[serde(default)]
+    pub rest_api: RestApiConfig,
+
     /// Prolog/epilog hook scripts.
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -217,6 +221,20 @@ impl MetricsConfig {
             MetricsBind::All => addr,
             MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
         })
+    }
+}
+
+/// REST API settings for spurctld (Slurm-compatible HTTP on a separate port).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestApiConfig {
+    /// When false, spurctld does not start the REST server.
+    #[serde(default = "default_true_fn")]
+    pub enabled: bool,
+}
+
+impl Default for RestApiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

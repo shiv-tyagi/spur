@@ -10,6 +10,9 @@ spec:
     - name: grpc
       port: 6817
       targetPort: 6817
+    - name: rest
+      port: 6820
+      targetPort: 6820
     - name: raft
       port: 6821
       targetPort: 6821
@@ -42,6 +45,8 @@ spec:
           ports:
             - containerPort: 6817
               name: grpc
+            - containerPort: 6820
+              name: rest
             - containerPort: 6821
               name: raft
           volumeMounts:
