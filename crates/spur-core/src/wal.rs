@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState};
 use crate::node::NodeState;
 use std::collections::HashMap;
@@ -102,6 +103,14 @@ pub enum WalOperation {
         name: String,
         set: HashMap<String, String>,
         remove: Vec<String>,
+    },
+
+    // Admission token operations
+    TokenCreate {
+        token: AdmissionToken,
+    },
+    TokenRevoke {
+        token_id: String,
     },
 }
 

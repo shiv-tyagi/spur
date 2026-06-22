@@ -52,6 +52,7 @@ pub struct ClusterManager {
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     license_pool: RwLock<HashMap<String, u64>>,
+    tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -74,6 +75,7 @@ impl ClusterManager {
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(1),
             license_pool: RwLock::new(license_pool),
+            tokens: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -841,6 +843,39 @@ impl ClusterManager {
         } else {
             false
         }
+    }
+
+    /// Create an admission token and persist via Raft.
+    pub fn create_token(
+        &self,
+        ttl_secs: Option<u32>,
+    ) -> anyhow::Result<(spur_core::admission::AdmissionToken, String)> {
+        let (token, full_string) = spur_core::admission::generate_token(ttl_secs);
+        self.propose(WalOperation::TokenCreate {
+            token: token.clone(),
+        })?;
+        Ok((token, full_string))
+    }
+
+    /// List all admission tokens (without secrets).
+    pub fn list_tokens(&self) -> Vec<spur_core::admission::AdmissionToken> {
+        self.tokens.read().values().cloned().collect()
+    }
+
+    /// Revoke an admission token by ID.
+    pub fn revoke_token(&self, token_id: &str) -> anyhow::Result<()> {
+        if !self.tokens.read().contains_key(token_id) {
+            anyhow::bail!("token not found: {}", token_id);
+        }
+        self.propose(WalOperation::TokenRevoke {
+            token_id: token_id.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Get a read-only reference to the token store for validation.
+    pub fn get_tokens(&self) -> HashMap<String, spur_core::admission::AdmissionToken> {
+        self.tokens.read().clone()
     }
 
     /// Get all nodes.
@@ -2206,6 +2241,14 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::TokenCreate { token } => {
+                self.tokens.write().insert(token.id.clone(), token.clone());
+            }
+            WalOperation::TokenRevoke { token_id } => {
+                if let Some(t) = self.tokens.write().get_mut(token_id) {
+                    t.revoked = true;
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -2221,6 +2264,8 @@ struct ClusterSnapshot {
     reservations: Vec<Reservation>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
+    #[serde(default)]
+    tokens: Vec<spur_core::admission::AdmissionToken>,
 }
 
 impl ClusterManager {
@@ -2268,6 +2313,7 @@ impl StateMachineApply for ClusterManager {
             reservations: self.reservations.read().clone(),
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
+            tokens: self.tokens.read().values().cloned().collect(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -2297,6 +2343,12 @@ impl StateMachineApply for ClusterManager {
             }
 
             *self.license_pool.write() = snap.license_pool;
+
+            let mut tokens = self.tokens.write();
+            tokens.clear();
+            for token in snap.tokens {
+                tokens.insert(token.id.clone(), token);
+            }
 
             self.next_job_id.store(next_id, Ordering::Relaxed);
 
@@ -2536,6 +2588,7 @@ mod tests {
             metrics: Default::default(),
             hooks: Default::default(),
             devices: Default::default(),
+            admission: Default::default(),
         }
     }
 

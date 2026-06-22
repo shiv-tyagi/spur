@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
@@ -20,6 +21,8 @@ pub struct NodeReporter {
     pub labels: HashMap<String, String>,
     pub free_memory_mb: AtomicU64,
     pub cpu_load: AtomicU64,
+    pub join_token: String,
+    node_token: RwLock<String>,
 }
 
 impl NodeReporter {
@@ -29,6 +32,7 @@ impl NodeReporter {
         resources: ResourceSet,
         node_address: spur_net::NodeAddress,
         labels: HashMap<String, String>,
+        join_token: String,
     ) -> Self {
         Self {
             hostname,
@@ -38,6 +42,8 @@ impl NodeReporter {
             labels,
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
+            join_token,
+            node_token: RwLock::new(String::new()),
         }
     }
 
@@ -56,12 +62,16 @@ impl NodeReporter {
                 port: self.node_address.port as u32,
                 wg_pubkey: String::new(),
                 labels: self.labels.clone(),
+                join_token: self.join_token.clone(),
             })
             .await
             .context("registration failed")?;
 
         let inner = resp.into_inner();
         if inner.accepted {
+            if !inner.node_token.is_empty() {
+                *self.node_token.write().unwrap() = inner.node_token;
+            }
             info!("registered with controller");
         } else {
             anyhow::bail!("controller rejected registration: {}", inner.message);
@@ -80,6 +90,7 @@ impl NodeReporter {
             let (load, free_mem) = read_system_metrics();
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
+            let current_token = self.node_token.read().unwrap().clone();
 
             match SlurmControllerClient::connect(self.controller_addr.clone()).await {
                 Ok(mut client) => {
@@ -89,6 +100,7 @@ impl NodeReporter {
                             cpu_load: load,
                             free_memory_mb: free_mem,
                             running_jobs: vec![],
+                            node_token: current_token,
                         })
                         .await
                     {

@@ -64,6 +64,10 @@ struct Args {
     #[arg(long = "label", value_parser = parse_label, env = "SPUR_NODE_LABELS")]
     labels: Vec<String>,
 
+    /// Admission join token for token-based node registration.
+    #[arg(long = "token", env = "SPUR_JOIN_TOKEN")]
+    token: Option<String>,
+
     /// Foreground mode
     #[arg(short = 'D', long)]
     foreground: bool,
@@ -187,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         resources,
         node_address,
         labels,
+        args.token.unwrap_or_default(),
     ));
 
     // Register with controller

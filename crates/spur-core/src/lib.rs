@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod accounting;
+pub mod admission;
 pub mod array;
 pub mod auth;
 pub mod config;

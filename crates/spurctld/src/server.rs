@@ -114,6 +114,40 @@ impl ControllerService {
         meta.insert(FORWARDED_HEADER, "true".parse().unwrap());
         meta
     }
+
+    /// Validate an admission token if token mode is enabled.
+    /// Returns the node_token JWT to include in the registration response,
+    /// or an empty string if admission mode is open.
+    #[allow(clippy::result_large_err)]
+    fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
+        use spur_core::config::AdmissionMode;
+
+        if !matches!(self.cluster.config.admission.mode, AdmissionMode::Token) {
+            return Ok(String::new());
+        }
+
+        if join_token.is_empty() {
+            return Err(Status::unauthenticated("admission token required"));
+        }
+
+        let (token_id, secret) = spur_core::admission::parse_token(join_token)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        let token_store = self.cluster.get_tokens();
+        spur_core::admission::validate_token(token_id, secret, &token_store)
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        let jwt_key = self
+            .cluster
+            .config
+            .auth
+            .jwt_key
+            .as_deref()
+            .unwrap_or("spur-default-key");
+
+        spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))
+    }
 }
 
 #[tonic::async_trait]
@@ -555,6 +589,8 @@ impl SlurmController for ControllerService {
 
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 
+        let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
+
         self.cluster
             .register_node(
                 req.hostname.clone(),
@@ -571,6 +607,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
             message: "registered".into(),
+            node_token: node_token_response,
         }))
     }
 
@@ -678,6 +715,29 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
+
+        if matches!(
+            self.cluster.config.admission.mode,
+            spur_core::config::AdmissionMode::Token
+        ) {
+            if req.node_token.is_empty() {
+                return Err(Status::unauthenticated("node token required"));
+            }
+            let jwt_key = self
+                .cluster
+                .config
+                .auth
+                .jwt_key
+                .as_deref()
+                .unwrap_or("spur-default-key");
+            let identity =
+                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            if identity.hostname != req.hostname {
+                return Err(Status::permission_denied("node token hostname mismatch"));
+            }
+        }
+
         if self
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
@@ -689,6 +749,82 @@ impl SlurmController for ControllerService {
                 req.hostname
             )))
         }
+    }
+
+    async fn create_token(
+        &self,
+        request: Request<CreateTokenRequest>,
+    ) -> Result<Response<CreateTokenResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    fwd.metadata_mut()
+                        .insert("x-forwarded", "true".parse().unwrap());
+                    return client.create_token(fwd).await;
+                }
+                Err(_) => return Err(status),
+            }
+        }
+
+        let req = request.into_inner();
+        let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
+
+        let (token, full_string) = self
+            .cluster
+            .create_token(ttl_secs)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CreateTokenResponse {
+            token: full_string,
+            token_id: token.id,
+        }))
+    }
+
+    async fn list_tokens(
+        &self,
+        _request: Request<ListTokensRequest>,
+    ) -> Result<Response<ListTokensResponse>, Status> {
+        use spur_proto::proto::TokenInfo;
+
+        let tokens = self.cluster.list_tokens();
+        let infos = tokens
+            .into_iter()
+            .map(|t| TokenInfo {
+                id: t.id,
+                created_at: t.created_at.to_rfc3339(),
+                expires_at: t.expires_at.map(|e| e.to_rfc3339()).unwrap_or_default(),
+                revoked: t.revoked,
+            })
+            .collect();
+
+        Ok(Response::new(ListTokensResponse { tokens: infos }))
+    }
+
+    async fn revoke_token(
+        &self,
+        request: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    fwd.metadata_mut()
+                        .insert("x-forwarded", "true".parse().unwrap());
+                    return client.revoke_token(fwd).await;
+                }
+                Err(_) => return Err(status),
+            }
+        }
+
+        let req = request.into_inner();
+        self.cluster
+            .revoke_token(&req.token_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        Ok(Response::new(RevokeTokenResponse {}))
     }
 
     async fn get_job_steps(

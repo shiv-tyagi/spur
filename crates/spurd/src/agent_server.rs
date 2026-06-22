@@ -1589,6 +1589,7 @@ mod tests {
                 source: spur_net::AddressSource::Static,
             },
             std::collections::HashMap::new(),
+            String::new(),
         ))
     }
 

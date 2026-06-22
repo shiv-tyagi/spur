@@ -240,5 +240,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         metrics: Default::default(),
         hooks: Default::default(),
         devices: Default::default(),
+        admission: Default::default(),
     }
 }
