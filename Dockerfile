@@ -51,7 +51,7 @@ RUN echo "=== Required GLIBC versions ===" && \
         echo "  ${bin}: requires ${MAX:-none}"; \
     done
 
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -64,8 +64,12 @@ COPY --from=builder /build/target/release/spurd /usr/local/bin/
 COPY --from=builder /build/target/release/spurdbd /usr/local/bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
 
+RUN groupadd --gid 1001 spur && useradd --uid 1001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
+USER spur
+
 # Multi-binary image: Kubernetes manifests must set container command per workload
-# (e.g. spurctld, spur-k8s-operator, spurd). No default ENTRYPOINT.
+# (e.g. spurctld, spur-k8s-operator, spurd). Workloads that need root (e.g. spurd
+# for seccomp/Landlock) should override with securityContext.runAsUser: 0.
 
 FROM scratch AS dist
 COPY --from=builder /build/target/release/spur /bin/
