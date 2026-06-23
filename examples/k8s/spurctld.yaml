@@ -35,6 +35,8 @@ spec:
       labels:
         app: spurctld
     spec:
+      securityContext:
+        fsGroup: 1001
       containers:
         - name: spurctld
           image: spur:latest

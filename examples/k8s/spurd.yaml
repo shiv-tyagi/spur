@@ -30,6 +30,7 @@ spec:
             - containerPort: 6816
               name: grpc
           securityContext:
+            runAsUser: 0
             privileged: true
           volumeMounts:
             - name: spool
