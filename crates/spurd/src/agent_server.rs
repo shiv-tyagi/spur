@@ -745,18 +745,6 @@ impl SlurmAgent for AgentService {
             .map(|a| a.cpu_ids.clone())
             .unwrap_or_default();
 
-        // Resolve stdout/stderr paths
-        let stdout_path = if spec.stdout_path.is_empty() {
-            format!("{}/spur-{}.out", work_dir, job_id)
-        } else {
-            spec.stdout_path.clone()
-        };
-        let stderr_path = if spec.stderr_path.is_empty() {
-            format!("{}/spur-{}.out", work_dir, job_id)
-        } else {
-            spec.stderr_path.clone()
-        };
-
         // Build container launch config if this is a containerized job
         let container_launch = if !spec.container_image.is_empty() {
             Some(executor::ContainerLaunchConfig {
@@ -772,8 +760,8 @@ impl SlurmAgent for AgentService {
             script: launch_script,
             work_dir: work_dir.clone(),
             environment: env,
-            stdout_path,
-            stderr_path,
+            stdout_path: spec.stdout_path.clone(),
+            stderr_path: spec.stderr_path.clone(),
             cpus: spec.cpus_per_task.max(1),
             memory_mb: spec.memory_per_node_mb,
             gpu_devices: allocated_device_ids,
@@ -793,17 +781,17 @@ impl SlurmAgent for AgentService {
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
-            Ok(running_job) => {
+            Ok(result) => {
                 let mut jobs = self.running.lock().await;
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 jobs.insert(
                     job_id,
                     TrackedJob {
-                        job: running_job,
+                        job: result.job,
                         rootfs_mode: rootfs_mode.clone(),
                         allocation: alloc_result,
-                        stdout_path: launch_cfg.stdout_path,
-                        stderr_path: launch_cfg.stderr_path,
+                        stdout_path: result.stdout_path,
+                        stderr_path: result.stderr_path,
                         has_pid_namespace: nix::unistd::geteuid().is_root(),
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,

@@ -74,6 +74,12 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
 }
 
+pub struct LaunchResult {
+    pub job: RunningJob,
+    pub stdout_path: String,
+    pub stderr_path: String,
+}
+
 /// A running job process — either a tokio-managed child or a raw-forked container.
 pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
@@ -196,7 +202,7 @@ impl RunningJob {
 pub async fn launch_job(
     cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
-) -> Result<RunningJob, LaunchError> {
+) -> Result<LaunchResult, LaunchError> {
     // Run prolog before anything else
     if let Some(ref prolog) = cfg.prolog_script {
         let ctx = spur_core::hooks::HookContext {
@@ -224,7 +230,7 @@ pub async fn launch_job(
 async fn spawn_job_process(
     cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
-) -> anyhow::Result<RunningJob> {
+) -> anyhow::Result<LaunchResult> {
     let JobLaunchConfig {
         job_id,
         ref script,
@@ -358,7 +364,7 @@ async fn spawn_job_process(
 
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {
-        return launch_container_job(
+        let job = launch_container_job(
             cfg,
             ctn,
             &env,
@@ -366,7 +372,12 @@ async fn spawn_job_process(
             &stdout_resolved,
             &stderr_resolved,
         )
-        .await;
+        .await?;
+        return Ok(LaunchResult {
+            job,
+            stdout_path: stdout_resolved,
+            stderr_path: stderr_resolved,
+        });
     }
 
     // --- Non-container jobs: existing tokio::Command path ---
@@ -520,7 +531,11 @@ async fn spawn_job_process(
         "job process spawned"
     );
 
-    Ok(RunningJob::Managed { child, cgroup_path })
+    Ok(LaunchResult {
+        job: RunningJob::Managed { child, cgroup_path },
+        stdout_path: stdout_resolved,
+        stderr_path: stderr_resolved,
+    })
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
