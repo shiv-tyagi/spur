@@ -175,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
         scheduler_loop::run(sched_cluster, sched_raft).await;
     });
 
-    // Start node health checker (90s timeout, only on leader).
+    // Start node health checker (only on leader).
+    let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
@@ -185,7 +186,16 @@ async fn main() -> anyhow::Result<()> {
             if !health_raft.is_leader() {
                 continue;
             }
-            health_cluster.check_node_health(90);
+            let evicted = health_cluster.check_node_health(hb_timeout);
+            for fin in &evicted {
+                if let Some(job) = health_cluster.get_job(fin.job_id) {
+                    let c = health_cluster.clone();
+                    tokio::spawn(async move {
+                        crate::scheduler_loop::send_cancel_to_agents(&c, &job, 9).await;
+                    });
+                }
+            }
+            health_cluster.complete_evicted_steps(&evicted);
         }
     });
 

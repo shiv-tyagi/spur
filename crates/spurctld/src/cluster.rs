@@ -334,9 +334,7 @@ impl ClusterManager {
             exit_code: -1,
             state: JobState::Deadline,
         })?;
-        if let Some(f) = resp.job_finalized {
-            self.run_job_finalized_side_effects(f);
-        }
+        self.run_all_finalized_side_effects(&resp);
 
         info!(job_id, "job deadline passed — transitioned to DEADLINE");
         Ok(())
@@ -362,9 +360,7 @@ impl ClusterManager {
             exit_code: -1,
             state: JobState::Cancelled,
         })?;
-        if let Some(f) = resp.job_finalized {
-            self.run_job_finalized_side_effects(f);
-        }
+        self.run_all_finalized_side_effects(&resp);
 
         info!(job_id, "job cancelled");
         Ok(())
@@ -536,8 +532,8 @@ impl ClusterManager {
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
-        if let Some(f) = resp.job_finalized {
-            self.run_job_finalized_side_effects(f);
+        self.run_all_finalized_side_effects(&resp);
+        if let Some(f) = resp.jobs_finalized.first() {
             return Ok(NodeCompleteResult::AllDone {
                 state: f.state,
                 exit_code: f.exit_code,
@@ -577,9 +573,7 @@ impl ClusterManager {
             exit_code,
             state,
         })?;
-        if let Some(f) = resp.job_finalized {
-            self.run_job_finalized_side_effects(f);
-        }
+        self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
         Ok(())
@@ -588,6 +582,12 @@ impl ClusterManager {
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
+    }
+
+    fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
+        for f in &resp.jobs_finalized {
+            self.run_job_finalized_side_effects(*f);
+        }
     }
 
     fn run_epilog_slurmctld(&self, job_id: JobId) {
@@ -1063,16 +1063,18 @@ impl ClusterManager {
 
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
-    pub fn check_node_health(&self, timeout_secs: u64) {
+    /// Returns finalized jobs from eviction so callers can send cancel RPCs.
+    pub fn check_node_health(&self, timeout_secs: u64) -> Vec<JobFinalized> {
         let actions = {
             let nodes = self.nodes.read();
             let refs: Vec<&Node> = nodes.values().collect();
             evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
-        self.apply_health_actions(actions);
+        self.apply_health_actions(actions)
     }
 
-    fn apply_health_actions(&self, actions: Vec<HealthAction>) {
+    fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
+        let mut evicted = Vec::new();
         for action in actions {
             match action {
                 HealthAction::MarkDown {
@@ -1081,14 +1083,21 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
-                        name,
+                    match self.propose(WalOperation::NodeStateChange {
+                        name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
                         reason: Some("Not responding".into()),
                         admin_locked,
                     }) {
-                        warn!(error = %e, "failed to propose node DOWN");
+                        Ok(resp) => {
+                            self.run_all_finalized_side_effects(&resp);
+                            evicted.extend(resp.jobs_finalized);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to propose node DOWN");
+                            continue;
+                        }
                     }
                 }
                 HealthAction::Recover { name, old_state } => {
@@ -1105,6 +1114,85 @@ impl ClusterManager {
                 }
             }
         }
+        evicted
+    }
+
+    /// Drain a node: stop scheduling new jobs on it. Running jobs finish naturally.
+    /// Returns (actual_state, running_job_count).
+    pub fn drain_node(
+        &self,
+        name: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<(NodeState, u32)> {
+        let (old_state, running_count) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+            let jobs = self.jobs.read();
+            let count = jobs
+                .values()
+                .filter(|j| {
+                    matches!(
+                        j.state,
+                        JobState::Running | JobState::Completing | JobState::Suspended
+                    ) && j.allocated_nodes.iter().any(|n| n == name)
+                })
+                .count() as u32;
+            (node.state, count)
+        };
+        let target_state = if running_count > 0 {
+            NodeState::Draining
+        } else {
+            NodeState::Drain
+        };
+        self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state,
+            new_state: target_state,
+            reason,
+            admin_locked: true,
+        })?;
+        info!(node = %name, state = %target_state, "node drain requested");
+        Ok((target_state, running_count))
+    }
+
+    /// Remove a node from the cluster. If `force`, evict running jobs first.
+    /// Returns finalized jobs from eviction so callers can send cancel RPCs.
+    pub fn remove_node(
+        &self,
+        name: &str,
+        force: bool,
+        reason: Option<String>,
+    ) -> anyhow::Result<Vec<JobFinalized>> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node '{}' not found", name);
+            }
+        }
+        if !force {
+            let jobs = self.jobs.read();
+            let has_running = jobs.values().any(|j| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.allocated_nodes.iter().any(|n| n == name)
+            });
+            if has_running {
+                anyhow::bail!(
+                    "node '{}' has running jobs; use --force to evict them",
+                    name
+                );
+            }
+        }
+
+        let resp = self.propose(WalOperation::NodeRemove {
+            name: name.to_string(),
+            reason,
+        })?;
+        self.run_all_finalized_side_effects(&resp);
+        Ok(resp.jobs_finalized)
     }
 
     /// Create a job step.
@@ -1409,9 +1497,7 @@ impl ClusterManager {
                 state: JobState::Cancelled,
             }) {
                 Ok(resp) => {
-                    if let Some(f) = resp.job_finalized {
-                        self.run_job_finalized_side_effects(f);
-                    }
+                    self.run_all_finalized_side_effects(&resp);
                     info!(job_id = id, "job cancelled: dependency never satisfied");
                     cancelled.push(id);
                 }
@@ -1831,6 +1917,14 @@ impl ClusterManager {
         // job leaving the running set frees its licenses automatically.
     }
 
+    /// Finalize steps for all evicted jobs returned by remove_node / health check.
+    pub fn complete_evicted_steps(&self, evicted: &[JobFinalized]) {
+        let now = Utc::now();
+        for fin in evicted {
+            self.complete_job_steps(&fin.job_id, fin.exit_code, now);
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
         let raft = self
@@ -1843,6 +1937,90 @@ impl ClusterManager {
         })
         .map(|res| res.data)
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
+    }
+
+    /// Evict a single job by ID: transition to NodeFail, then free its
+    /// allocations on every node it spans. Transition is validated first
+    /// so allocations are never freed for a job that can't be evicted.
+    fn evict_job(
+        job_id: JobId,
+        jobs: &mut HashMap<JobId, Job>,
+        nodes: &mut HashMap<String, Node>,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> Option<JobFinalized> {
+        let job = jobs.get_mut(&job_id)?;
+
+        if let Some(since) = job.suspended_at.take() {
+            job.suspended_secs += (timestamp - since).num_seconds().max(0);
+        }
+        if let Err(e) = job.transition(JobState::NodeFail) {
+            warn!(job_id, error = %e, "evict: invalid transition to NodeFail");
+            return None;
+        }
+        job.exit_code = Some(-1);
+        job.end_time = Some(timestamp);
+        job.pending_reason = PendingReason::NodeDown;
+        job.node_completions.clear();
+
+        let alloc_nodes = job.allocated_nodes.clone();
+        if let Some(ref total) = job.allocated_resources {
+            let node_count = alloc_nodes.len().max(1) as u32;
+            for alloc_node in &alloc_nodes {
+                if let Some(node) = nodes.get_mut(alloc_node) {
+                    let slice = job
+                        .per_node_alloc
+                        .get(alloc_node)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            ResourceAllocations::with_scalar(
+                                total.cpus / node_count,
+                                total.memory_mb / node_count as u64,
+                            )
+                        });
+                    node.alloc_resources.subtract(&slice);
+                    node.update_state_from_alloc();
+                    if node.state == NodeState::Draining
+                        && node.alloc_resources.cpus == 0
+                        && !node.alloc_resources.has_devices()
+                    {
+                        node.state = NodeState::Drain;
+                    }
+                }
+            }
+        }
+
+        Some(JobFinalized {
+            job_id,
+            state: JobState::NodeFail,
+            exit_code: -1,
+        })
+    }
+
+    /// Fail all running/completing/suspended jobs on a node, releasing
+    /// allocations on **every** node each job spans.
+    fn evict_jobs_on_node(
+        node_name: &str,
+        jobs: &mut HashMap<JobId, Job>,
+        nodes: &mut HashMap<String, Node>,
+        timestamp: chrono::DateTime<Utc>,
+        response: &mut ClientResponse,
+    ) {
+        let affected: Vec<JobId> = jobs
+            .iter()
+            .filter(|(_, j)| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.allocated_nodes.iter().any(|n| n == node_name)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+
+        for jid in affected {
+            if let Some(fin) = Self::evict_job(jid, jobs, nodes, timestamp) {
+                response.jobs_finalized.push(fin);
+            }
+        }
     }
 
     /// Apply a WalOperation to in-memory state.
@@ -2063,11 +2241,11 @@ impl ClusterManager {
                     self.complete_job_steps(job_id, final_exit, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
                     return ClientResponse {
-                        job_finalized: Some(JobFinalized {
+                        jobs_finalized: vec![JobFinalized {
                             job_id: *job_id,
                             state: final_state,
                             exit_code: final_exit,
-                        }),
+                        }],
                     };
                 }
             }
@@ -2092,7 +2270,7 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
                     if state.is_terminal() {
-                        response.job_finalized = Some(JobFinalized {
+                        response.jobs_finalized.push(JobFinalized {
                             job_id: *job_id,
                             state: *state,
                             exit_code: *exit_code,
@@ -2272,6 +2450,9 @@ impl ClusterManager {
                     node.state_reason = reason.clone();
                     node.admin_locked = *admin_locked;
                 }
+                if *new_state == NodeState::Down {
+                    Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+                }
             }
             WalOperation::NodeLabelsUpdate { name, set, remove } => {
                 if let Some(node) = nodes.get_mut(name) {
@@ -2307,6 +2488,24 @@ impl ClusterManager {
                         }
                     }
                 }
+            }
+            WalOperation::NodeRemove { name, reason } => {
+                Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+                if let Some(node) = nodes.get(name) {
+                    if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
+                        warn!(
+                            node = %name,
+                            reason = reason.as_deref().unwrap_or(""),
+                            "removing node with nonzero allocations"
+                        );
+                    }
+                }
+                nodes.remove(name);
+                info!(
+                    node = %name,
+                    reason = reason.as_deref().unwrap_or(""),
+                    "node removed from cluster"
+                );
             }
             WalOperation::TokenCreate { token } => {
                 self.tokens.write().insert(token.id.clone(), token.clone());
@@ -3662,7 +3861,7 @@ mod tests {
             exit_code: 0,
             signal: 0,
         });
-        assert!(r1.job_finalized.is_none());
+        assert!(r1.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -3671,7 +3870,10 @@ mod tests {
             exit_code: 0,
             signal: 0,
         });
-        let f = r2.job_finalized.expect("last node should finalize");
+        let f = r2
+            .jobs_finalized
+            .first()
+            .expect("last node should finalize");
         assert_eq!(f.job_id, 1);
         assert_eq!(f.state, JobState::Completed);
         assert_eq!(f.exit_code, 0);
@@ -3706,7 +3908,10 @@ mod tests {
             exit_code: 0,
             state: JobState::Completed,
         });
-        let f = resp.job_finalized.expect("JobComplete should finalize");
+        let f = resp
+            .jobs_finalized
+            .first()
+            .expect("JobComplete should finalize");
         assert_eq!(f.job_id, 1);
         assert_eq!(f.state, JobState::Completed);
         assert_eq!(f.exit_code, 0);
@@ -3740,9 +3945,10 @@ mod tests {
             exit_code: 0,
             state: JobState::Completed,
         });
-        first
-            .job_finalized
-            .expect("first JobComplete should finalize");
+        assert!(
+            !first.jobs_finalized.is_empty(),
+            "first JobComplete should finalize"
+        );
         let node = cm.get_node("worker1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
         assert_eq!(node.alloc_resources.memory_mb, 0);
@@ -3752,7 +3958,7 @@ mod tests {
             exit_code: -1,
             state: JobState::Cancelled,
         });
-        assert!(second.job_finalized.is_none());
+        assert!(second.jobs_finalized.is_empty());
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completed);
@@ -5844,5 +6050,371 @@ mod tests {
             result.is_ok(),
             "array job submission should trigger scheduler notification"
         );
+    }
+
+    // ---- Node deregistration tests ----
+
+    fn start_job_on(cm: &ClusterManager, id: JobId, node: &str) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: vec![node.into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_state_change_to_down_evicts_running_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("evict-me"));
+        start_job_on(&cm, id, "n1");
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("heartbeat timeout".into()),
+            admin_locked: false,
+        });
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].job_id, id);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.exit_code, Some(-1));
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_state_change_to_down_no_jobs_is_clean() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: None,
+            admin_locked: false,
+        });
+        assert!(resp.jobs_finalized.is_empty());
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_remove_deletes_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        assert!(cm.get_node("n1").is_some());
+
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: Some("decommission".into()),
+        });
+        assert!(cm.get_node("n1").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_remove_evicts_and_deletes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        let resp = cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: None,
+        });
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+        assert!(cm.get_node("n1").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_node_sets_draining_with_running_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("drain-job"));
+        start_job_on(&cm, id, "n1");
+
+        cm.drain_node("n1", Some("maintenance".into())).unwrap();
+        wait_for("n1 draining", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Draining)
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.admin_locked);
+        assert_eq!(node.state_reason.as_deref(), Some("maintenance"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_node_sets_drain_without_running_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", None).unwrap();
+        wait_for("n1 drain", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_node_rejects_running_without_force() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        let err = cm.remove_node("n1", false, None);
+        assert!(err.is_err());
+        assert!(cm.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_node_force_evicts_and_removes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        start_job_on(&cm, id, "n1");
+
+        cm.remove_node("n1", true, Some("bad node".into())).unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multinode_eviction_frees_all_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let id = submit_and_wait(&cm, basic_spec("multi"));
+
+        let alloc = scalar_alloc(2, 2000);
+        let per_node = per_node_for(&["n1", "n2"], scalar_alloc(1, 1000));
+        cm.start_job(id, vec!["n1".into(), "n2".into()], alloc, per_node)
+            .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
+
+        let evicted = cm
+            .remove_node("n1", true, Some("evict test".into()))
+            .unwrap();
+        wait_for("n1 removed", || cm.get_node("n1").is_none());
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].job_id, id);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
+
+        let n2 = cm.get_node("n2").unwrap();
+        assert_eq!(
+            n2.alloc_resources.cpus, 0,
+            "peer node n2 must have allocations freed"
+        );
+        assert_eq!(n2.alloc_resources.memory_mb, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_to_drain_on_last_job_complete() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("drain-job"));
+        start_job_on(&cm, id, "n1");
+
+        cm.drain_node("n1", None).unwrap();
+        wait_for("n1 draining", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Draining)
+        });
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: id,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+    }
+
+    // --- Direct evict_job unit tests ---
+
+    fn make_running_job(job_id: JobId, nodes: &[&str], cpus_per_node: u32) -> Job {
+        let mut spec = basic_spec("evict-test");
+        spec.cpus_per_task = cpus_per_node;
+        let mut job = Job::new(job_id, spec);
+        job.state = JobState::Running;
+        job.start_time = Some(Utc::now());
+        let node_list: Vec<String> = nodes.iter().map(|n| (*n).to_string()).collect();
+        let total_cpus = cpus_per_node * nodes.len() as u32;
+        job.allocated_nodes = node_list;
+        job.allocated_resources = Some(ResourceAllocations::with_scalar(total_cpus, 0));
+        job.per_node_alloc = nodes
+            .iter()
+            .map(|n| {
+                (
+                    (*n).to_string(),
+                    ResourceAllocations::with_scalar(cpus_per_node, 0),
+                )
+            })
+            .collect();
+        job
+    }
+
+    fn make_test_node(name: &str, total_cpus: u32, alloc_cpus: u32) -> Node {
+        let mut node = Node::new(
+            name.into(),
+            ResourceSet {
+                cpus: total_cpus,
+                ..Default::default()
+            },
+        );
+        node.state = if alloc_cpus > 0 {
+            NodeState::Allocated
+        } else {
+            NodeState::Idle
+        };
+        node.alloc_resources = ResourceAllocations::with_scalar(alloc_cpus, 0);
+        node
+    }
+
+    #[test]
+    fn evict_job_returns_none_for_missing_job() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let result = ClusterManager::evict_job(999, &mut jobs, &mut nodes, Utc::now());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn evict_job_transitions_running_to_nodefail() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        jobs.insert(1, make_running_job(1, &["n1"], 2));
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+
+        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        assert_eq!(fin.job_id, 1);
+        assert_eq!(fin.state, JobState::NodeFail);
+        assert_eq!(fin.exit_code, -1);
+
+        let job = &jobs[&1];
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.exit_code, Some(-1));
+        assert!(job.end_time.is_some());
+        assert_eq!(job.pending_reason, PendingReason::NodeDown);
+    }
+
+    #[test]
+    fn evict_job_frees_allocations_on_all_nodes() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        jobs.insert(1, make_running_job(1, &["n1", "n2"], 2));
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+        nodes.insert("n2".into(), make_test_node("n2", 4, 2));
+
+        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+
+        assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
+        assert_eq!(nodes["n2"].alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn evict_job_returns_none_for_terminal_job() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let mut job = make_running_job(1, &["n1"], 2);
+        job.state = JobState::Completed;
+        jobs.insert(1, job);
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+
+        let result = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn evict_job_finalizes_suspended_time() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let suspended_at = Utc::now() - chrono::Duration::seconds(30);
+        let mut job = make_running_job(1, &["n1"], 2);
+        job.state = JobState::Suspended;
+        job.suspended_at = Some(suspended_at);
+        job.suspended_secs = 10;
+        jobs.insert(1, job);
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+
+        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+
+        let job = &jobs[&1];
+        assert!(job.suspended_at.is_none());
+        assert!(job.suspended_secs >= 40, "should accumulate ~30s more");
+    }
+
+    #[test]
+    fn evict_job_transitions_completing_to_nodefail() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let mut job = make_running_job(1, &["n1"], 2);
+        job.state = JobState::Completing;
+        jobs.insert(1, job);
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+
+        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        assert_eq!(fin.state, JobState::NodeFail);
+        assert_eq!(jobs[&1].state, JobState::NodeFail);
+        assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn evict_job_transitions_draining_node_to_drain() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        jobs.insert(1, make_running_job(1, &["n1"], 2));
+        let mut node = make_test_node("n1", 4, 2);
+        node.state = NodeState::Draining;
+        nodes.insert("n1".into(), node);
+
+        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+
+        assert_eq!(nodes["n1"].state, NodeState::Drain);
     }
 }

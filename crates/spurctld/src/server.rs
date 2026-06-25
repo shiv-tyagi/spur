@@ -115,6 +115,17 @@ impl ControllerService {
         meta
     }
 
+    fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
+        for fin in evicted {
+            if let Some(job) = self.cluster.get_job(fin.job_id) {
+                let cluster = self.cluster.clone();
+                tokio::spawn(async move {
+                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
+                });
+            }
+        }
+    }
+
     /// Validate an admission token if token mode is enabled.
     /// Returns the node_token JWT to include in the registration response,
     /// or an empty string if admission mode is open.
@@ -491,6 +502,130 @@ impl SlurmController for ControllerService {
                 .update_node_labels(&req.name, req.labels, &req.remove_labels)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
+        Ok(Response::new(()))
+    }
+
+    async fn drain_node(
+        &self,
+        request: Request<spur_proto::proto::DrainNodeRequest>,
+    ) -> Result<Response<spur_proto::proto::DrainNodeResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.drain_node(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward drain_node to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        let reason = if req.reason.is_empty() {
+            None
+        } else {
+            Some(req.reason)
+        };
+        let (actual_state, running_jobs) = self
+            .cluster
+            .drain_node(&req.name, reason)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(spur_proto::proto::DrainNodeResponse {
+            actual_state: actual_state.to_string(),
+            running_jobs,
+        }))
+    }
+
+    async fn deregister_node(
+        &self,
+        request: Request<spur_proto::proto::DeregisterNodeRequest>,
+    ) -> Result<Response<spur_proto::proto::DeregisterNodeResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.deregister_node(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward deregister_node to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        let reason = if req.reason.is_empty() {
+            None
+        } else {
+            Some(req.reason)
+        };
+        let evicted = self
+            .cluster
+            .remove_node(&req.name, req.force, reason)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        self.spawn_cancel_for_evicted(&evicted);
+        self.cluster.complete_evicted_steps(&evicted);
+        Ok(Response::new(spur_proto::proto::DeregisterNodeResponse {
+            evicted_jobs_count: evicted.len() as u32,
+        }))
+    }
+
+    async fn deregister_agent(
+        &self,
+        request: Request<spur_proto::proto::DeregisterAgentRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.deregister_agent(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward deregister_agent to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+
+        if matches!(
+            self.cluster.config.admission.mode,
+            spur_core::config::AdmissionMode::Token
+        ) {
+            if req.node_token.is_empty() {
+                return Err(Status::unauthenticated("node token required"));
+            }
+            let jwt_key = self
+                .cluster
+                .config
+                .auth
+                .jwt_key
+                .as_deref()
+                .unwrap_or("spur-default-key");
+            let identity =
+                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            if identity.hostname != req.hostname {
+                return Err(Status::permission_denied("node token hostname mismatch"));
+            }
+        }
+
+        let evicted = self
+            .cluster
+            .remove_node(
+                &req.hostname,
+                true,
+                Some(req.reason.clone()).filter(|r| !r.is_empty()),
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.spawn_cancel_for_evicted(&evicted);
+        self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(()))
     }
 

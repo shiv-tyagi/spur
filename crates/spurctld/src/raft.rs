@@ -46,7 +46,8 @@ pub struct JobFinalized {
 /// Response returned after a Raft write is committed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientResponse {
-    pub job_finalized: Option<JobFinalized>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs_finalized: Vec<JobFinalized>,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.
