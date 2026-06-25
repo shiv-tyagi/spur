@@ -36,6 +36,8 @@ PR descriptions should be concise and readable — not line-by-line changelogs. 
 
 When filing issues, focus on the problem: what happened, what was expected, and how to reproduce. Do not prescribe a fix — that biases the person or agent addressing it.
 
+Do not use `#N` to reference numbered points within a PR or issue description — GitHub interprets `#1`, `#2`, etc. as links to other issues/PRs. Use `[N]` instead (e.g. "as noted in [1] above").
+
 A pre-commit hook is available in `.githooks/` (activate with `git config core.hooksPath .githooks`). It enforces formatting and SPDX license headers.
 
 Validate your changes before submitting:
