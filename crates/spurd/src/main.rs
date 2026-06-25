@@ -211,10 +211,29 @@ async fn main() -> anyhow::Result<()> {
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 
-    tonic::transport::Server::builder()
+    let server_future = tonic::transport::Server::builder()
         .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent_service))
-        .serve(addr)
-        .await?;
+        .serve(addr);
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        result = server_future => { result?; }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, deregistering from controller");
+            let dereg_reporter = reporter.clone();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dereg_reporter.deregister("agent shutdown"),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
+                Err(_) => warn!("deregistration timed out"),
+            }
+        }
+    }
 
     Ok(())
 }

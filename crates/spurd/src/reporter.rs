@@ -80,6 +80,26 @@ impl NodeReporter {
         Ok(())
     }
 
+    /// Notify the controller that this agent is shutting down.
+    pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
+        let current_token = self.node_token.read().unwrap().clone();
+        let mut client = SlurmControllerClient::connect(self.controller_addr.clone())
+            .await
+            .context("failed to connect to spurctld for deregistration")?;
+
+        client
+            .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
+                hostname: self.hostname.clone(),
+                node_token: current_token,
+                reason: reason.to_string(),
+            })
+            .await
+            .context("deregistration RPC failed")?;
+
+        info!("deregistered from controller");
+        Ok(())
+    }
+
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(&self) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
