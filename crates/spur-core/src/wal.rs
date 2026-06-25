@@ -105,6 +105,12 @@ pub enum WalOperation {
         remove: Vec<String>,
     },
 
+    // Node deregistration
+    NodeRemove {
+        name: String,
+        reason: Option<String>,
+    },
+
     // Admission token operations
     TokenCreate {
         token: AdmissionToken,
@@ -140,6 +146,45 @@ mod tests {
                 assert_eq!(node_name, "n0");
                 assert_eq!(exit_code, 0);
                 assert_eq!(signal, 9);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod deregistration_wal_tests {
+    use super::*;
+
+    #[test]
+    fn node_remove_round_trips() {
+        let op = WalOperation::NodeRemove {
+            name: "gpu01".into(),
+            reason: Some("decommission".into()),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::NodeRemove { name, reason } => {
+                assert_eq!(name, "gpu01");
+                assert_eq!(reason.as_deref(), Some("decommission"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_remove_none_reason_round_trips() {
+        let op = WalOperation::NodeRemove {
+            name: "n0".into(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::NodeRemove { name, reason } => {
+                assert_eq!(name, "n0");
+                assert!(reason.is_none());
             }
             _ => panic!("wrong variant"),
         }

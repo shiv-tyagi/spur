@@ -749,6 +749,7 @@ impl Job {
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
+            (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,

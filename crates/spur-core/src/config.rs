@@ -274,6 +274,11 @@ pub struct ControllerConfig {
     /// Listen address for Raft internal gRPC traffic (separate from client API).
     #[serde(default = "default_raft_listen_addr")]
     pub raft_listen_addr: String,
+
+    /// Seconds without a heartbeat before a node is marked Down.
+    /// Defaults to 90 when absent.
+    #[serde(default)]
+    pub heartbeat_timeout_secs: Option<u64>,
 }
 
 fn default_listen_addr() -> String {
@@ -307,6 +312,7 @@ impl Default for ControllerConfig {
             peers: Vec::new(),
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
+            heartbeat_timeout_secs: None,
         }
     }
 }
@@ -1132,5 +1138,35 @@ memory_mb = 1024000
         let parts = config.build_partitions();
         assert_eq!(parts[0].name, "gpu");
         assert_eq!(parts[0].max_time_minutes, Some(4320));
+    }
+
+    #[test]
+    fn controller_config_defaults_for_new_fields() {
+        let config = ControllerConfig::default();
+        assert_eq!(config.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn controller_config_parses_heartbeat_timeout() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+heartbeat_timeout_secs = 120
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.heartbeat_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn controller_config_absent_fields_are_none() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+listen_addr = "[::]:6817"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.heartbeat_timeout_secs, None);
     }
 }

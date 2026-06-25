@@ -266,6 +266,11 @@ service SlurmController {
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
   rpc GetNode(GetNodeRequest) returns (NodeInfo);
   rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
+  rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+  rpc DeregisterNode(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+
+  // Agent deregistration (called by spurd on SIGTERM)
+  rpc DeregisterAgent(DeregisterAgentRequest) returns (google.protobuf.Empty);
 
   // Partition management
   rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse);
@@ -427,6 +432,32 @@ message UpdateNodeRequest {
   optional string reason = 3;
   map<string, string> labels = 4;
   repeated string remove_labels = 5;
+}
+
+message DrainNodeRequest {
+  string name = 1;
+  string reason = 2;
+}
+
+message DrainNodeResponse {
+  string actual_state = 1;
+  uint32 running_jobs = 2;
+}
+
+message DeregisterNodeRequest {
+  string name = 1;
+  bool force = 2;
+  string reason = 3;
+}
+
+message DeregisterNodeResponse {
+  uint32 evicted_jobs_count = 1;
+}
+
+message DeregisterAgentRequest {
+  string hostname = 1;
+  string node_token = 2;
+  string reason = 3;
 }
 
 message GetPartitionsRequest {
