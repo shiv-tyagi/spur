@@ -60,7 +60,7 @@ jobs:
             }
 
   e2e:
-    name: E2E (${{ matrix.cluster_type }})
+    name: ${{ matrix.STATUS_CONTEXT }}
     runs-on: [self-hosted, spur-e2e, gpu]
     if: github.event.workflow_run.conclusion == 'success'
     strategy:
