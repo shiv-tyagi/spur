@@ -781,9 +781,10 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     };
 
     // Submit to controller
-    let mut client = SlurmControllerClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let response = client
         .submit_job(SubmitJobRequest {

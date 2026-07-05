@@ -218,9 +218,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .unwrap_or(0);
 
     // Submit as a batch job
-    let mut client = SlurmControllerClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let job_spec = JobSpec {
         name,
@@ -537,9 +538,10 @@ async fn run_as_step(
 ) -> Result<()> {
     use spur_proto::proto::RunStepRequest;
 
-    let mut client = SlurmControllerClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Create a step on the controller for tracking; capture the assigned
     // step_id so the completion (and thus DerivedExitCode) records against it.

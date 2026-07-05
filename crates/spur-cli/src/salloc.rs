@@ -109,9 +109,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let ntasks = args.ntasks;
     let cpus_per_task = args.cpus_per_task;
 
-    let mut client = SlurmControllerClient::connect(controller)
+    let channel = spur_client::connect_channel(&controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Submit interactive allocation (sleep infinity holds the allocation)
     let job_spec = JobSpec {

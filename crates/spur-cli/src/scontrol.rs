@@ -168,9 +168,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
         ScontrolCommand::Requeue { job_id } => {
             // Requeue = cancel + resubmit, simplified for now
-            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+            let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
+            let mut client = SlurmControllerClient::new(channel);
             client
                 .cancel_job(spur_proto::proto::CancelJobRequest {
                     job_id,
@@ -183,9 +184,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Suspend { job_id } => {
-            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+            let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
+            let mut client = SlurmControllerClient::new(channel);
             client
                 .suspend_job(spur_proto::proto::SuspendJobRequest {
                     job_id,
@@ -197,9 +199,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Resume { job_id } => {
-            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+            let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
+            let mut client = SlurmControllerClient::new(channel);
             client
                 .resume_job(spur_proto::proto::ResumeJobRequest {
                     job_id,
@@ -246,9 +249,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect()
             };
-            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+            let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
+            let mut client = SlurmControllerClient::new(channel);
             client
                 .update_reservation(spur_proto::proto::UpdateReservationRequest {
                     name: name.clone(),
@@ -272,9 +276,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     match entity.to_lowercase().as_str() {
         "job" | "jobs" => {
@@ -496,9 +501,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 }
 
 async fn ping(controller: &str) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let resp = client.ping(()).await.context("ping failed")?;
 
@@ -537,9 +543,10 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
 async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequest) -> Result<()> {
     let hold = req.hold;
     let job_id = req.job_id;
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     client.update_job(req).await.context("update failed")?;
 
@@ -624,9 +631,10 @@ async fn update_node(
     state: Option<&str>,
     reason: Option<String>,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let proto_state = state.map(|s| match s.to_lowercase().as_str() {
         "idle" | "resume" => spur_proto::proto::NodeState::NodeIdle as i32,
@@ -666,9 +674,10 @@ async fn create_reservation(
     accounts: &str,
     users: &str,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let node_list: Vec<String> = nodes
         .split(',')
@@ -704,9 +713,10 @@ async fn create_reservation(
 
 /// Delete a reservation via the controller.
 async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string())
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     client
         .delete_reservation(spur_proto::proto::DeleteReservationRequest {
