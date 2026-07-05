@@ -159,14 +159,18 @@ jobs:
 
       - name: Bootstrap k8s cluster (k8s only)
         if: matrix.cluster_type == 'k8s'
+        id: k8s-bootstrap
         run: |
           source /tmp/cluster-env.sh
+          KUBECONFIG_DIR=$(mktemp -d)
           /opt/spur-ci/bin/k8s-bootstrap.sh \
             --control-plane "$VM_1_IP" \
             --workers "$VM_2_IP,$VM_3_IP" \
             --ssh-key "${{ steps.ssh.outputs.privkey }}" \
             --ssh-user ci \
+            --kubeconfig "$KUBECONFIG_DIR/config" \
             --image-tar /tmp/spur-image.tar
+          echo "kubeconfig=$KUBECONFIG_DIR/config" >> "$GITHUB_OUTPUT"
 
       - name: Push artifacts into driver VM
         run: |
@@ -179,9 +183,10 @@ jobs:
           scp $SSH_OPTS "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
           ssh $SSH_OPTS ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
           # Copy kubeconfig into driver VM (written by k8s-bootstrap on the host)
-          if [[ -f /tmp/spur-kubeconfig ]]; then
+          KUBECONFIG_FILE="${{ steps.k8s-bootstrap.outputs.kubeconfig }}"
+          if [[ -n "$KUBECONFIG_FILE" && -f "$KUBECONFIG_FILE" ]]; then
             ssh $SSH_OPTS ci@"$DRIVER_IP" "mkdir -p /home/ci/.kube"
-            scp $SSH_OPTS /tmp/spur-kubeconfig ci@"$DRIVER_IP":/home/ci/.kube/config
+            scp $SSH_OPTS "$KUBECONFIG_FILE" ci@"$DRIVER_IP":/home/ci/.kube/config
           fi
 
       - name: Load AppArmor profile for rootless containers
