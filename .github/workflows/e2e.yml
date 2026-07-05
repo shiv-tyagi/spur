@@ -149,7 +149,7 @@ jobs:
           source /tmp/cluster-env.sh
           for ip in $VM_0_IP $VM_1_IP $VM_2_IP $VM_3_IP; do
             for i in $(seq 1 60); do
-              if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+              if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 \
                 -i "${{ steps.ssh.outputs.privkey }}" ci@"$ip" true 2>/dev/null; then
                 break
               fi
@@ -172,7 +172,7 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -i $KEY"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
 
           scp $SSH_OPTS -r /tmp/release-binaries ci@"$DRIVER_IP":/tmp/
           scp $SSH_OPTS -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
@@ -185,7 +185,7 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -i $KEY"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
           SPURD="/tmp/spur-ci-bin/spurd"
           PROF="abi <abi/4.0>,
           profile spur-ci ${SPURD} flags=(unconfined) {
@@ -203,7 +203,7 @@ jobs:
           GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
 
-          ssh -o StrictHostKeyChecking=no -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export SPUR_TEST_NODES="$GPU_IPS"
           export SPUR_TEST_SSH_USER=ci
@@ -222,7 +222,7 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
 
-          ssh -o StrictHostKeyChecking=no -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
           source /opt/spur-ci/test-venv/bin/activate
@@ -235,10 +235,9 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
           mkdir -p /tmp/e2e-results
-          scp -o StrictHostKeyChecking=no -i "$KEY" \
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" \
             ci@"$DRIVER_IP":/tmp/results.xml /tmp/e2e-results/ 2>/dev/null || true
-          # Scrub logs inside driver VM (not on host)
-          ssh -o StrictHostKeyChecking=no -i "$KEY" ci@"$DRIVER_IP" \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" \
             "find /tmp -name '*.log' -exec rm -f {} + 2>/dev/null" || true
 
       - name: Upload test results
