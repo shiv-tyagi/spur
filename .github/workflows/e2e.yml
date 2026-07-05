@@ -130,6 +130,8 @@ jobs:
       - name: Bring up ephemeral VM cluster
         id: cluster
         run: |
+          CLUSTER_ENV=$(mktemp /tmp/cluster-env-XXXXXX.sh)
+          echo "cluster_env=$CLUSTER_ENV" >> "$GITHUB_OUTPUT"
           /opt/spur-ci/bin/cluster-up.sh \
             --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
             --count 4 \
@@ -139,29 +141,38 @@ jobs:
             --ssh-pubkey "${{ steps.ssh.outputs.pubkey }}" \
             --network "${SPUR_CI_NETWORK}" \
             --gpu-vfs "${SPUR_CI_GPU_VFS}" \
-            > /tmp/cluster-env.sh
-          source /tmp/cluster-env.sh
+            > "$CLUSTER_ENV"
+          source "$CLUSTER_ENV"
           echo "driver_ip=${VM_0_IP}" >> "$GITHUB_OUTPUT"
           echo "gpu_ips=${VM_1_IP},${VM_2_IP},${VM_3_IP}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for VMs to be reachable
         run: |
-          source /tmp/cluster-env.sh
+          source "${{ steps.cluster.outputs.cluster_env }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
           for ip in $VM_0_IP $VM_1_IP $VM_2_IP $VM_3_IP; do
-            for i in $(seq 1 60); do
+            echo "Waiting for $ip..."
+            ok=false
+            for i in $(seq 1 90); do
               if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 \
-                -i "${{ steps.ssh.outputs.privkey }}" ci@"$ip" true 2>/dev/null; then
+                -o BatchMode=yes -i "$KEY" ci@"$ip" true 2>/dev/null; then
+                echo "  $ip ready"
+                ok=true
                 break
               fi
               sleep 2
             done
+            if [[ "$ok" != "true" ]]; then
+              echo "ERROR: $ip not reachable after 180s" >&2
+              exit 1
+            fi
           done
 
       - name: Bootstrap k8s cluster (k8s only)
         if: matrix.cluster_type == 'k8s'
         id: k8s-bootstrap
         run: |
-          source /tmp/cluster-env.sh
+          source "${{ steps.cluster.outputs.cluster_env }}"
           KUBECONFIG_DIR=$(mktemp -d)
           /opt/spur-ci/bin/k8s-bootstrap.sh \
             --control-plane "$VM_1_IP" \
