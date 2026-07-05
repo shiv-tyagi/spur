@@ -178,6 +178,11 @@ jobs:
           scp $SSH_OPTS -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
           scp $SSH_OPTS "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
           ssh $SSH_OPTS ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
+          # Copy kubeconfig into driver VM (written by k8s-bootstrap on the host)
+          if [[ -f /tmp/spur-kubeconfig ]]; then
+            ssh $SSH_OPTS ci@"$DRIVER_IP" "mkdir -p /home/ci/.kube"
+            scp $SSH_OPTS /tmp/spur-kubeconfig ci@"$DRIVER_IP":/home/ci/.kube/config
+          fi
 
       - name: Load AppArmor profile for rootless containers
         if: matrix.cluster_type == 'native-host'
