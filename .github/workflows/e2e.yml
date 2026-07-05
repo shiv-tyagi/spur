@@ -66,9 +66,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cluster_type: [native-host, k8s]
+        include:
+          - cluster_type: native-host
+            STATUS_CONTEXT: "E2E / native-host"
+          - cluster_type: k8s
+            STATUS_CONTEXT: "E2E / k8s"
     env:
-      STATUS_CONTEXT: "E2E / ${{ matrix.cluster_type }}"
+      STATUS_CONTEXT: ${{ matrix.STATUS_CONTEXT }}
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
