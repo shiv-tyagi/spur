@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# One-time runner registration for a given slot.
+# Usage: register-runner.sh <slot> [token]
+#
+# If token is not provided, prompts for it.
+# Get a token: gh api repos/OWNER/REPO/actions/runners/registration-token -q .token
+
+set -euo pipefail
+
+SLOT="${1:-}"
+TOKEN="${2:-}"
+RUNNER_DIR="{{ runner_install_dir }}/${SLOT}"
+RUNNER_NAME="spur-{{ inventory_hostname }}-${SLOT}"
+LABELS="{{ runner_labels }}"
+REPO_URL="${SPUR_CI_REPO_URL:-https://github.com/ROCm/spur}"
+
+if [[ -z "$SLOT" ]]; then
+    echo "Usage: $0 <slot> [token]" >&2
+    echo "Available slots: {{ ci_slots.keys() | join(', ') }}" >&2
+    exit 1
+fi
+
+if [[ ! -d "$RUNNER_DIR" ]]; then
+    echo "ERROR: Runner directory $RUNNER_DIR does not exist." >&2
+    exit 1
+fi
+
+if [[ -z "$TOKEN" ]]; then
+    read -rsp "Enter registration token for slot $SLOT: " TOKEN
+    echo
+fi
+
+if [[ -f "$RUNNER_DIR/.runner" ]]; then
+    echo "Removing existing registration..."
+    "$RUNNER_DIR/config.sh" remove --token "$TOKEN" 2>/dev/null || true
+fi
+
+"$RUNNER_DIR/config.sh" \
+    --unattended \
+    --url "$REPO_URL" \
+    --token "$TOKEN" \
+    --name "$RUNNER_NAME" \
+    --labels "$LABELS" \
+    --replace
+
+echo "Runner $RUNNER_NAME registered. Start with: sudo systemctl start spur-ci-runner@${SLOT}"

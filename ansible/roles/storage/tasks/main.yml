@@ -1,0 +1,123 @@
+---
+# Storage role: ensure /var/lib/spur-ci exists with required subdirectories.
+# If spur_ci_disk_by_id is defined, provisions a dedicated NVMe (DESTRUCTIVE, guarded).
+# If not defined, uses whatever filesystem backs /var/lib/spur-ci.
+
+- name: Check if dedicated disk provisioning is configured
+  ansible.builtin.set_fact:
+    has_dedicated_disk: "{{ spur_ci_disk_by_id is defined and spur_ci_disk_by_id | length > 0 }}"
+
+# --- Dedicated disk path (only when spur_ci_disk_by_id is set) ---
+
+- name: Resolve disk by-id symlink to actual device
+  ansible.builtin.stat:
+    path: "{{ spur_ci_disk_by_id }}"
+  register: disk_link
+  when: has_dedicated_disk
+
+- name: Fail if disk symlink does not exist
+  ansible.builtin.fail:
+    msg: "Disk {{ spur_ci_disk_by_id }} not found on {{ inventory_hostname }}"
+  when: has_dedicated_disk and not disk_link.stat.exists
+
+- name: Get real device path
+  ansible.builtin.command:
+    cmd: readlink -f {{ spur_ci_disk_by_id }}
+  register: real_device
+  changed_when: false
+  when: has_dedicated_disk
+
+- name: Check for existing filesystem signatures
+  ansible.builtin.command:
+    cmd: wipefs -n {{ real_device.stdout }}
+  register: wipefs_check
+  changed_when: false
+  when: has_dedicated_disk
+
+- name: Check if already mounted at target
+  ansible.builtin.command:
+    cmd: findmnt -n -o SOURCE {{ spur_ci_mount }}
+  register: current_mount
+  changed_when: false
+  failed_when: false
+  when: has_dedicated_disk
+
+- name: Determine if disk is already provisioned
+  ansible.builtin.set_fact:
+    disk_already_provisioned: "{{ current_mount.rc == 0 and real_device.stdout in current_mount.stdout }}"
+  when: has_dedicated_disk
+
+- name: Abort if device has signatures and provision_disk not set
+  ansible.builtin.fail:
+    msg: >
+      Device {{ real_device.stdout }} ({{ spur_ci_disk_by_id }}) has existing signatures.
+      Set provision_disk=true to format. Signatures: {{ wipefs_check.stdout }}
+  when:
+    - has_dedicated_disk
+    - not disk_already_provisioned
+    - wipefs_check.stdout | length > 0
+    - not provision_disk
+
+- name: Format disk with XFS
+  ansible.builtin.filesystem:
+    dev: "{{ real_device.stdout }}"
+    fstype: xfs
+    force: true
+  when:
+    - has_dedicated_disk
+    - provision_disk
+    - not disk_already_provisioned
+
+- name: Get UUID of filesystem
+  ansible.builtin.command:
+    cmd: blkid -s UUID -o value {{ real_device.stdout }}
+  register: disk_uuid
+  changed_when: false
+  failed_when: false
+  when: has_dedicated_disk and not disk_already_provisioned
+
+- name: Create mount point
+  ansible.builtin.file:
+    path: "{{ spur_ci_mount }}"
+    state: directory
+    mode: "0755"
+  when: has_dedicated_disk and not disk_already_provisioned and disk_uuid.rc == 0
+
+- name: Add fstab entry and mount
+  ansible.posix.mount:
+    path: "{{ spur_ci_mount }}"
+    src: "UUID={{ disk_uuid.stdout }}"
+    fstype: xfs
+    opts: noatime
+    state: mounted
+  when: has_dedicated_disk and not disk_already_provisioned and disk_uuid.rc == 0
+
+- name: Warn if disk has no filesystem
+  ansible.builtin.debug:
+    msg: >
+      Disk {{ spur_ci_disk_by_id }} has no filesystem. Set provision_disk=true
+      to format it, or manually create a filesystem.
+  when: has_dedicated_disk and not disk_already_provisioned and disk_uuid.rc != 0
+
+# --- Common path (always runs) ---
+
+- name: Ensure base directory exists
+  ansible.builtin.file:
+    path: "{{ spur_ci_mount }}"
+    state: directory
+    mode: "0755"
+
+- name: Create subdirectories
+  ansible.builtin.file:
+    path: "{{ spur_ci_mount }}/{{ item.name }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { name: images }
+    - { name: instances, owner: "{{ ci_user }}", group: "{{ ci_user }}" }
+    - { name: locks, owner: "{{ ci_user }}", group: "{{ ci_user }}" }
+    - { name: bin }
+  loop_control:
+    label: "{{ item.name }}"

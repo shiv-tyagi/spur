@@ -1,0 +1,38 @@
+---
+# Define and autostart isolated NAT networks for each CI slot.
+# Retains the default network (used by image-build scripts).
+
+- name: Ensure default network is active
+  community.libvirt.virt_net:
+    name: default
+    state: active
+
+- name: Autostart default network
+  community.libvirt.virt_net:
+    name: default
+    autostart: true
+
+- name: Define per-slot isolated networks
+  community.libvirt.virt_net:
+    name: "{{ item.value.network_name }}"
+    state: present
+    xml: "{{ lookup('template', 'slot-network.xml.j2') }}"
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Autostart per-slot networks
+  community.libvirt.virt_net:
+    name: "{{ item.value.network_name }}"
+    autostart: true
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Start per-slot networks
+  community.libvirt.virt_net:
+    name: "{{ item.value.network_name }}"
+    state: active
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"

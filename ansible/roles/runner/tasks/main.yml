@@ -1,0 +1,82 @@
+---
+# GitHub Actions self-hosted runner: persistent mode with systemd template units.
+# Each slot gets its own runner install directory.
+# Registration is one-time; after that, systemd keeps the runner alive.
+
+- name: Create per-slot runner directories
+  ansible.builtin.file:
+    path: "{{ runner_install_dir }}/{{ item.key }}"
+    state: directory
+    owner: "{{ ci_user }}"
+    group: "{{ ci_user }}"
+    mode: "0755"
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Download and extract runner
+  ansible.builtin.unarchive:
+    src: "https://github.com/actions/runner/releases/download/v{{ runner_version }}/actions-runner-linux-x64-{{ runner_version }}.tar.gz"
+    dest: "{{ runner_install_dir }}/{{ item.key }}"
+    remote_src: true
+    owner: "{{ ci_user }}"
+    group: "{{ ci_user }}"
+    creates: "{{ runner_install_dir }}/{{ item.key }}/run.sh"
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Create slot env directory
+  ansible.builtin.file:
+    path: /etc/spur-ci/slots
+    state: directory
+    mode: "0755"
+
+- name: Deploy per-slot environment files
+  ansible.builtin.template:
+    src: slot-env.j2
+    dest: "/etc/spur-ci/slots/{{ item.key }}.env"
+    mode: "0644"
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Deploy runner systemd template unit
+  ansible.builtin.template:
+    src: spur-ci-runner@.service.j2
+    dest: /etc/systemd/system/spur-ci-runner@.service
+    mode: "0644"
+
+- name: Deploy runner registration script
+  ansible.builtin.template:
+    src: register-runner.sh.j2
+    dest: /opt/spur-ci/bin/register-runner.sh
+    mode: "0755"
+
+- name: Check if runners are already registered
+  ansible.builtin.stat:
+    path: "{{ runner_install_dir }}/{{ item.key }}/.runner"
+  register: runner_registered
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Warn about unregistered runners
+  ansible.builtin.debug:
+    msg: >
+      Runner slot {{ item.item.key }} is not registered on {{ inventory_hostname }}.
+      Register manually: sudo -u {{ ci_user }} /opt/spur-ci/bin/register-runner.sh {{ item.item.key }}
+      (requires a one-time registration token from GitHub)
+  loop: "{{ runner_registered.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  when: not item.stat.exists
+
+- name: Enable runner instances
+  ansible.builtin.systemd:
+    name: "spur-ci-runner@{{ item.key }}.service"
+    enabled: true
+    daemon_reload: true
+  loop: "{{ ci_slots | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"

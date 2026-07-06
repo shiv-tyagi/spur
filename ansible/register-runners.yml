@@ -1,0 +1,48 @@
+---
+# One-time runner registration playbook.
+# Fetches a registration token from GitHub and registers any unregistered slot runners.
+#
+# Prerequisites: `gh` CLI authenticated on the control machine.
+# Usage: ansible-playbook -u shiv register-runners.yml
+
+- name: Register GitHub Actions runners
+  hosts: gpu_hosts
+  vars:
+    repo: shiv-tyagi/spur
+
+  tasks:
+    - name: Get registration token from GitHub API
+      ansible.builtin.command:
+        cmd: gh api repos/{{ repo }}/actions/runners/registration-token -X POST -q .token
+      register: reg_token
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+
+    - name: Check which slots are already registered
+      ansible.builtin.stat:
+        path: "{{ runner_install_dir }}/{{ item.key }}/.runner"
+      register: slot_status
+      loop: "{{ ci_slots | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Register unregistered runner slots
+      ansible.builtin.command:
+        cmd: /opt/spur-ci/bin/register-runner.sh {{ item.item.key }} {{ reg_token.stdout }}
+      become: true
+      become_user: "{{ ci_user }}"
+      loop: "{{ slot_status.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+      when: not item.stat.exists
+
+    - name: Start runner services
+      ansible.builtin.systemd:
+        name: "spur-ci-runner@{{ item.key }}.service"
+        state: started
+        daemon_reload: true
+      become: true
+      loop: "{{ ci_slots | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"

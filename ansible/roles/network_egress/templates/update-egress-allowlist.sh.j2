@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Resolve egress allowlist FQDNs and populate the nftables set.
+# Run periodically by systemd timer.
+set -euo pipefail
+
+HOSTS=(
+{% for host in egress_allowed_hosts %}
+  "{{ host }}"
+{% endfor %}
+)
+
+nft flush set inet spur_ci_egress allowed_egress 2>/dev/null || true
+
+for host in "${HOSTS[@]}"; do
+    ips=$(dig +short "$host" A 2>/dev/null | grep -E '^[0-9]+\.' || true)
+    for ip in $ips; do
+        nft add element inet spur_ci_egress allowed_egress "{ $ip }" 2>/dev/null || true
+    done
+done

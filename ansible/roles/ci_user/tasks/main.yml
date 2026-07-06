@@ -1,0 +1,34 @@
+---
+# Create the ci user with restricted sudo allowlist.
+# No blanket NOPASSWD:ALL — only specific VM management commands.
+
+- name: Create ci user (locked password, no login shell by default uses bash)
+  ansible.builtin.user:
+    name: "{{ ci_user }}"
+    shell: /bin/bash
+    create_home: true
+    password: "!"
+    state: present
+
+- name: Add ci user to required groups
+  ansible.builtin.user:
+    name: "{{ ci_user }}"
+    groups:
+      - libvirt
+      - kvm
+    append: true
+
+- name: Deploy restricted sudoers file
+  ansible.builtin.template:
+    src: ci-sudoers.j2
+    dest: /etc/sudoers.d/ci-spur
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Create .ssh directory for ci user
+  ansible.builtin.file:
+    path: /home/{{ ci_user }}/.ssh
+    state: directory
+    owner: "{{ ci_user }}"
+    group: "{{ ci_user }}"
+    mode: "0700"

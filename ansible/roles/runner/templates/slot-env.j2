@@ -1,0 +1,8 @@
+# Slot {{ item.key }} on {{ inventory_hostname }}
+SPUR_CI_SLOT={{ item.key }}
+SPUR_CI_GPU_VFS={{ item.value.gpu_vfs }}
+SPUR_CI_NETWORK={{ item.value.network_name }}
+SPUR_CI_INSTANCE_DIR={{ spur_ci_mount }}/instances/{{ item.key }}
+SPUR_CI_LOCK_DIR={{ spur_ci_mount }}/locks/{{ item.key }}
+SPUR_CI_VM_PREFIX=ci-{{ inventory_hostname }}-{{ item.key }}
+SPUR_CI_IMAGE_DIR={{ spur_ci_image_dir }}

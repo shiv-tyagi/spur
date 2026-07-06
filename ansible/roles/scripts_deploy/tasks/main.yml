@@ -1,0 +1,21 @@
+---
+# Deploy orchestration scripts to /opt/spur-ci/bin (host-trusted, root-owned).
+# These are the ONLY scripts the runner host executes directly.
+
+- name: Create /opt/spur-ci/bin
+  ansible.builtin.file:
+    path: /opt/spur-ci/bin
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Sync scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /opt/spur-ci/bin/
+    owner: root
+    group: root
+    mode: "0755"
+  with_fileglob:
+    - "{{ playbook_dir }}/../scripts/*.sh"

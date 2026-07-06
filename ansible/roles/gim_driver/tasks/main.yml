@@ -1,0 +1,124 @@
+---
+# GIM (GPU-IOV Module) SR-IOV driver: build, install via DKMS, create VFs, healthcheck.
+
+- name: Install build dependencies
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - dkms
+      - git
+      - linux-headers-{{ ansible_kernel }}
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Check if GIM DKMS is already installed
+  ansible.builtin.command:
+    cmd: dkms status gim
+  register: dkms_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Clone MxGPU-Virtualization repo
+  ansible.builtin.git:
+    repo: "{{ gim_repo_url }}"
+    dest: "{{ gim_build_dir }}"
+    version: "{{ gim_repo_ref }}"
+    force: true
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Get GIM module version from git
+  ansible.builtin.command:
+    cmd: git -C {{ gim_build_dir }} describe --tags --always
+  register: gim_module_version
+  changed_when: false
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Copy source tree to DKMS directory
+  ansible.builtin.copy:
+    src: "{{ gim_build_dir }}/"
+    dest: "/usr/src/gim-{{ gim_module_version.stdout }}/"
+    remote_src: true
+    mode: "0755"
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Write dkms.conf with correct version
+  ansible.builtin.shell:
+    cmd: sed 's|#MODULE_VERSION#|{{ gim_module_version.stdout }}|g' {{ gim_build_dir }}/package/rpm/dkms.conf > /usr/src/gim-{{ gim_module_version.stdout }}/dkms.conf
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Add GIM to DKMS
+  ansible.builtin.command:
+    cmd: dkms add -m gim -v {{ gim_module_version.stdout }}
+  when: "'installed' not in dkms_status.stdout"
+  failed_when: false
+
+- name: Build GIM via DKMS
+  ansible.builtin.command:
+    cmd: dkms build -m gim -v {{ gim_module_version.stdout }}
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Install GIM via DKMS
+  ansible.builtin.command:
+    cmd: dkms install -m gim -v {{ gim_module_version.stdout }}
+  when: "'installed' not in dkms_status.stdout"
+
+- name: Verify DKMS installation
+  ansible.builtin.command:
+    cmd: dkms status gim
+  register: dkms_verify
+  changed_when: false
+  check_mode: false
+
+- name: Fail if GIM not installed
+  ansible.builtin.fail:
+    msg: "GIM DKMS installation failed. Status: {{ dkms_verify.stdout }}"
+  when: "'installed' not in dkms_verify.stdout"
+
+# --- VF creation (B5) ---
+# GIM creates VFs automatically when loaded (1 per PF in SPX mode).
+# Ensure the systemd oneshot runs AFTER gim is loaded to verify.
+
+- name: Deploy VF creation/verification service
+  ansible.builtin.template:
+    src: spur-ci-vf-check.service.j2
+    dest: /etc/systemd/system/spur-ci-vf-check.service
+    mode: "0644"
+  notify: reload systemd
+
+- name: Enable VF check service
+  ansible.builtin.systemd:
+    name: spur-ci-vf-check.service
+    enabled: true
+    daemon_reload: true
+
+# --- Healthcheck ---
+
+- name: Check VF count
+  ansible.builtin.shell:
+    cmd: lspci -d 1002:74b5 | wc -l
+  register: vf_count
+  changed_when: false
+
+- name: Verify expected VF count
+  ansible.builtin.debug:
+    msg: "WARNING: Expected {{ gim_expected_vf_count }} VFs, found {{ vf_count.stdout }}. Is GIM loaded?"
+  when: vf_count.stdout | int < gim_expected_vf_count
+
+- name: Validate slot VFs are present on this host
+  ansible.builtin.shell:
+    cmd: lspci -Ds {{ item }} 2>/dev/null | grep -qi 'amd\|radeon'
+  loop: "{{ ci_slots.values() | map(attribute='gpu_vfs') | join(',') | split(',') }}"
+  changed_when: false
+  failed_when: false
+  register: vf_presence
+  when: vf_count.stdout | int >= gim_expected_vf_count
+
+- name: Warn about missing slot VFs
+  ansible.builtin.debug:
+    msg: "WARNING: VF {{ item.item }} not found on {{ inventory_hostname }}. Check ci_slots PCI addresses."
+  loop: "{{ vf_presence.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('skipped') }}"
+  when: item.rc is defined and item.rc != 0

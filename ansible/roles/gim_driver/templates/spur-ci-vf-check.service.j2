@@ -1,0 +1,12 @@
+[Unit]
+Description=Verify AMD GPU SR-IOV VFs are present
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'count=$(lspci -D | grep -ci "Virtual Function.*amd\\|Virtual Function.*radeon" || true); if [ "$count" -lt {{ gim_expected_vf_count }} ]; then echo "FATAL: only $count VFs found, expected {{ gim_expected_vf_count }}"; exit 1; fi; echo "OK: $count GPU VFs present"'
+
+[Install]
+WantedBy=multi-user.target

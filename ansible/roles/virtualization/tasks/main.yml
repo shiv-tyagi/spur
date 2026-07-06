@@ -1,0 +1,35 @@
+---
+# Install libvirt/QEMU/KVM and dependencies for ephemeral VM management.
+
+- name: Install virtualization packages
+  ansible.builtin.apt:
+    name:
+      - qemu-kvm
+      - libvirt-daemon-system
+      - libvirt-clients
+      - virtinst
+      - genisoimage
+      - cloud-image-utils
+      - ovmf
+      - sshpass
+      - libguestfs-tools
+      - python3-libvirt
+      - python3-lxml
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable and start libvirtd
+  ansible.builtin.systemd:
+    name: libvirtd
+    enabled: true
+    state: started
+
+- name: Ensure ci user is in libvirt and kvm groups
+  ansible.builtin.user:
+    name: "{{ ci_user }}"
+    groups:
+      - libvirt
+      - kvm
+    append: true
+  when: ci_user is defined

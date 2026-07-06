@@ -1,0 +1,45 @@
+---
+# Reaper: systemd timer that garbage-collects orphaned VMs, overlays, and leases.
+# Scoped by age (not slot prefix) to avoid reaping in-flight job VMs.
+
+- name: Deploy reaper script
+  ansible.builtin.copy:
+    src: spur-ci-reaper.sh
+    dest: /opt/spur-ci/bin/spur-ci-reaper.sh
+    mode: "0755"
+
+- name: Deploy reaper systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/spur-ci-reaper.service
+    content: |
+      [Unit]
+      Description=Spur CI orphaned VM reaper
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/spur-ci/bin/spur-ci-reaper.sh
+    mode: "0644"
+  notify: reload systemd
+
+- name: Deploy reaper timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/spur-ci-reaper.timer
+    content: |
+      [Unit]
+      Description=Run Spur CI reaper every 15 minutes
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=15min
+
+      [Install]
+      WantedBy=timers.target
+    mode: "0644"
+  notify: reload systemd
+
+- name: Enable reaper timer
+  ansible.builtin.systemd:
+    name: spur-ci-reaper.timer
+    enabled: true
+    state: started
+    daemon_reload: true

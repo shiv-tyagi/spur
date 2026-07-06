@@ -1,0 +1,78 @@
+# Spur CI Infrastructure - shared variables
+# All values are per-server unless overridden in host_vars.
+
+# --- Storage ---
+# Target NVMe for /var/lib/spur-ci. Selected by stable /dev/disk/by-id path.
+# Set per-host in host_vars. provision_disk must be explicitly true to format.
+spur_ci_mount: /var/lib/spur-ci
+provision_disk: false
+
+# --- Slot definitions ---
+# Each slot is a static resource partition: fixed GPU VFs, isolated network, own instance dir.
+# Any slot can run any E2E type (native or k8s).
+ci_slots:
+  a:
+    gpu_vfs: "{{ ci_slot_vfs.a }}"
+    network_name: spurci-a
+    network_subnet: 10.44.1.0/24
+    network_gateway: 10.44.1.1
+    network_dhcp_start: 10.44.1.10
+    network_dhcp_end: 10.44.1.50
+  b:
+    gpu_vfs: "{{ ci_slot_vfs.b }}"
+    network_name: spurci-b
+    network_subnet: 10.44.2.0/24
+    network_gateway: 10.44.2.1
+    network_dhcp_start: 10.44.2.10
+    network_dhcp_end: 10.44.2.50
+
+# --- GIM driver ---
+gim_repo_url: https://github.com/amd/MxGPU-Virtualization.git
+gim_repo_ref: f603f87adba426887d1a1e53710fc5b41fa22eea
+gim_build_dir: /tmp/MxGPU-Virtualization
+gim_expected_vf_count: 8
+
+# --- Guest images ---
+spur_ci_image_dir: "{{ spur_ci_mount }}/images"
+
+# --- CI user ---
+ci_user: ci
+ci_sudoers_commands:
+  - /usr/bin/virsh
+  - /usr/bin/virt-install
+  - /usr/bin/qemu-img
+  - /usr/bin/genisoimage
+  - /sbin/modprobe gim
+
+# --- Runner ---
+runner_version: "2.321.0"
+runner_labels: "self-hosted,spur-e2e,gpu"
+runner_install_dir: /opt/actions-runner
+
+# --- Egress allowlist (FQDNs) ---
+egress_allowed_hosts:
+  - github.com
+  - api.github.com
+  - objects.githubusercontent.com
+  - raw.githubusercontent.com
+  - pkg-containers.githubusercontent.com
+  - ghcr.io
+  - production.cloudflare.docker.com
+  - registry-1.docker.io
+  - repo.radeon.com
+  - archive.ubuntu.com
+  - security.ubuntu.com
+  - pkgs.k8s.io
+  - cloud-images.ubuntu.com
+  - registry.test.pensando.io
+
+# --- fail2ban ---
+fail2ban_whitelist_ips:
+  # Cross-server (prevent lockout during inter-server ops)
+  - 149.28.118.43
+  - 108.61.203.48
+  # VPN / corporate ranges
+  - 136.226.242.0/24
+  - 142.254.82.0/23
+  - 165.204.154.0/24
+  - 167.103.88.0/24

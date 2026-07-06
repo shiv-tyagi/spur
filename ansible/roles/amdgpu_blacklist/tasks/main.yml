@@ -1,0 +1,51 @@
+---
+# Persist the amdgpu/amdkfd blacklist so GIM loads instead on boot.
+
+- name: Blacklist amdgpu and amdkfd
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/blacklist-amdgpu.conf
+    content: |
+      blacklist amdgpu
+      blacklist amdkfd
+    mode: "0644"
+  register: blacklist_written
+
+- name: Ensure GIM loads at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/gim.conf
+    content: |
+      gim
+    mode: "0644"
+  register: modules_load_written
+
+- name: Update initramfs
+  ansible.builtin.command:
+    cmd: update-initramfs -u
+  when: blacklist_written is changed or modules_load_written is changed
+
+- name: Check if amdgpu is currently loaded
+  ansible.builtin.shell:
+    cmd: lsmod | grep -q '^amdgpu ' && echo loaded || echo not_loaded
+  register: amdgpu_state
+  changed_when: false
+
+- name: Check amdgpu refcount
+  ansible.builtin.shell:
+    cmd: lsmod | awk '/^amdgpu/{print $3}'
+  register: amdgpu_refcount
+  changed_when: false
+  when: amdgpu_state.stdout == 'loaded'
+
+- name: Live-switch to GIM (unload amdgpu, load gim)
+  ansible.builtin.shell:
+    cmd: modprobe -r amdgpu && modprobe gim
+  when:
+    - amdgpu_state.stdout == 'loaded'
+    - amdgpu_refcount.stdout | default('1') | int == 0
+
+- name: Flag reboot if amdgpu cannot be unloaded live
+  ansible.builtin.debug:
+    msg: "REBOOT REQUIRED: amdgpu refcount is {{ amdgpu_refcount.stdout | default('unknown') }}, cannot unload live."
+  when:
+    - amdgpu_state.stdout == 'loaded'
+    - amdgpu_refcount.stdout | default('1') | int > 0

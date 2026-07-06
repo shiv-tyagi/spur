@@ -1,0 +1,87 @@
+---
+# Build guest VM images using Packer HCL templates.
+
+- name: Check if base image already exists
+  ansible.builtin.stat:
+    path: "{{ spur_ci_image_dir }}/spur-ci-base.qcow2"
+  register: base_image
+
+- name: Create images directory
+  ansible.builtin.file:
+    path: "{{ spur_ci_image_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Add HashiCorp GPG key
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /etc/apt/keyrings/hashicorp.asc
+    mode: "0644"
+
+- name: Add HashiCorp APT repo
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com noble main"
+    filename: hashicorp
+
+- name: Install Packer
+  ansible.builtin.apt:
+    name: packer=1.11.*
+    state: present
+    update_cache: true
+
+- name: Ensure genisoimage is installed
+  ansible.builtin.apt:
+    name: genisoimage
+    state: present
+
+- name: Copy packer directory to host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../packer/"
+    dest: /opt/spur-ci/packer/
+    mode: "0755"
+
+- name: Generate cloud-init ISO
+  community.general.make:
+    chdir: /opt/spur-ci/packer
+    target: cidata
+
+- name: Initialize Packer plugins
+  ansible.builtin.command:
+    cmd: packer init .
+    chdir: /opt/spur-ci/packer
+  changed_when: false
+
+- name: Build base image with Packer
+  ansible.builtin.command:
+    cmd: >-
+      packer build -force -only='qemu.base'
+      -var 'output_dir={{ spur_ci_image_dir }}'
+      .
+    chdir: /opt/spur-ci/packer
+  when: not base_image.stat.exists
+  timeout: 1800
+
+- name: Verify base image exists
+  ansible.builtin.stat:
+    path: "{{ spur_ci_image_dir }}/spur-ci-base.qcow2"
+  register: final_image
+
+- name: Fail if image build failed
+  ansible.builtin.fail:
+    msg: "Base image build failed. Check logs."
+  when: not final_image.stat.exists
+
+- name: Check if k8s image exists
+  ansible.builtin.stat:
+    path: "{{ spur_ci_image_dir }}/spur-ci-k8s.qcow2"
+  register: k8s_image
+
+- name: Build k8s image with Packer
+  ansible.builtin.command:
+    cmd: >-
+      packer build -force -only='qemu.k8s'
+      -var 'output_dir={{ spur_ci_image_dir }}'
+      .
+    chdir: /opt/spur-ci/packer
+  when: not k8s_image.stat.exists
+  timeout: 1800

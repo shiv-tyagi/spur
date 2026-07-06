@@ -1,0 +1,39 @@
+---
+# Discovery playbook: run after GIM is loaded to enumerate GPU VFs per host.
+# Output is intended to be copied into host_vars/serverN.yml as ci_slot_vfs.
+#
+# Usage:
+#   ansible-playbook -i inventory discover-vfs.yml
+#   Then commit the updated host_vars files.
+
+- name: Discover GPU VFs
+  hosts: gpu_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    - name: List all GPU VFs by BDF (sorted)
+      ansible.builtin.shell:
+        cmd: lspci -D | grep -i 'Virtual Function' | grep -i 'amd\|radeon' | awk '{print $1}' | sort
+      register: discovered_vfs
+      changed_when: false
+
+    - name: Compute VFs per slot
+      ansible.builtin.set_fact:
+        vfs_per_slot: "{{ (discovered_vfs.stdout_lines | length) // (ci_slots | length) }}"
+
+    - name: Assert enough VFs for all slots
+      ansible.builtin.assert:
+        that:
+          - discovered_vfs.stdout_lines | length >= (ci_slots | length) * (vfs_per_slot | int)
+        fail_msg: >
+          Found {{ discovered_vfs.stdout_lines | length }} VFs but need
+          {{ (ci_slots | length) * (vfs_per_slot | int) }} for {{ ci_slots | length }} slots.
+
+    - name: Print VF assignment for host_vars
+      ansible.builtin.debug:
+        msg: |-
+          # Paste into host_vars/{{ inventory_hostname }}.yml:
+          ci_slot_vfs:
+          {% for slot in ci_slots.keys() | sort %}
+            {{ slot }}: "{{ discovered_vfs.stdout_lines[(loop.index0 * (vfs_per_slot | int)):((loop.index0 + 1) * (vfs_per_slot | int))] | join(',') }}"
+          {% endfor %}

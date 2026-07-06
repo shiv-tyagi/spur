@@ -1,0 +1,29 @@
+---
+# Ensure IOMMU kernel params are set for GPU passthrough.
+# Does NOT auto-reboot; sets a flag for the operator.
+
+- name: Ensure iommu=pt in GRUB cmdline
+  ansible.builtin.replace:
+    path: /etc/default/grub
+    regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT="(?:(?!iommu=pt).)*)"$'
+    replace: '\1 iommu=pt"'
+    backup: true
+  register: grub_iommu
+
+- name: Ensure pci=realloc=off in GRUB cmdline
+  ansible.builtin.replace:
+    path: /etc/default/grub
+    regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT="(?:(?!pci=realloc=off).)*)"$'
+    replace: '\1 pci=realloc=off"'
+    backup: true
+  register: grub_pci
+
+- name: Update GRUB
+  ansible.builtin.command:
+    cmd: update-grub
+  when: grub_iommu is changed or grub_pci is changed
+
+- name: Flag reboot required
+  ansible.builtin.debug:
+    msg: "REBOOT REQUIRED: GRUB IOMMU params were updated. Reboot to apply."
+  when: grub_iommu is changed or grub_pci is changed

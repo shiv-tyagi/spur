@@ -1,0 +1,17 @@
+#cloud-config
+ssh_pwauth: true
+
+users:
+  - name: ci
+    lock_passwd: false
+    passwd: __BUILD_PASSWORD_HASH__
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys: []
+
+package_update: false
+package_upgrade: false
+
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh

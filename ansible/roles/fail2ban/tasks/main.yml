@@ -1,0 +1,22 @@
+---
+# fail2ban: whitelist CI/admin IPs to prevent self-banning.
+
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Deploy fail2ban local config with whitelist
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+  notify: restart fail2ban
+
+- name: Enable fail2ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started

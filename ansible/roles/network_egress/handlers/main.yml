@@ -1,0 +1,9 @@
+---
+- name: restart nftables
+  ansible.builtin.systemd:
+    name: nftables
+    state: restarted
+
+- name: run egress allowlist update
+  ansible.builtin.command:
+    cmd: /opt/spur-ci/bin/update-egress-allowlist.sh

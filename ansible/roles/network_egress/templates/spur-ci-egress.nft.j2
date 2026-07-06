@@ -1,0 +1,29 @@
+#!/usr/sbin/nft -f
+# Spur CI egress rules: default-deny for slot VM networks.
+# VMs on virbr-* can only reach hosts in the allowed_egress set.
+# The set is populated by a systemd timer that resolves FQDNs.
+# Managed by Ansible.
+
+table inet spur_ci_egress {
+  set allowed_egress {
+    type ipv4_addr
+    flags interval
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+
+    # Allow established/related
+    ct state established,related accept
+
+    # Allow DNS (needed to resolve allowlisted hosts from within VMs)
+    iifname "virbr-*" udp dport 53 accept
+    iifname "virbr-*" tcp dport 53 accept
+
+    # Allow traffic to allowlisted IPs
+    iifname "virbr-*" ip daddr @allowed_egress accept
+
+    # Drop all other outbound from slot bridge interfaces
+    iifname "virbr-*" oifname != "virbr-*" drop
+  }
+}

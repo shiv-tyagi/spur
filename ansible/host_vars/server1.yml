@@ -1,0 +1,8 @@
+# Server 1: 149.28.118.43
+# Samsung 3.5TB NVMe (kernel: nvme0n1, confirmed blank)
+spur_ci_disk_by_id: /dev/disk/by-id/nvme-SAMSUNG_MZWLO3T8HCLS-00A07_S794NG0X618327
+
+# GPU VF PCI addresses per slot (populated by: ansible-playbook discover-vfs.yml)
+ci_slot_vfs:
+  a: "0000:05:02.0,0000:27:02.0,0000:47:02.0"
+  b: "0000:65:02.0,0000:85:02.0,0000:a7:02.0"

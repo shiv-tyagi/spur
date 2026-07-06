@@ -1,0 +1,85 @@
+---
+# Default-deny egress on per-slot libvirt networks.
+# Allow only GitHub, package mirrors, and k8s registries.
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure nftables include directory exists
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    mode: "0755"
+
+- name: Deploy egress nftables rules
+  ansible.builtin.template:
+    src: spur-ci-egress.nft.j2
+    dest: /etc/nftables.d/spur-ci-egress.nft
+    mode: "0644"
+  notify: restart nftables
+
+- name: Ensure main nftables.conf includes our rules
+  ansible.builtin.lineinfile:
+    path: /etc/nftables.conf
+    line: 'include "/etc/nftables.d/*.nft"'
+    create: true
+    mode: "0644"
+  notify: restart nftables
+
+- name: Enable nftables
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
+
+- name: Install dnsutils for dig
+  ansible.builtin.apt:
+    name: dnsutils
+    state: present
+
+- name: Deploy egress allowlist updater script
+  ansible.builtin.template:
+    src: update-egress-allowlist.sh.j2
+    dest: /opt/spur-ci/bin/update-egress-allowlist.sh
+    mode: "0755"
+  notify: run egress allowlist update
+
+- name: Deploy allowlist updater systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/spur-ci-egress-update.service
+    content: |
+      [Unit]
+      Description=Update Spur CI egress allowlist IPs
+      After=nftables.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/spur-ci/bin/update-egress-allowlist.sh
+    mode: "0644"
+
+- name: Deploy allowlist updater timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/spur-ci-egress-update.timer
+    content: |
+      [Unit]
+      Description=Refresh egress allowlist every 30 min
+
+      [Timer]
+      OnBootSec=1min
+      OnUnitActiveSec=30min
+
+      [Install]
+      WantedBy=timers.target
+    mode: "0644"
+
+- name: Enable allowlist updater timer
+  ansible.builtin.systemd:
+    name: spur-ci-egress-update.timer
+    daemon_reload: true
+    enabled: true
+    state: started
+

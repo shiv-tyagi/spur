@@ -1,0 +1,3 @@
+# Managed by Ansible — restricted sudo for CI user
+{{ ci_user }} ALL=(ALL) NOPASSWD: {% for cmd in ci_sudoers_commands %}{{ cmd }}{% if not loop.last %}, {% endif %}{% endfor %}
+
