@@ -235,16 +235,42 @@ jobs:
           pytest /tmp/e2e-assets/tests/native_host/e2e/ -v --junitxml=/tmp/results.xml
           REMOTE
 
+      - name: Apply RBAC and verify cluster state (k8s)
+        if: matrix.cluster_type == 'k8s'
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
+          NS="spur-ci-${{ github.run_id }}"
+
+          ssh $SSH_OPTS ci@"$DRIVER_IP" bash -s <<REMOTE
+          set -euo pipefail
+          export KUBECONFIG=/home/ci/.kube/config
+
+          # Create test namespace
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+          # Apply RBAC with namespace patched
+          sed "s/namespace: spur/namespace: $NS/g" \
+            /tmp/e2e-assets/tests/k8s/e2e/manifests/rbac.yaml | kubectl apply -f -
+
+          # Verify nodes are labeled
+          echo "=== Labeled nodes ==="
+          kubectl get nodes -l spur.amd.com/managed=true -o wide
+          REMOTE
+
       - name: Run tests inside driver VM (k8s)
         if: matrix.cluster_type == 'k8s'
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
+          NS="spur-ci-${{ github.run_id }}"
 
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
           export SPUR_CI_IMAGE=docker.io/library/spur:ci
+          export SPUR_TEST_NS="$NS"
           source /opt/spur-ci/test-venv/bin/activate
           pytest /tmp/e2e-assets/tests/k8s/e2e/ -v --junitxml=/tmp/results.xml
           REMOTE
