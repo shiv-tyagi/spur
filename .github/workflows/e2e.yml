@@ -276,7 +276,7 @@ jobs:
           REMOTE
 
       - name: Dump cluster diagnostics (k8s)
-        if: always() && matrix.cluster_type == 'k8s'
+        if: failure() && matrix.cluster_type == 'k8s'
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
