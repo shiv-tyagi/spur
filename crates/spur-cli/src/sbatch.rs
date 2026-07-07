@@ -648,9 +648,16 @@ fn candidate_script_path(cli_args: &[String]) -> Option<&str> {
     }
 }
 
-/// Default job name: explicit `-J`, else the script filename, else `"sbatch"`.
-fn default_job_name(job_name: Option<&str>, script: Option<&str>) -> String {
-    job_name.or(script).unwrap_or("sbatch").to_string()
+/// Default job name: explicit `-J`, else `"wrap"` for wrap-mode, else the
+/// script filename, else `"sbatch"` (stdin).
+fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool) -> String {
+    if let Some(name) = job_name {
+        return name.to_string();
+    }
+    if is_wrap {
+        return "wrap".to_string();
+    }
+    script.unwrap_or("sbatch").to_string()
 }
 
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
@@ -665,6 +672,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
 
     // Build the job spec
+    let is_wrap = args.wrap.is_some();
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
     {
@@ -682,7 +690,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .chdir
         .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
 
-    let name = default_job_name(args.job_name.as_deref(), args.script.as_deref());
+    let name = default_job_name(args.job_name.as_deref(), args.script.as_deref(), is_wrap);
 
     // Build GRES list
     let mut gres = args.gres;
@@ -1192,23 +1200,36 @@ echo "hello world"
     }
 
     #[test]
-    fn test_default_job_name_wrap_or_stdin() {
-        assert_eq!(default_job_name(None, None), "sbatch");
+    fn test_default_job_name_stdin() {
+        assert_eq!(default_job_name(None, None, false), "sbatch");
+    }
+
+    #[test]
+    fn test_default_job_name_wrap() {
+        assert_eq!(default_job_name(None, None, true), "wrap");
     }
 
     #[test]
     fn test_default_job_name_explicit() {
-        assert_eq!(default_job_name(Some("mine"), None), "mine");
+        assert_eq!(default_job_name(Some("mine"), None, false), "mine");
+    }
+
+    #[test]
+    fn test_default_job_name_explicit_overrides_wrap() {
+        assert_eq!(default_job_name(Some("mine"), None, true), "mine");
     }
 
     #[test]
     fn test_default_job_name_from_script() {
-        assert_eq!(default_job_name(None, Some("job.sh")), "job.sh");
+        assert_eq!(default_job_name(None, Some("job.sh"), false), "job.sh");
     }
 
     #[test]
     fn test_default_job_name_explicit_overrides_script() {
-        assert_eq!(default_job_name(Some("mine"), Some("job.sh")), "mine");
+        assert_eq!(
+            default_job_name(Some("mine"), Some("job.sh"), false),
+            "mine"
+        );
     }
 
     #[test]
