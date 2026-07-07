@@ -32,6 +32,8 @@ PRs are squash-merged, so the **PR title is the final commit message**. Use conv
 - **scope**: crate name (e.g. `spur-cli`, `spurctld`, `spur-core`). If no single crate applies, use a concise scope reflecting the area of change (e.g. `proto`, `deploy`, `config`).
 - **message**: imperative mood, lowercase, no trailing period.
 
+Only `feat`, `fix`, and `perf` appear in the release changelog. Non-user-facing work (CI, tooling, infra) must use `ci`, `build`, or `chore` so it stays out of release notes. CI enforces this: a PR titled `fix(ci): ...` will be rejected, use `ci: ...` instead.
+
 PR descriptions should be concise and readable — not line-by-line changelogs. Cover: what this fixes/adds, the approach taken, important design choices or trade-offs, planned follow-ups (if any), and how it was tested. Keep individual commits meaningful for reviewers.
 
 When filing issues, focus on the problem: what happened, what was expected, and how to reproduce. Do not prescribe a fix — that biases the person or agent addressing it.

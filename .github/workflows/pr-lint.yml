@@ -27,6 +27,18 @@ jobs:
           fi
           echo "PASS: PR title is valid."
 
+      - name: Reject changelog-visible types on infra scopes
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if echo "$PR_TITLE" | grep -Eq "^(feat|fix|perf)\((ci|cd|build|release|infra|e2e|docs|test|tests|style|chore|revert)\)"; then
+            echo "FAIL: '$PR_TITLE' uses a changelog-visible type (feat/fix/perf) with a non-product scope."
+            echo "Non-user-facing changes should use the right type instead. Examples:"
+            echo "  'ci(e2e): fix flaky test' not 'fix(e2e): fix flaky test'"
+            echo "  'test: fix broken fixture' not 'fix(test): fix broken fixture'"
+            exit 1
+          fi
+
   license-headers:
     name: SPDX License Headers
     runs-on: ubuntu-latest
