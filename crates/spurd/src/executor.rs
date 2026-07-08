@@ -59,6 +59,7 @@ pub struct JobLaunchConfig {
     pub environment: HashMap<String, String>,
     pub stdout_path: String,
     pub stderr_path: String,
+    pub stdin_path: String,
     pub cpus: u32,
     pub memory_mb: u64,
     pub gpu_devices: Vec<u32>,
@@ -238,6 +239,7 @@ async fn spawn_job_process(
         ref environment,
         ref stdout_path,
         ref stderr_path,
+        ref stdin_path,
         cpus,
         memory_mb,
         gpu_devices: _,
@@ -418,12 +420,20 @@ async fn spawn_job_process(
 
     // Launch the process
     let mut cmd = Command::new(&launch_cmd);
+    let stdin_stdio: Stdio = if stdin_path.is_empty() {
+        Stdio::null()
+    } else {
+        let resolved = resolve_output_path(stdin_path, job_id, work_dir);
+        let f = std::fs::File::open(&resolved)
+            .with_context(|| format!("failed to open stdin file: {}", resolved))?;
+        Stdio::from(f)
+    };
     cmd.args(&launch_args)
         .current_dir(work_dir)
         .envs(&env)
         .stdout(stdout_file.into_std().await)
         .stderr(stderr_file.into_std().await)
-        .stdin(Stdio::null())
+        .stdin(stdin_stdio)
         // Run the batch process in its own process group (pgid == its pid) so
         // signals can target the whole job tree without touching spurd's group.
         .process_group(0);

@@ -335,6 +335,7 @@ pub struct JobSpec {
     pub work_dir: String,
     pub stdout_path: Option<String>,
     pub stderr_path: Option<String>,
+    pub stdin_path: Option<String>,
     pub environment: HashMap<String, String>,
 
     // Time
@@ -442,6 +443,7 @@ impl Default for JobSpec {
             work_dir: String::from("/tmp"),
             stdout_path: None,
             stderr_path: None,
+            stdin_path: None,
             environment: HashMap::new(),
             time_limit: None,
             time_min: None,

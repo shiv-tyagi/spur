@@ -93,6 +93,18 @@ pub struct SrunArgs {
     #[arg(long, default_value = "none")]
     pub mpi: String,
 
+    /// Stdout file path (supports %j for job ID)
+    #[arg(short = 'o', long)]
+    pub output: Option<String>,
+
+    /// Stderr file path (supports %j for job ID)
+    #[arg(short = 'e', long)]
+    pub error: Option<String>,
+
+    /// Stdin file path
+    #[arg(short = 'i', long)]
+    pub input: Option<String>,
+
     /// Job step label output
     #[arg(short = 'l', long)]
     pub label: bool,
@@ -184,6 +196,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
+    let stdout_path = args.output.clone().unwrap_or_default();
+    let stderr_path = args.error.clone().unwrap_or_default();
+    let stdin_path = args.input.clone().unwrap_or_default();
+
     let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
 
     // Build a wrapper script from the command
@@ -245,6 +261,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         gres,
         script,
         work_dir: work_dir.clone(),
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+        stdin_path: stdin_path.clone(),
         environment,
         time_limit,
         constraint: args.constraint.unwrap_or_default(),
@@ -330,6 +349,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                             job_id,
                             job.exit_code,
                             &work_dir,
+                            &stdout_path,
                             &hooks,
                             false,
                         )
@@ -353,9 +373,21 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    // Stream output if possible (best-effort), then poll for terminal state.
-    let output_streamed = try_stream_output(&mut client, &nodelist, job_id).await;
-    poll_for_completion(&mut client, job_id, &work_dir, &hooks, output_streamed).await;
+    // Stream output to terminal only when the user didn't ask for file output.
+    let output_streamed = if stdout_path.is_empty() {
+        try_stream_output(&mut client, &nodelist, job_id).await
+    } else {
+        false
+    };
+    poll_for_completion(
+        &mut client,
+        job_id,
+        &work_dir,
+        &stdout_path,
+        &hooks,
+        output_streamed,
+    )
+    .await;
 
     Ok(())
 }
@@ -422,6 +454,7 @@ async fn poll_for_completion(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
     job_id: u32,
     work_dir: &str,
+    stdout_path: &str,
     hooks: &HooksConfig,
     output_streamed: bool,
 ) {
@@ -446,6 +479,7 @@ async fn poll_for_completion(
                             job_id,
                             job.exit_code,
                             work_dir,
+                            stdout_path,
                             hooks,
                             output_streamed,
                         )
@@ -475,6 +509,7 @@ async fn handle_terminal_state(
     job_id: u32,
     exit_code: i32,
     work_dir: &str,
+    stdout_path: &str,
     hooks: &HooksConfig,
     output_streamed: bool,
 ) -> ! {
@@ -486,16 +521,18 @@ async fn handle_terminal_state(
         }
     }
 
+    let should_print = !output_streamed && stdout_path.is_empty();
+
     match state {
         JobState::JobCompleted => {
-            if !output_streamed {
-                print_job_output(work_dir, job_id).await;
+            if should_print {
+                print_job_output(work_dir, stdout_path, job_id).await;
             }
             std::process::exit(exit_code);
         }
         JobState::JobFailed => {
-            if !output_streamed {
-                print_job_output(work_dir, job_id).await;
+            if should_print {
+                print_job_output(work_dir, stdout_path, job_id).await;
             }
             eprintln!("srun: job {} failed with exit code {}", job_id, exit_code);
             std::process::exit(exit_code.max(1));
@@ -524,10 +561,30 @@ async fn handle_terminal_state(
 }
 
 /// Print job output file to stdout (best-effort).
-async fn print_job_output(work_dir: &str, job_id: u32) {
-    let path = format!("{}/spur-{}.out", work_dir, job_id);
+async fn print_job_output(work_dir: &str, stdout_path: &str, job_id: u32) {
+    let path = resolve_output_path_client(stdout_path, job_id, work_dir);
     if let Ok(content) = tokio::fs::read_to_string(&path).await {
         print!("{}", content);
+    }
+}
+
+/// Client-side output path resolution, mirroring the agent's logic.
+fn resolve_output_path_client(pattern: &str, job_id: u32, work_dir: &str) -> String {
+    let resolved = if pattern.is_empty() {
+        format!("spur-{}.out", job_id)
+    } else {
+        pattern
+            .replace("%j", &job_id.to_string())
+            .replace("%J", &job_id.to_string())
+    };
+
+    if std::path::Path::new(&resolved).is_absolute() {
+        resolved
+    } else {
+        std::path::PathBuf::from(work_dir)
+            .join(resolved)
+            .to_string_lossy()
+            .into()
     }
 }
 
@@ -567,6 +624,10 @@ async fn run_as_step(
         .into_inner()
         .step_id;
 
+    if args.input.is_some() {
+        eprintln!("srun: warning: --input is not supported in step mode, ignoring");
+    }
+
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
 
     let resp = client
@@ -586,11 +647,38 @@ async fn run_as_step(
     if !resp.node.is_empty() {
         eprintln!("srun: dispatched to node {}", resp.node);
     }
+
     if !resp.stdout.is_empty() {
-        print!("{}", resp.stdout);
+        if let Some(ref path) = args.output {
+            let resolved = resolve_output_path_client(path, job_id, work_dir);
+            if let Some(parent) = std::path::Path::new(&resolved).parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+            if let Err(e) = tokio::fs::write(&resolved, &resp.stdout).await {
+                eprintln!(
+                    "srun: warning: failed to write stdout to {}: {}",
+                    resolved, e
+                );
+            }
+        } else {
+            print!("{}", resp.stdout);
+        }
     }
     if !resp.stderr.is_empty() {
-        eprint!("{}", resp.stderr);
+        if let Some(ref path) = args.error {
+            let resolved = resolve_output_path_client(path, job_id, work_dir);
+            if let Some(parent) = std::path::Path::new(&resolved).parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+            if let Err(e) = tokio::fs::write(&resolved, &resp.stderr).await {
+                eprintln!(
+                    "srun: warning: failed to write stderr to {}: {}",
+                    resolved, e
+                );
+            }
+        } else {
+            eprint!("{}", resp.stderr);
+        }
     }
 
     // SrunEpilog: run locally after step completes (failure logged only)
@@ -675,5 +763,73 @@ mod tests {
         .expect("parse failed");
         assert_eq!(args.nodelist.as_deref(), Some("node001"));
         assert_eq!(args.exclude.as_deref(), Some("node002"));
+    }
+
+    #[test]
+    fn parses_output_error_input_short() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "-o",
+            "/tmp/out.txt",
+            "-e",
+            "/tmp/err.txt",
+            "-i",
+            "/tmp/in.txt",
+            "hostname",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.output.as_deref(), Some("/tmp/out.txt"));
+        assert_eq!(args.error.as_deref(), Some("/tmp/err.txt"));
+        assert_eq!(args.input.as_deref(), Some("/tmp/in.txt"));
+    }
+
+    #[test]
+    fn parses_output_error_input_long() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--output",
+            "job-%j.out",
+            "--error",
+            "job-%j.err",
+            "--input",
+            "/dev/null",
+            "hostname",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.output.as_deref(), Some("job-%j.out"));
+        assert_eq!(args.error.as_deref(), Some("job-%j.err"));
+        assert_eq!(args.input.as_deref(), Some("/dev/null"));
+    }
+
+    #[test]
+    fn output_error_input_default_to_none() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
+        assert!(args.output.is_none());
+        assert!(args.error.is_none());
+        assert!(args.input.is_none());
+    }
+
+    #[test]
+    fn resolve_output_path_client_defaults() {
+        assert_eq!(
+            resolve_output_path_client("", 42, "/work"),
+            "/work/spur-42.out"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_client_pattern() {
+        assert_eq!(
+            resolve_output_path_client("results-%j.log", 99, "/home/user"),
+            "/home/user/results-99.log"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_client_absolute() {
+        assert_eq!(
+            resolve_output_path_client("/shared/output-%j.txt", 7, "/work"),
+            "/shared/output-7.txt"
+        );
     }
 }
