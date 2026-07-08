@@ -292,7 +292,7 @@ impl SlurmController for ControllerService {
 
         self.cluster
             .cancel_job(job_id, &req.user)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(cluster_err_to_status)?;
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
@@ -333,7 +333,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .suspend_job(job_id, &req.user)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(cluster_err_to_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
@@ -367,7 +367,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .resume_job(job_id, &req.user)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(cluster_err_to_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
@@ -1988,6 +1988,13 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
         ReservationError::AlreadyExists(m) => Status::already_exists(m),
         ReservationError::Raft(m) => Status::internal(m),
     }
+}
+
+fn cluster_err_to_status(err: anyhow::Error) -> Status {
+    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
+        return Status::permission_denied(err.to_string());
+    }
+    Status::internal(err.to_string())
 }
 
 fn node_complete_to_status(err: NodeCompleteError) -> Status {
