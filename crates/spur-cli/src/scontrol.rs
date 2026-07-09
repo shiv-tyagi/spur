@@ -323,7 +323,11 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     format_ts(job.end_time.as_ref()),
                 );
                 println!("   WorkDir={}", job.work_dir);
-                println!("   StdOut={} StdErr={}", job.stdout_path, job.stderr_path);
+                print!("   StdOut={} StdErr={}", job.stdout_path, job.stderr_path);
+                if !job.stdin_path.is_empty() {
+                    print!(" StdIn={}", job.stdin_path);
+                }
+                println!();
                 println!(
                     "   ExitCode={} DerivedExitCode={} Priority={}",
                     format_exit(job.exit_code, job.exit_signal),
