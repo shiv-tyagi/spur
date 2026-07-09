@@ -117,6 +117,9 @@ CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS exit_signal INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS derived_exit_code INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
+-- No FK to qos(name): a stale reference (QOS deleted after being set as a
+-- default) must degrade gracefully at read time, not be blocked here.
+ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 "#;
 
 /// Record a job start in the database.
@@ -482,13 +485,16 @@ pub struct AccountRecord {
     pub max_running_jobs: Option<i32>,
 }
 
-/// Add a user-account association.
+/// Add a user-account association. Like `upsert_account`/`upsert_qos`, this
+/// is a full resend on modify, not a partial patch: an empty `default_qos`
+/// clears any existing default rather than preserving it.
 pub async fn add_user(
     pool: &PgPool,
     user: &str,
     account: &str,
     admin_level: &str,
     is_default: bool,
+    default_qos: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -504,20 +510,46 @@ pub async fn add_user(
     .execute(pool)
     .await?;
 
-    // Also create association
-    sqlx::query(
+    // partition_name is nullable (NULL != NULL), so ON CONFLICT on it can't
+    // upsert; update explicitly, serialized per (user, account) so two
+    // concurrent first-time calls can't both insert.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)")
+        .bind(user)
+        .bind(account)
+        .execute(&mut *tx)
+        .await?;
+
+    let updated = sqlx::query(
         r#"
-        INSERT INTO associations (user_name, account, is_default)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (user_name, account, partition_name) DO UPDATE SET is_default = $3
+        UPDATE associations SET is_default = $3, default_qos = NULLIF($4, '')
+        WHERE user_name = $1 AND account = $2
+          AND (partition_name IS NULL OR partition_name = '')
         "#,
     )
     .bind(user)
     .bind(account)
     .bind(is_default)
-    .execute(pool)
+    .bind(default_qos)
+    .execute(&mut *tx)
     .await?;
 
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO associations (user_name, account, is_default, default_qos)
+            VALUES ($1, $2, $3, NULLIF($4, ''))
+            "#,
+        )
+        .bind(user)
+        .bind(account)
+        .bind(is_default)
+        .bind(default_qos)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -536,14 +568,37 @@ pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Re
     Ok(())
 }
 
-/// List users, optionally filtered by account.
+/// List users, joining each one's own association row for `default_qos`.
+/// `DISTINCT ON ... a.id DESC` picks the newest row if legacy duplicates
+/// exist (pre-dating the add_user upsert fix); it never touches the others.
 pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<Vec<UserRecord>> {
     let rows = if let Some(acct) = account {
-        sqlx::query("SELECT name, account, admin_level, default_account FROM users WHERE account = $1 ORDER BY name")
-            .bind(acct).fetch_all(pool).await?
+        sqlx::query(
+            r#"
+            SELECT DISTINCT ON (u.name, u.account)
+                u.name, u.account, u.admin_level, u.default_account, a.default_qos
+            FROM users u
+            LEFT JOIN associations a
+                ON a.user_name = u.name AND a.account = u.account
+                    AND (a.partition_name IS NULL OR a.partition_name = '')
+            WHERE u.account = $1
+            ORDER BY u.name, u.account, a.id DESC NULLS LAST
+            "#,
+        )
+        .bind(acct)
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query(
-            "SELECT name, account, admin_level, default_account FROM users ORDER BY name, account",
+            r#"
+            SELECT DISTINCT ON (u.name, u.account)
+                u.name, u.account, u.admin_level, u.default_account, a.default_qos
+            FROM users u
+            LEFT JOIN associations a
+                ON a.user_name = u.name AND a.account = u.account
+                    AND (a.partition_name IS NULL OR a.partition_name = '')
+            ORDER BY u.name, u.account, a.id DESC NULLS LAST
+            "#,
         )
         .fetch_all(pool)
         .await?
@@ -556,6 +611,7 @@ pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<
             account: r.get("account"),
             admin_level: r.get("admin_level"),
             default_account: r.get("default_account"),
+            default_qos: r.get("default_qos"),
         })
         .collect())
 }
@@ -566,6 +622,7 @@ pub struct UserRecord {
     pub account: String,
     pub admin_level: String,
     pub default_account: Option<String>,
+    pub default_qos: Option<String>,
 }
 
 /// Create or update a QOS.
@@ -619,6 +676,17 @@ pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Whether a QOS with this name exists. Used to reject setting a
+/// nonexistent QOS as a default at write time, rather than only degrading
+/// gracefully later when it's read back and no longer resolves.
+pub async fn qos_exists(pool: &PgPool, name: &str) -> anyhow::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM qos WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
 }
 
 /// List all QOS.
@@ -857,6 +925,200 @@ mod job_history_tests {
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_round_trips_default_qos() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_qosdef_user_{pid}");
+        let account = format!("spur_qosdef_acct_{pid}");
+        let qos_name = format!("spur_qosdef_qos_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&qos_name)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_qos(
+            &pool, &qos_name, "d", 0, "off", 1.0, None, None, None, None, None, None,
+        )
+        .await?;
+
+        add_user(&pool, &user, &account, "none", true, &qos_name).await?;
+        let got = list_users(&pool, Some(&account))
+            .await?
+            .into_iter()
+            .find(|u| u.name == user)
+            .expect("user present");
+        assert_eq!(got.default_qos.as_deref(), Some(qos_name.as_str()));
+
+        // Upsert again with an empty default_qos: clears it (full resend,
+        // not a partial patch — matches modify account/qos semantics).
+        add_user(&pool, &user, &account, "none", true, "").await?;
+        let got = list_users(&pool, Some(&account))
+            .await?
+            .into_iter()
+            .find(|u| u.name == user)
+            .expect("user present");
+        assert_eq!(got.default_qos, None);
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&qos_name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_never_creates_a_duplicate_association_row() -> anyhow::Result<()> {
+        // Repeated add_user calls (what `sacctmgr modify user` now does)
+        // must converge on one row, not accumulate duplicates.
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_nodupe_user_{pid}");
+        let account = format!("spur_nodupe_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+
+        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(
+            &pool,
+            &user,
+            &account,
+            "none",
+            true,
+            "highprio-does-not-need-to-exist",
+        )
+        .await?;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM associations WHERE user_name = $1 AND account = $2",
+        )
+        .bind(&user)
+        .bind(&account)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            count, 1,
+            "repeated add_user must update in place, not accumulate rows"
+        );
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_reads_default_qos_from_a_legacy_empty_partition_row() -> anyhow::Result<()>
+    {
+        // The join must match partition_name = '' as well as NULL, same as
+        // add_user's UPDATE, or this row's default_qos would be invisible.
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_emptypart_user_{pid}");
+        let account = format!("spur_emptypart_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        sqlx::query("INSERT INTO users (name, account, admin_level) VALUES ($1, $2, 'none')")
+            .bind(&user)
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO associations (user_name, account, partition_name, default_qos) \
+             VALUES ($1, $2, '', 'highprio')",
+        )
+        .bind(&user)
+        .bind(&account)
+        .execute(&pool)
+        .await?;
+
+        let got = list_users(&pool, Some(&account))
+            .await?
+            .into_iter()
+            .find(|u| u.name == user)
+            .expect("user present");
+        assert_eq!(got.default_qos.as_deref(), Some("highprio"));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
             .execute(&pool)
             .await?;
         Ok(())

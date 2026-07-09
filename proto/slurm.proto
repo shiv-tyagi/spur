@@ -818,6 +818,10 @@ message AddUserRequest {
   string account = 2;
   string admin_level = 3;
   bool is_default = 4;
+  // Default QOS for this user's association with `account`. Like every
+  // other field here, this is a full resend on upsert, not a partial
+  // patch: empty clears an existing default (matches modify account/qos).
+  string default_qos = 5;
 }
 
 message RemoveUserRequest {
@@ -838,6 +842,7 @@ message UserInfo {
   string account = 2;
   string admin_level = 3;
   string default_account = 4;
+  string default_qos = 5;
 }
 
 message CreateQosRequest {

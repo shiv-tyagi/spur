@@ -44,3 +44,24 @@ pub async fn fairshare_factors(
         now,
     ))
 }
+
+/// Load the (user, account) -> default QOS and user -> default account maps
+/// backing the controller's `AssociationCache`.
+pub async fn association_maps(
+    pool: &PgPool,
+) -> anyhow::Result<(HashMap<(String, String), String>, HashMap<String, String>)> {
+    let users = db::list_users(pool, None).await?;
+
+    let mut default_qos = HashMap::new();
+    let mut default_account = HashMap::new();
+    for u in users {
+        if let Some(qos) = u.default_qos {
+            default_qos.insert((u.name.clone(), u.account), qos);
+        }
+        if let Some(acct) = u.default_account {
+            default_account.insert(u.name, acct);
+        }
+    }
+
+    Ok((default_qos, default_account))
+}
