@@ -179,7 +179,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .cancel_job(spur_proto::proto::CancelJobRequest {
                     job_id,
                     signal: 0,
-                    user: String::new(),
+                    user: whoami::username().unwrap_or_else(|_| "unknown".into()),
                 })
                 .await
                 .context("requeue failed")?;
@@ -194,7 +194,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             client
                 .suspend_job(spur_proto::proto::SuspendJobRequest {
                     job_id,
-                    user: String::new(),
+                    user: whoami::username().unwrap_or_else(|_| "unknown".into()),
                 })
                 .await
                 .context("suspend failed")?;
@@ -209,7 +209,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             client
                 .resume_job(spur_proto::proto::ResumeJobRequest {
                     job_id,
-                    user: String::new(),
+                    user: whoami::username().unwrap_or_else(|_| "unknown".into()),
                 })
                 .await
                 .context("resume failed")?;
