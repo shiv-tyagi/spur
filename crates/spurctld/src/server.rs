@@ -333,7 +333,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .suspend_job(job_id, &req.user)
-            .map_err(cluster_err_to_status)?;
+            .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
@@ -367,7 +367,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .resume_job(job_id, &req.user)
-            .map_err(cluster_err_to_status)?;
+            .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
@@ -1995,6 +1995,13 @@ fn cluster_err_to_status(err: anyhow::Error) -> Status {
         return Status::permission_denied(err.to_string());
     }
     Status::internal(err.to_string())
+}
+
+fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
+    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
+        return Status::permission_denied(err.to_string());
+    }
+    Status::failed_precondition(err.to_string())
 }
 
 fn node_complete_to_status(err: NodeCompleteError) -> Status {

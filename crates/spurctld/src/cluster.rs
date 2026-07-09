@@ -451,7 +451,8 @@ impl ClusterManager {
         .into())
     }
 
-    /// Cancel a job. The requesting `user` must be the job owner or root.
+    /// Cancel a job. The requesting `user` must be the job owner, root, or
+    /// empty (trusted internal/daemon calls).
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
@@ -479,6 +480,7 @@ impl ClusterManager {
     }
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
+    /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
@@ -499,6 +501,7 @@ impl ClusterManager {
     }
 
     /// Resume a suspended job: validate state, record through Raft, fold suspended time.
+    /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn resume_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
@@ -7585,6 +7588,110 @@ mod tests {
         cm.cancel_job(job_id, "").unwrap();
         settle(&cm, job_id, JobState::Cancelled);
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_job_wrong_user_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("sus-auth"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let result = cm.suspend_job(id, "other_user");
+        assert!(
+            result.is_err(),
+            "non-owner must not suspend another user's job"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot") && err_msg.contains("suspend"),
+            "error should mention the denied action: {err_msg}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_job_root_allowed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("sus-root"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.suspend_job(id, "root").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_job_wrong_user_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("res-auth"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Suspended);
+
+        let result = cm.resume_job(id, "other_user");
+        assert!(
+            result.is_err(),
+            "non-owner must not resume another user's job"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot") && err_msg.contains("resume"),
+            "error should mention the denied action: {err_msg}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_job_root_allowed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("res-root"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Suspended);
+
+        cm.resume_job(id, "root").unwrap();
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
