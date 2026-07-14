@@ -238,10 +238,15 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.account.as_str())
         };
+        let name = if req.name.is_empty() {
+            None
+        } else {
+            Some(req.name.as_str())
+        };
 
         let jobs = self
             .cluster
-            .get_jobs(&states, user, partition, account, &req.job_ids);
+            .get_jobs(&states, user, partition, account, name, &req.job_ids);
 
         let proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
 
@@ -1558,6 +1563,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.script)
         },
         argv: spec.argv,
+        script_args: spec.script_args,
         work_dir: if spec.work_dir.is_empty() {
             "/tmp".into()
         } else {
@@ -1796,6 +1802,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         array_job_id: job.spec.array_job_id.unwrap_or(0),
         array_task_id: job.spec.array_task_id.unwrap_or(0),
         reservation: job.spec.reservation.clone().unwrap_or_default(),
+        comment: job.spec.comment.clone().unwrap_or_default(),
     }
 }
 

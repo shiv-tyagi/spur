@@ -302,6 +302,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 
             for job in resp.into_inner().jobs {
                 println!("JobId={} JobName={}", job.job_id, job.name);
+                if !job.comment.is_empty() {
+                    println!("   Comment={}", job.comment);
+                }
                 println!("   UserId={} Account={}", job.user, job.account);
                 println!("   Partition={} QOS={}", job.partition, job.qos);
                 println!(

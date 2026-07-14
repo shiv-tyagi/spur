@@ -32,6 +32,10 @@ pub struct SqueueArgs {
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
+    /// Show only jobs with this name
+    #[arg(short = 'n', long)]
+    pub name: Option<String>,
+
     /// Output format string
     #[arg(short = 'o', long)]
     pub format: Option<String>,
@@ -105,6 +109,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             partition: args.partition.unwrap_or_default(),
             account: args.account.unwrap_or_default(),
             job_ids,
+            name: args.name.unwrap_or_default(),
         })
         .await
         .context("failed to get jobs")?;
@@ -155,6 +160,8 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'V' => format_timestamp(job.submit_time.as_ref()),
         'v' => job.reservation.clone(),
         'e' => format_timestamp(job.end_time.as_ref()),
+        'k' => job.comment.clone(),
+        'A' => job.job_id.to_string(),
         _ => "?".into(),
     }
 }

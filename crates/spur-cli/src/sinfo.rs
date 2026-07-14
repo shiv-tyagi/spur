@@ -118,7 +118,7 @@ fn group_nodes_by_display_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(String, Vec<
 }
 
 fn render_sinfo_output(
-    fields: &[format_engine::FormatField],
+    fields: &[format_engine::FormatToken],
     partitions: &[PartitionInfo],
     nodes: &[NodeInfo],
     node_oriented: bool,
@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    fn default_fields() -> Vec<format_engine::FormatField> {
+    fn default_fields() -> Vec<format_engine::FormatToken> {
         format_engine::parse_format(
             format_engine::SINFO_DEFAULT_FORMAT,
             &format_engine::sinfo_header,

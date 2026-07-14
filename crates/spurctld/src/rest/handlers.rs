@@ -44,10 +44,11 @@ pub async fn get_jobs(
     let user = query.user.as_deref();
     let partition = query.partition.as_deref();
     let account = query.account.as_deref();
+    let name = query.name.as_deref();
 
     let jobs = state
         .cluster
-        .get_jobs(&states, user, partition, account, &[]);
+        .get_jobs(&states, user, partition, account, name, &[]);
     let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
 
     Ok(ApiResponse::ok(JobsData { jobs: json_jobs }))
