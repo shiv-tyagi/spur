@@ -35,6 +35,32 @@ openraft::declare_raft_types!(
 
 pub type SpurRaft = Raft<SpurTypeConfig>;
 
+/// Maximum size of a single Raft gRPC message (request or response), in bytes.
+///
+/// tonic defaults both encode and decode limits to 4 MiB. Snapshots ship in
+/// chunks of `RAFT_SNAPSHOT_MAX_CHUNK_SIZE` raw bytes, and `serde_json` inflates
+/// the chunk's `Vec<u8>` payload roughly 3.4x (each byte becomes a decimal
+/// integer plus a comma), so the largest message we ever put on the wire is
+/// about `3.4 * RAFT_SNAPSHOT_MAX_CHUNK_SIZE`. This limit keeps large headroom
+/// over that bound. Invariant: `4 * RAFT_SNAPSHOT_MAX_CHUNK_SIZE < RAFT_MAX_MESSAGE_SIZE`.
+pub const RAFT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+
+/// Raw bytes per `install_snapshot` chunk. Bounded so the JSON-encoded message
+/// stays well under `RAFT_MAX_MESSAGE_SIZE` (see the invariant above). A larger
+/// snapshot simply ships in more chunks.
+pub const RAFT_SNAPSHOT_MAX_CHUNK_SIZE: u64 = 1024 * 1024;
+
+/// Build a Raft gRPC client with message-size limits raised to
+/// `RAFT_MAX_MESSAGE_SIZE`. Used by both the live network path and tests so the
+/// exact transport configuration is covered.
+pub(crate) fn raft_client(
+    channel: tonic::transport::Channel,
+) -> spur_proto::raft_proto::raft_internal_client::RaftInternalClient<tonic::transport::Channel> {
+    spur_proto::raft_proto::raft_internal_client::RaftInternalClient::new(channel)
+        .max_decoding_message_size(RAFT_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(RAFT_MAX_MESSAGE_SIZE)
+}
+
 /// Set when a committed WAL entry transitions a job to a terminal state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct JobFinalized {
@@ -594,9 +620,7 @@ impl SpurNetworkConnection {
                         &std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()),
                     ))
                 })?;
-            self.client = Some(
-                spur_proto::raft_proto::raft_internal_client::RaftInternalClient::new(channel),
-            );
+            self.client = Some(raft_client(channel));
         }
         Ok(self.client.as_mut().unwrap())
     }
@@ -775,6 +799,7 @@ pub async fn start_raft_with_recovery_mode(
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_max_chunk_size: RAFT_SNAPSHOT_MAX_CHUNK_SIZE,
         ..Default::default()
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
