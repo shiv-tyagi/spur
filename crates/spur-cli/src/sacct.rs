@@ -407,7 +407,11 @@ mod tests {
             &sacct_field_spec,
             &sacct_header,
         );
-        assert_eq!(fields.len(), 4);
+        let field_count = fields
+            .iter()
+            .filter(|t| matches!(t, format_engine::FormatToken::Field(_)))
+            .count();
+        assert_eq!(field_count, 4);
         let mut j = job(0, 0, 0);
         j.name = "train".into();
         j.partition = "gpu".into();

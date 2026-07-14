@@ -393,6 +393,7 @@ impl ClusterManager {
         user: Option<&str>,
         partition: Option<&str>,
         account: Option<&str>,
+        name: Option<&str>,
         job_ids: &[JobId],
     ) -> Vec<Job> {
         let matches = |j: &Job| -> bool {
@@ -411,6 +412,11 @@ impl ClusterManager {
             }
             if let Some(a) = account {
                 if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
+                    return false;
+                }
+            }
+            if let Some(n) = name {
+                if !n.is_empty() && !n.split(',').any(|pat| pat.trim() == j.spec.name) {
                     return false;
                 }
             }
@@ -4641,6 +4647,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         );
         assert!(
@@ -5496,7 +5503,8 @@ mod tests {
         assert_eq!(m.running_cpus, 0);
 
         // Snapshot matches a full scan of the job map.
-        let expected = JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, &[]).iter());
+        let expected =
+            JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, None, &[]).iter());
         assert_eq!(cm.job_metrics(), expected);
     }
 
@@ -8879,19 +8887,48 @@ mod tests {
         submit_array_task(&cm, 12, 10, 1);
 
         // Query the parent id explicitly.
-        let got = cm.get_jobs(&[], None, None, None, &[10]);
+        let got = cm.get_jobs(&[], None, None, None, None, &[10]);
         assert_eq!(got.len(), 1, "parent id should synthesize one record");
         assert_eq!(got[0].job_id, 10);
         assert_eq!(got[0].state, JobState::Pending);
         assert_eq!(got[0].spec.array_job_id, Some(10));
 
         // Querying a real task id still returns that task, not the parent.
-        let got_task = cm.get_jobs(&[], None, None, None, &[11]);
+        let got_task = cm.get_jobs(&[], None, None, None, None, &[11]);
         assert_eq!(got_task.len(), 1);
         assert_eq!(got_task[0].job_id, 11);
 
         // Unknown id → empty.
-        assert!(cm.get_jobs(&[], None, None, None, &[999]).is_empty());
+        assert!(cm.get_jobs(&[], None, None, None, None, &[999]).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_filters_by_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        submit_and_wait(&cm, basic_spec("alpha"));
+        submit_and_wait(&cm, basic_spec("beta"));
+        submit_and_wait(&cm, basic_spec("alpha"));
+
+        let all = cm.get_jobs(&[], None, None, None, None, &[]);
+        assert_eq!(all.len(), 3);
+
+        let alphas = cm.get_jobs(&[], None, None, None, Some("alpha"), &[]);
+        assert_eq!(alphas.len(), 2);
+        assert!(alphas.iter().all(|j| j.spec.name == "alpha"));
+
+        let betas = cm.get_jobs(&[], None, None, None, Some("beta"), &[]);
+        assert_eq!(betas.len(), 1);
+
+        let multi = cm.get_jobs(&[], None, None, None, Some("alpha,beta"), &[]);
+        assert_eq!(multi.len(), 3);
+
+        let none = cm.get_jobs(&[], None, None, None, Some("nonexistent"), &[]);
+        assert!(none.is_empty());
+
+        let empty = cm.get_jobs(&[], None, None, None, Some(""), &[]);
+        assert_eq!(empty.len(), 3);
     }
 
     // --- Partition matching tests ---

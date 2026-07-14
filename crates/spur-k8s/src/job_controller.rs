@@ -765,6 +765,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         gres: spec.gres.clone(),
         script: spec.script.clone().unwrap_or_default(),
         argv: spec.argv.clone(),
+        script_args: spec.script_args.clone(),
         work_dir: spec.work_dir.clone(),
         stdout_path: spec.stdout_path.clone().unwrap_or_default(),
         stderr_path: spec.stderr_path.clone().unwrap_or_default(),

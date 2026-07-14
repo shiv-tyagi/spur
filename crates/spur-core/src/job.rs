@@ -346,6 +346,8 @@ pub struct JobSpec {
     // Execution
     pub script: Option<String>,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub script_args: Vec<String>,
     pub work_dir: String,
     pub stdout_path: Option<String>,
     pub stderr_path: Option<String>,
@@ -454,6 +456,7 @@ impl Default for JobSpec {
             gres: Vec::new(),
             script: None,
             argv: Vec::new(),
+            script_args: Vec::new(),
             work_dir: String::from("/tmp"),
             stdout_path: None,
             stderr_path: None,

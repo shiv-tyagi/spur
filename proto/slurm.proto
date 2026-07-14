@@ -148,6 +148,7 @@ message JobSpec {
   bool host_ipc = 68;              // Share host IPC namespace
   string shm_size = 69;            // Shared memory size (e.g., "64Gi")
   map<string, string> extra_resources = 80; // Custom device plugin resources
+  repeated string script_args = 81;          // Positional args for the batch script ($1, $2, ...)
 
   // Container
   string container_image = 70;     // OCI image ref or squashfs path
@@ -201,6 +202,8 @@ message JobInfo {
 
   // Reservation
   string reservation = 52;
+
+  string comment = 53;
 }
 
 message NodeInfo {
@@ -389,6 +392,7 @@ message GetJobsRequest {
   string partition = 3;
   string account = 4;
   repeated uint32 job_ids = 5;
+  string name = 6;
 }
 
 message GetJobsResponse {

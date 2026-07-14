@@ -121,6 +121,7 @@ pub struct JobsQuery {
     pub partition: Option<String>,
     pub state: Option<String>,
     pub account: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]

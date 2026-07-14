@@ -66,6 +66,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             partition: String::new(),
             account: String::new(),
             job_ids,
+            name: String::new(),
         })
         .await
         .context("failed to get jobs")?;

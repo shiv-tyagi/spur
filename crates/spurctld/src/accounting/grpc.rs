@@ -201,6 +201,7 @@ impl SlurmAccounting for AccountingService {
                 array_job_id: 0,
                 array_task_id: 0,
                 reservation: r.reservation.clone(),
+                comment: String::new(),
             })
             .collect();
 

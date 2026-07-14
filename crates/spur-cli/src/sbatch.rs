@@ -269,12 +269,20 @@ pub struct SbatchArgs {
     )]
     pub controller: String,
 
+    /// Print only the job ID on success
+    #[arg(long)]
+    pub parsable: bool,
+
     /// Wrap the given command in a minimal shell script (mutually exclusive with a script file)
     #[arg(long, conflicts_with = "script")]
     pub wrap: Option<String>,
 
     /// The batch script file
     pub script: Option<String>,
+
+    /// Arguments passed to the batch script as $1, $2, etc.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub script_args: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -632,20 +640,16 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-/// The token to treat as a batch script path for `#SBATCH` pre-parsing, if any.
-/// Returns `None` when `--wrap` is used (wrap has no script file) or when the
-/// last token is a flag / the `sbatch` argv[0].
-fn candidate_script_path(cli_args: &[String]) -> Option<&str> {
-    if cli_args
-        .iter()
-        .any(|a| a == "--wrap" || a.starts_with("--wrap="))
-    {
+/// Identify the script file for `#SBATCH` directive pre-parsing.
+///
+/// Uses a lightweight clap pre-parse to extract the `script` positional,
+/// which is reliable even when trailing `script_args` are present.
+fn candidate_script_path(cli_args: &[String]) -> Option<String> {
+    let pre = SbatchArgs::try_parse_from(cli_args).ok()?;
+    if pre.wrap.is_some() {
         return None;
     }
-    match cli_args.last() {
-        Some(last) if !last.starts_with('-') && last != "sbatch" => Some(last.as_str()),
-        _ => None,
-    }
+    pre.script
 }
 
 /// Default job name: explicit `-J`, else `"wrap"` for wrap-mode, else the
@@ -662,7 +666,7 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
 
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     let script_content =
-        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(p).ok());
+        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(&p).ok());
 
     let directive_args = script_content
         .as_deref()
@@ -673,6 +677,9 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
     // Build the job spec
     let is_wrap = args.wrap.is_some();
+    if is_wrap && !args.script_args.is_empty() {
+        bail!("sbatch: script arguments may not be used with --wrap");
+    }
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
     {
@@ -755,6 +762,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         gres,
         script,
         argv: Vec::new(),
+        script_args: args.script_args.clone(),
         work_dir,
         stdout_path: args.output.unwrap_or_default(),
         stderr_path: args.error.unwrap_or_default(),
@@ -844,7 +852,11 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .context("job submission failed")?;
 
     let job_id = response.into_inner().job_id;
-    println!("Submitted batch job {}", job_id);
+    if args.parsable {
+        println!("{}", job_id);
+    } else {
+        println!("Submitted batch job {}", job_id);
+    }
 
     Ok(())
 }
@@ -1165,7 +1177,16 @@ echo "hello world"
             .into_iter()
             .map(Into::into)
             .collect();
-        assert_eq!(candidate_script_path(&args), Some("job.sh"));
+        assert_eq!(candidate_script_path(&args), Some("job.sh".to_string()));
+    }
+
+    #[test]
+    fn test_candidate_script_path_with_trailing_args() {
+        let args: Vec<String> = vec!["sbatch", "job.sh", "arg1", "arg2"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), Some("job.sh".to_string()));
     }
 
     #[test]

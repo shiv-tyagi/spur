@@ -121,19 +121,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 partition: args.partition.unwrap_or_default(),
                 account: args.account.unwrap_or_default(),
                 job_ids: Vec::new(),
+                name: args.name.unwrap_or_default(),
             })
             .await
             .context("failed to get jobs")?;
 
         let jobs = response.into_inner().jobs;
-        let name_filter = args.name.as_deref();
 
         for job in &jobs {
-            if let Some(name) = name_filter {
-                if job.name != name {
-                    continue;
-                }
-            }
             match client
                 .cancel_job(CancelJobRequest {
                     job_id: job.job_id,

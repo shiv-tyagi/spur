@@ -317,9 +317,16 @@ mod completion_report_tests {
 /// argument vector whose elements are shell-escaped, so metacharacters stay
 /// data rather than being interpreted by the wrapper shell (a redirect leaking
 /// to the outer shell would escape an argv-wrapped sandbox).
-fn build_job_script(script: &str, argv: &[String]) -> Result<String, Status> {
+///
+/// When `script_args` is non-empty and a script body is present, a `set --`
+/// line is injected so the script receives positional parameters (`$1`, `$@`).
+fn build_job_script(
+    script: &str,
+    argv: &[String],
+    script_args: &[String],
+) -> Result<String, Status> {
     if !script.is_empty() {
-        return Ok(script.to_string());
+        return inject_script_args(script, script_args);
     }
     if argv.is_empty() {
         return Err(Status::invalid_argument("no script or argv"));
@@ -327,6 +334,31 @@ fn build_job_script(script: &str, argv: &[String]) -> Result<String, Status> {
     let joined = shlex::try_join(argv.iter().map(String::as_str))
         .map_err(|e| Status::invalid_argument(format!("argv is not shell-safe: {e}")))?;
     Ok(format!("#!/bin/bash\n{joined}\n"))
+}
+
+/// Inject `set -- <args>` into a script so it receives positional parameters.
+/// Placed right after the shebang line (if present), otherwise at the top.
+fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
+    if args.is_empty() {
+        return Ok(script.to_string());
+    }
+    let escaped = shlex::try_join(args.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("script args not shell-safe: {e}")))?;
+    let set_line = format!("set -- {escaped}");
+
+    let first_newline = script.find('\n');
+    let has_shebang = script.starts_with("#!");
+
+    if has_shebang {
+        if let Some(pos) = first_newline {
+            let shebang = script[..pos].trim_end_matches('\r');
+            let rest = &script[pos + 1..];
+            return Ok(format!("{shebang}\n{set_line}\n{rest}"));
+        }
+        return Ok(format!("{script}\n{set_line}\n"));
+    }
+
+    Ok(format!("{set_line}\n{script}"))
 }
 
 async fn report_completion(
@@ -445,7 +477,7 @@ impl SlurmAgent for AgentService {
             spec.work_dir.clone()
         };
 
-        let script = build_job_script(&spec.script, &spec.argv)?;
+        let script = build_job_script(&spec.script, &spec.argv, &spec.script_args)?;
 
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
@@ -1543,23 +1575,17 @@ mod tests {
 
     #[test]
     fn build_job_script_uses_explicit_script_verbatim() {
-        let s = build_job_script("#!/bin/sh\nmake -j4\n", &[]).unwrap();
+        let s = build_job_script("#!/bin/sh\nmake -j4\n", &[], &[]).unwrap();
         assert_eq!(s, "#!/bin/sh\nmake -j4\n");
     }
 
     #[test]
     fn build_job_script_errors_on_empty() {
-        assert!(build_job_script("", &[]).is_err());
+        assert!(build_job_script("", &[], &[]).is_err());
     }
 
     #[test]
     fn build_job_script_escapes_argv_so_redirect_stays_in_arg() {
-        // A sandbox wrapper whose final argv element carries shell syntax. The
-        // redirection must remain *inside* the `bash -c` argument, never leak to
-        // the outer wrapper script (which would escape the sandbox). Shell-split
-        // the generated command and assert it round-trips back to the original
-        // argv: were `>` left unquoted it would split into its own token and the
-        // equality would fail, independent of the quoting style shlex chooses.
         let argv: Vec<String> = [
             "axis",
             "run",
@@ -1573,7 +1599,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let s = build_job_script("", &argv).unwrap();
+        let s = build_job_script("", &argv, &[]).unwrap();
         let cmd = s.strip_prefix("#!/bin/bash\n").unwrap().trim_end();
         let reparsed = shlex::split(cmd).expect("generated command must be shell-parseable");
         assert_eq!(reparsed, argv);
@@ -1582,8 +1608,39 @@ mod tests {
     #[test]
     fn build_job_script_simple_argv_round_trips() {
         let argv: Vec<String> = ["echo", "hello"].iter().map(|s| s.to_string()).collect();
-        let s = build_job_script("", &argv).unwrap();
+        let s = build_job_script("", &argv, &[]).unwrap();
         assert_eq!(s, "#!/bin/bash\necho hello\n");
+    }
+
+    #[test]
+    fn build_job_script_injects_args_after_shebang() {
+        let args: Vec<String> = ["uuid-123", "--flag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let s = build_job_script("#!/bin/bash\necho hello\n", &[], &args).unwrap();
+        assert_eq!(s, "#!/bin/bash\nset -- uuid-123 --flag\necho hello\n");
+    }
+
+    #[test]
+    fn build_job_script_injects_args_no_shebang() {
+        let args: Vec<String> = ["arg1"].iter().map(|s| s.to_string()).collect();
+        let s = build_job_script("echo $1\n", &[], &args).unwrap();
+        assert_eq!(s, "set -- arg1\necho $1\n");
+    }
+
+    #[test]
+    fn build_job_script_injects_args_with_env_shebang() {
+        let args: Vec<String> = ["a", "b c"].iter().map(|s| s.to_string()).collect();
+        let s = build_job_script("#!/usr/bin/env bash\necho $@\n", &[], &args).unwrap();
+        assert_eq!(s, "#!/usr/bin/env bash\nset -- a 'b c'\necho $@\n");
+    }
+
+    #[test]
+    fn build_job_script_injects_args_crlf_shebang() {
+        let args: Vec<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        let s = build_job_script("#!/bin/bash\r\necho hi\n", &[], &args).unwrap();
+        assert_eq!(s, "#!/bin/bash\nset -- x\necho hi\n");
     }
 
     async fn run_command_test_setup() -> (AgentService, u32) {

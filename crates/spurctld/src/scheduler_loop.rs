@@ -466,7 +466,7 @@ pub(crate) async fn try_preempt(
     };
 
     let mut running: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&[JobState::Running], None, None, None, &[])
+        .get_jobs(&[JobState::Running], None, None, None, None, &[])
         .into_iter()
         .collect();
     running.sort_by_key(|j| j.priority);
@@ -650,6 +650,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         licenses,
         script: s.script.clone().unwrap_or_default(),
         argv: s.argv.clone(),
+        script_args: s.script_args.clone(),
         work_dir: s.work_dir.clone(),
         stdout_path: s.stdout_path.clone().unwrap_or_default(),
         stderr_path: s.stderr_path.clone().unwrap_or_default(),
@@ -746,6 +747,7 @@ async fn dispatch_to_agent(
         gres: spec.gres.clone(),
         script: spec.script.clone().unwrap_or_default(),
         argv: spec.argv.clone(),
+        script_args: spec.script_args.clone(),
         work_dir: spec.work_dir.clone(),
         stdout_path: spec.stdout_path.clone().unwrap_or_default(),
         stderr_path: spec.stderr_path.clone().unwrap_or_default(),
@@ -859,8 +861,14 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 
         // Deadline enforcement: mark pending jobs whose deadline has passed
         {
-            let pending =
-                cluster.get_jobs(&[spur_core::job::JobState::Pending], None, None, None, &[]);
+            let pending = cluster.get_jobs(
+                &[spur_core::job::JobState::Pending],
+                None,
+                None,
+                None,
+                None,
+                &[],
+            );
             for job in &pending {
                 if let Some(deadline) = job.spec.deadline {
                     if now > deadline {
@@ -877,6 +885,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 spur_core::job::JobState::Running,
                 spur_core::job::JobState::Completing,
             ],
+            None,
             None,
             None,
             None,
@@ -962,6 +971,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
         let completing = cluster.get_jobs(
             &[spur_core::job::JobState::Completing],
+            None,
             None,
             None,
             None,
