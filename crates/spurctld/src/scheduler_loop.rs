@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
@@ -19,6 +19,11 @@ use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
+
+/// Upper bound on a single CancelJob RPC (connect + call) when the caller
+/// awaits delivery. Best-effort cleanup must not stall eviction on an
+/// unreachable agent.
+const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
@@ -276,87 +281,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             let cluster_ref = cluster.clone();
             let dispatch_nodes = all_nodes.clone();
             let allocated_nodelist = all_nodes.join(",");
-            tokio::spawn(async move {
-                let mut successes = 0u32;
-                let mut failures = 0u32;
-                let total = dispatch_nodes.len() as u32;
-
-                let mut set = tokio::task::JoinSet::new();
-                for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
-                    let node_info = cluster_ref.get_node(node_name);
-                    let (addr, port) = match node_info {
-                        Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
-                        _ => {
-                            warn!(
-                                job_id,
-                                node = %node_name,
-                                "no agent address for node, skipping dispatch"
-                            );
-                            failures += 1;
-                            continue;
-                        }
-                    };
-
-                    let agent_addr = format!("http://{}:{}", addr, port);
-                    let spec = spec.clone();
-                    let peer_addrs = peer_addrs.clone();
-                    let task_offset = node_idx as u32 * tasks_per_node;
-                    let target_node = node_name.clone();
-                    let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
-                    let allocated_nodelist = allocated_nodelist.clone();
-                    set.spawn(async move {
-                        dispatch_to_agent(
-                            &agent_addr,
-                            &AgentDispatchParams {
-                                job_id,
-                                spec: &spec,
-                                peer_nodes: &peer_addrs,
-                                task_offset,
-                                target_node: &target_node,
-                                allocated: &allocated,
-                                allocated_nodelist: &allocated_nodelist,
-                            },
-                        )
-                        .await
-                    });
-                }
-
-                while let Some(result) = set.join_next().await {
-                    match result {
-                        Ok(Ok(())) => successes += 1,
-                        Ok(Err(e)) => {
-                            error!(job_id, error = %e, "dispatch to agent failed");
-                            failures += 1;
-                        }
-                        Err(e) => {
-                            error!(job_id, error = %e, "dispatch task panicked");
-                            failures += 1;
-                        }
-                    }
-                }
-
-                // If ALL dispatches failed, requeue the job back to Pending
-                // so the scheduler can retry (e.g., container image may be
-                // imported later, or a transient agent error may resolve).
-                // Issue #91: previously marked as Failed immediately, which
-                // didn't give users a chance to fix the problem.
-                if successes == 0 && total > 0 {
-                    error!(
-                        job_id,
-                        failures, "all dispatches failed — requeueing job to Pending"
-                    );
-                    if let Err(e) = cluster_ref.requeue_job(job_id) {
-                        error!(job_id, error = %e, "failed to requeue job after dispatch failure");
-                    }
-                } else if failures > 0 {
-                    warn!(
-                        job_id,
-                        successes,
-                        failures,
-                        "partial dispatch failure — job continues on successful nodes"
-                    );
-                }
-            });
+            tokio::spawn(dispatch_job_to_nodes(
+                cluster_ref,
+                job_id,
+                dispatch_nodes,
+                spec,
+                peer_addrs,
+                per_node_allocs,
+                allocated_nodelist,
+                tasks_per_node,
+            ));
         }
 
         let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -833,6 +767,119 @@ async fn dispatch_to_agent(
     Ok(())
 }
 
+/// Dispatch a job to every assigned node and act on the aggregate result:
+/// requeue to Pending if every node rejected the launch, or evict the job to
+/// NodeFail if only some nodes accepted it (a node that never launched the
+/// job will never report completion, so the job would otherwise hang).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_job_to_nodes(
+    cluster: Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    dispatch_nodes: Vec<String>,
+    spec: spur_core::job::JobSpec,
+    peer_addrs: Vec<String>,
+    per_node_allocs: std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
+    allocated_nodelist: String,
+    tasks_per_node: u32,
+) {
+    let mut successes = 0u32;
+    let mut failures = 0u32;
+    let mut succeeded_nodes: Vec<String> = Vec::new();
+    let total = dispatch_nodes.len() as u32;
+
+    let mut set = tokio::task::JoinSet::new();
+    for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
+        let node_info = cluster.get_node(node_name);
+        let (addr, port) = match node_info {
+            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            _ => {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    "no agent address for node, skipping dispatch"
+                );
+                failures += 1;
+                continue;
+            }
+        };
+
+        let agent_addr = format!("http://{}:{}", addr, port);
+        let spec = spec.clone();
+        let peer_addrs = peer_addrs.clone();
+        let task_offset = node_idx as u32 * tasks_per_node;
+        let target_node = node_name.clone();
+        let result_node = node_name.clone();
+        let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
+        let allocated_nodelist = allocated_nodelist.clone();
+        set.spawn(async move {
+            let result = dispatch_to_agent(
+                &agent_addr,
+                &AgentDispatchParams {
+                    job_id,
+                    spec: &spec,
+                    peer_nodes: &peer_addrs,
+                    task_offset,
+                    target_node: &target_node,
+                    allocated: &allocated,
+                    allocated_nodelist: &allocated_nodelist,
+                },
+            )
+            .await;
+            (result_node, result)
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((node_name, Ok(()))) => {
+                successes += 1;
+                succeeded_nodes.push(node_name);
+            }
+            Ok((node_name, Err(e))) => {
+                error!(job_id, node = %node_name, error = %e, "dispatch to agent failed");
+                failures += 1;
+            }
+            Err(e) => {
+                error!(job_id, error = %e, "dispatch task panicked");
+                failures += 1;
+            }
+        }
+    }
+
+    // If ALL dispatches failed, requeue the job back to Pending
+    // so the scheduler can retry (e.g., container image may be
+    // imported later, or a transient agent error may resolve) rather
+    // than failing it outright and denying the user a chance to fix it.
+    if successes == 0 && total > 0 {
+        error!(
+            job_id,
+            failures, "all dispatches failed — requeueing job to Pending"
+        );
+        if let Err(e) = cluster.requeue_job(job_id) {
+            error!(job_id, error = %e, "failed to requeue job after dispatch failure");
+        }
+    } else if failures > 0 {
+        // A node that never got the dispatch will never report completion, so evict
+        // the whole job to NodeFail (same as a node dying mid-run) instead of hanging.
+        warn!(
+            job_id,
+            successes, failures, "partial dispatch failure — evicting job to NodeFail"
+        );
+        // Cancel the job on nodes that DID launch it *before* evicting, and wait
+        // for those cancels to be delivered. Eviction can synchronously requeue
+        // the job to Pending (when `spec.requeue` is set), making it eligible for
+        // immediate re-dispatch on the next scheduler cycle; because CancelJob is
+        // keyed only by job_id, a cancel still in flight would otherwise be able
+        // to terminate a freshly re-dispatched attempt on the same node. Ordering
+        // the awaited cancel ahead of the requeue closes that race — the launched
+        // processes are stopped before the job can be relaunched anywhere.
+        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+        if let Err(e) = cluster.evict_job(job_id) {
+            error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
+        }
+    }
+}
+
 /// Watchdog: gracefully terminate running jobs that exceed their time limit.
 ///
 /// Two-phase shutdown:
@@ -1115,50 +1162,112 @@ pub async fn send_cancel_to_agents(
     job: &spur_core::job::Job,
     signal: i32,
 ) {
-    for node_name in &job.allocated_nodes {
-        let node_info = cluster.get_node(node_name);
-        let (addr, port) = match node_info {
-            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+    send_cancel_to_nodes(cluster, job.job_id, &job.allocated_nodes, signal).await;
+}
+
+/// Send CancelJob RPC to an explicit set of nodes for a job with a specific
+/// signal. Callers that already know which nodes ran the job (e.g. a dispatch
+/// loop) should use this instead of `send_cancel_to_agents` so the cancel
+/// isn't at the mercy of `job.allocated_nodes` having been mutated in the
+/// meantime (e.g. cleared by a requeue-on-eviction side effect).
+///
+/// Fire-and-forget: each node's cancel runs on its own task and this returns
+/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
+/// before subsequent work (e.g. a requeue that could re-dispatch the job).
+pub async fn send_cancel_to_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+    signal: i32,
+) {
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal));
+    }
+}
+
+/// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
+/// returning so the caller can establish a happens-before ordering against
+/// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
+/// unreachable agent can't stall the caller indefinitely.
+pub async fn cancel_job_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+    signal: i32,
+) {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(cancel_one_agent(agent_addr, job_id, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Resolve `node_names` to agent URLs, logging and skipping any node whose
+/// address is unknown.
+fn cancel_agent_addrs(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+) -> Vec<String> {
+    let mut addrs = Vec::with_capacity(node_names.len());
+    for node_name in node_names {
+        match cluster.get_node(node_name) {
+            Some(ref n) if n.address.is_some() => {
+                addrs.push(format!("http://{}:{}", n.address.clone().unwrap(), n.port));
+            }
             _ => {
                 warn!(
-                    job_id = job.job_id,
+                    job_id,
                     node = %node_name,
                     "no agent address — cannot cancel job on node"
                 );
-                continue;
             }
-        };
+        }
+    }
+    addrs
+}
 
-        let agent_addr = format!("http://{}:{}", addr, port);
-        let job_id = job.job_id;
-        tokio::spawn(async move {
-            match SlurmAgentClient::connect(agent_addr.clone()).await {
-                Ok(mut client) => {
-                    if let Err(e) = client
-                        .cancel_job(AgentCancelJobRequest { job_id, signal })
-                        .await
-                    {
-                        warn!(
-                            job_id,
-                            signal,
-                            agent = %agent_addr,
-                            error = %e,
-                            "CancelJob RPC failed"
-                        );
-                    } else {
-                        info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
-                    }
-                }
-                Err(e) => {
+/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
+/// timeouts are logged, never propagated: a cancel is best-effort cleanup and
+/// must not block the caller past the timeout.
+async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
+    let attempt = async {
+        match SlurmAgentClient::connect(agent_addr.clone()).await {
+            Ok(mut client) => {
+                if let Err(e) = client
+                    .cancel_job(AgentCancelJobRequest { job_id, signal })
+                    .await
+                {
                     warn!(
                         job_id,
+                        signal,
                         agent = %agent_addr,
                         error = %e,
-                        "failed to connect to agent for cancel"
+                        "CancelJob RPC failed"
                     );
+                } else {
+                    info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
                 }
             }
-        });
+            Err(e) => {
+                warn!(
+                    job_id,
+                    agent = %agent_addr,
+                    error = %e,
+                    "failed to connect to agent for cancel"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+        .await
+        .is_err()
+    {
+        warn!(
+            job_id,
+            agent = %agent_addr,
+            "CancelJob RPC timed out"
+        );
     }
 }
 
@@ -1513,5 +1622,385 @@ mod tests {
             job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts),
             PreemptMode::Off
         );
+    }
+
+    // ── dispatch_job_to_nodes: real partial-dispatch-failure trigger path ──
+    //
+    // Exercises the actual JoinSet success/failure counting in
+    // dispatch_job_to_nodes (not a reimplementation of it) against a real
+    // agent over the network, so the eviction + cancel-RPC behavior it
+    // drives is verified end-to-end rather than by calling evict_job
+    // directly on an already-Running job.
+    mod dispatch_trigger_tests {
+        use super::*;
+        use spur_core::config::SlurmConfig;
+        use spur_core::node::NodeSource;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tempfile::TempDir;
+        use tonic::transport::server::TcpIncoming;
+        use tonic::transport::Server;
+
+        /// Minimal SlurmAgent: always accepts launch_job and counts cancel_job
+        /// calls, so tests can assert the controller actually tried to stop
+        /// the job on nodes that did launch it.
+        struct MockAgent {
+            cancel_calls: Arc<AtomicU32>,
+        }
+
+        #[tonic::async_trait]
+        impl spur_proto::proto::slurm_agent_server::SlurmAgent for MockAgent {
+            type StreamJobOutputStream =
+                tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
+            type AttachJobStream = tonic::codegen::BoxStream<spur_proto::proto::AttachJobOutput>;
+
+            async fn launch_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+
+            async fn cancel_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(tonic::Response::new(()))
+            }
+
+            async fn suspend_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentSuspendJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+
+            async fn get_node_resources(
+                &self,
+                _request: tonic::Request<()>,
+            ) -> Result<tonic::Response<spur_proto::proto::NodeResourcesResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn exec_in_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ExecInJobRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::ExecInJobResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn run_command(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RunCommandRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn stream_job_output(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StreamJobOutputRequest>,
+            ) -> Result<tonic::Response<Self::StreamJobOutputStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn attach_job(
+                &self,
+                _request: tonic::Request<tonic::Streaming<spur_proto::proto::AttachJobInput>>,
+            ) -> Result<tonic::Response<Self::AttachJobStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+        }
+
+        /// Spawn a real MockAgent gRPC server on an OS-assigned localhost
+        /// port. Returns the bound address and the shared cancel-call counter.
+        async fn spawn_mock_agent() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancel_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: cancel_calls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancel_calls)
+        }
+
+        /// Reserve a localhost port with nothing listening on it, so a
+        /// connection attempt to it deterministically fails fast (connection
+        /// refused) instead of hanging.
+        async fn unreachable_addr() -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        }
+
+        fn test_config() -> SlurmConfig {
+            SlurmConfig {
+                cluster_name: "test".into(),
+                controller: spur_core::config::ControllerConfig {
+                    first_job_id: 1,
+                    ..Default::default()
+                },
+                accounting: Default::default(),
+                scheduler: Default::default(),
+                auth: Default::default(),
+                partitions: vec![spur_core::config::PartitionConfig {
+                    name: "default".into(),
+                    default: true,
+                    state: "UP".into(),
+                    nodes: "ALL".into(),
+                    selector: Default::default(),
+                    max_time: None,
+                    default_time: None,
+                    max_nodes: None,
+                    min_nodes: 1,
+                    allow_accounts: Vec::new(),
+                    allow_groups: Vec::new(),
+                    deny_accounts: Vec::new(),
+                    priority_tier: 1,
+                    preempt_mode: String::new(),
+                }],
+                nodes: Vec::new(),
+                network: Default::default(),
+                logging: Default::default(),
+                kubernetes: Default::default(),
+                notifications: Default::default(),
+                power: Default::default(),
+                federation: Default::default(),
+                topology: None,
+                isolation: Default::default(),
+                licenses: HashMap::new(),
+                burst_buffer: Default::default(),
+                update: Default::default(),
+                metrics: Default::default(),
+                rest_api: Default::default(),
+                hooks: Default::default(),
+                devices: Default::default(),
+                admission: Default::default(),
+            }
+        }
+
+        async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+            let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+            let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+                .await
+                .unwrap();
+            handle
+                .raft
+                .wait(Some(std::time::Duration::from_secs(5)))
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .expect("single-node raft did not self-elect within 5s");
+            cm.set_raft(handle.raft);
+            cm
+        }
+
+        /// Spin until an async mutation (Raft-committed state, or a
+        /// fire-and-forget cancel RPC) is visible. Bounded retry, not an
+        /// open-ended wait: fails loudly if the condition never holds.
+        fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+            for _ in 0..200 {
+                if f() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        fn register_node_at(cm: &ClusterManager, name: &str, addr: std::net::SocketAddr) {
+            cm.register_node(
+                name.into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                addr.ip().to_string(),
+                addr.port(),
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+            )
+            .unwrap();
+            let n = name.to_string();
+            wait_for(&format!("node '{n}' registered"), || {
+                cm.get_node(&n).is_some()
+            });
+        }
+
+        fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> spur_core::job::JobId {
+            let id = cm.submit_job(spec).unwrap();
+            wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
+            id
+        }
+
+        fn settle(
+            cm: &ClusterManager,
+            job_id: spur_core::job::JobId,
+            expected: spur_core::job::JobState,
+        ) {
+            wait_for(&format!("job {job_id} -> {expected:?}"), || {
+                cm.get_job(job_id).is_some_and(|j| j.state == expected)
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn partial_dispatch_evicts_job_and_cancels_the_node_that_launched() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls) = spawn_mock_agent().await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let mut spec = JobSpec {
+                name: "partial-dispatch".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // This calls the exact same function `run()` spawns per assignment:
+            // real network dispatch to both nodes, real JoinSet success/failure
+            // counting, and the real branch that decides to evict on a partial
+            // failure — n1 (real agent) accepts, n2 (nothing listening) fails.
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            settle(&cm, job_id, JobState::NodeFail);
+            assert_eq!(
+                cm.get_job(job_id).unwrap().pending_reason,
+                spur_core::job::PendingReason::JobLaunchFailure
+            );
+
+            // n1 actually launched the job, so the controller must tell its
+            // agent to stop it instead of leaving an orphaned process behind.
+            // The cancel is awaited inside dispatch_job_to_nodes, so it has
+            // already been delivered by the time that call returned.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 must have been cancelled before dispatch_job_to_nodes returned"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn partial_dispatch_with_requeue_still_cancels_the_node_that_launched() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls) = spawn_mock_agent().await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let mut spec = JobSpec {
+                name: "partial-dispatch-requeue".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                requeue: true,
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // Same as the non-requeue case, but `spec.requeue` is set: eviction's
+            // requeue side effect resets the job to Pending and clears
+            // `allocated_nodes`. The cancel RPC must be delivered to n1 *before*
+            // that requeue makes the job eligible for re-dispatch, otherwise a
+            // job_id-keyed cancel still in flight could kill a fresh attempt.
+            // dispatch_job_to_nodes awaits the cancel before evicting, so by the
+            // time it returns both the cancel is delivered and the job is Pending.
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            // Cancel-before-requeue: the cancel is already delivered, and the
+            // requeue side effect has put the job back to Pending with its
+            // allocation cleared — no polling needed, both are guaranteed by the
+            // await ordering inside dispatch_job_to_nodes.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 must have been cancelled before the requeue re-enabled dispatch"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert!(job.allocated_nodes.is_empty());
+        }
     }
 }
