@@ -350,23 +350,21 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Resolve the effective PreemptMode for a job from its partition config.
-///
-/// `job.spec.partition` is a comma-separated OR list (same convention as the
-/// backfill scheduler's node matching), so a job may span several partitions.
-/// The most aggressive mode among the matched partitions wins.
+/// Resolve the effective PreemptMode for a job: QoS override wins if set
+/// (see `qos_preempt_override`), else the most aggressive matched partition.
 fn job_preempt_mode(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
+    qos: &spur_core::accounting::Qos,
 ) -> spur_core::partition::PreemptMode {
     use spur_core::partition::PreemptMode;
-    let Some(name) = job.spec.partition.as_deref().filter(|p| !p.is_empty()) else {
-        return PreemptMode::Off;
-    };
-    name.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|req| partitions.iter().find(|p| p.name == req))
+
+    if let Some(mode) = spur_core::qos::qos_preempt_override(qos) {
+        return mode;
+    }
+
+    spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+        .into_iter()
         .map(|p| p.preempt_mode)
         .max_by_key(|m| m.aggressiveness())
         .unwrap_or(PreemptMode::Off)
@@ -389,21 +387,34 @@ pub(crate) async fn try_preempt(
     let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
-        job.spec.partition.as_deref().and_then(|pname| {
-            pname
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|req| partitions.iter().find(|p| p.name == req))
-                .max_by_key(|p| p.preempt_mode.aggressiveness())
-        })
+        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+            .into_iter()
+            .max_by_key(|p| p.preempt_mode.aggressiveness())
     };
 
     let mut running: Vec<spur_core::job::Job> = cluster
         .get_jobs(&[JobState::Running], None, None, None, None, &[])
         .into_iter()
         .collect();
-    running.sort_by_key(|j| j.priority);
+    // Resolve once, reuse for both the priority recompute and the
+    // preempt-mode decision below.
+    let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
+        running
+            .iter()
+            .map(|j| (j.job_id, cluster.resolve_qos(j)))
+            .collect();
+    // Running jobs' stored `priority` is the raw base value, unlike
+    // `pending`'s fully adjusted one; recompute a comparable value.
+    let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
+        .iter()
+        .map(|j| {
+            (
+                j.job_id,
+                cluster.current_effective_priority_with_qos(j, &running_qos[&j.job_id], partitions),
+            )
+        })
+        .collect();
+    running.sort_by_key(|j| running_priority[&j.job_id]);
 
     for pending in unscheduled {
         let Some(pending_part) = partition_for(pending) else {
@@ -415,7 +426,8 @@ pub(crate) async fn try_preempt(
         let pending_tier = pending_part.priority_tier;
 
         for candidate in &running {
-            if candidate.priority >= pending.priority / 2 {
+            let candidate_priority = running_priority[&candidate.job_id];
+            if candidate_priority >= pending.priority / 2 {
                 continue;
             }
 
@@ -432,13 +444,13 @@ pub(crate) async fn try_preempt(
                 }
             }
 
-            let mode = job_preempt_mode(candidate, partitions);
+            let mode = job_preempt_mode(candidate, partitions, &running_qos[&candidate.job_id]);
             if mode == PreemptMode::Off {
                 continue;
             }
             info!(
                 preempted_job = candidate.job_id,
-                preempted_priority = candidate.priority,
+                preempted_priority = candidate_priority,
                 pending_job = pending.job_id,
                 pending_priority = pending.priority,
                 mode = ?mode,
@@ -1572,12 +1584,23 @@ mod tests {
         })
     }
 
+    fn qos_with_mode(mode: spur_core::accounting::QosPreemptMode) -> spur_core::accounting::Qos {
+        spur_core::accounting::Qos {
+            preempt_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn no_qos_override() -> spur_core::accounting::Qos {
+        qos_with_mode(spur_core::accounting::QosPreemptMode::Off)
+    }
+
     #[test]
     fn job_preempt_mode_single_partition() {
         use spur_core::partition::PreemptMode;
         let parts = vec![partition_with_mode("gpu", PreemptMode::Requeue)];
         assert_eq!(
-            job_preempt_mode(&job_in_partitions("gpu"), &parts),
+            job_preempt_mode(&job_in_partitions("gpu"), &parts, &no_qos_override()),
             PreemptMode::Requeue
         );
     }
@@ -1587,11 +1610,15 @@ mod tests {
         use spur_core::partition::PreemptMode;
         let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
         assert_eq!(
-            job_preempt_mode(&job_with_spec(JobSpec::default()), &parts),
+            job_preempt_mode(
+                &job_with_spec(JobSpec::default()),
+                &parts,
+                &no_qos_override()
+            ),
             PreemptMode::Off
         );
         assert_eq!(
-            job_preempt_mode(&job_in_partitions("nope"), &parts),
+            job_preempt_mode(&job_in_partitions("nope"), &parts, &no_qos_override()),
             PreemptMode::Off
         );
     }
@@ -1606,7 +1633,7 @@ mod tests {
             partition_with_mode("cpu", PreemptMode::Cancel),
         ];
         assert_eq!(
-            job_preempt_mode(&job_in_partitions("gpu, cpu"), &parts),
+            job_preempt_mode(&job_in_partitions("gpu, cpu"), &parts, &no_qos_override()),
             PreemptMode::Cancel
         );
     }
@@ -1619,7 +1646,7 @@ mod tests {
             partition_with_mode("cpu", PreemptMode::Off),
         ];
         assert_eq!(
-            job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts),
+            job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts, &no_qos_override()),
             PreemptMode::Off
         );
     }
@@ -2002,5 +2029,27 @@ mod tests {
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
         }
+    }
+
+    #[test]
+    fn job_preempt_mode_qos_override_wins_over_partition() {
+        use spur_core::accounting::QosPreemptMode;
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        let qos = qos_with_mode(QosPreemptMode::Requeue);
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts, &qos),
+            PreemptMode::Requeue
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_qos_off_falls_back_to_partition() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts, &no_qos_override()),
+            PreemptMode::Cancel
+        );
     }
 }

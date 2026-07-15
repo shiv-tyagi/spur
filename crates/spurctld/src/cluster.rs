@@ -20,7 +20,7 @@ use spur_core::job::{
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{Partition, PreemptMode};
-use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
@@ -1572,7 +1572,7 @@ impl ClusterManager {
     }
 
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
-    /// Recomputes effective priority using age and partition tier before sorting.
+    /// Recomputes effective priority using QoS, age, and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
@@ -1653,10 +1653,17 @@ impl ClusterManager {
             true
         });
 
+        // Resolve once, reuse for both the QoS-limit check and the priority
+        // adjustment below, instead of looking it up twice per job.
+        let qos_by_job: HashMap<JobId, Qos> = pending
+            .iter()
+            .map(|job| (job.job_id, self.resolve_qos(job)))
+            .collect();
+
         // QoS enforcement: check per-user limits for jobs with a QoS. Shares
         // the eligibility logic with tag_blocked_pending_reasons() via
         // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &self.resolve_qos(job), &jobs).is_none());
+        pending.retain(|job| qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_none());
 
         // License enforcement is applied after the priority sort below, so scarce
         // licenses are reserved highest-priority-first and a single pass cannot
@@ -1675,29 +1682,30 @@ impl ClusterManager {
         let reservations = self.get_reservations();
         for job in &mut pending {
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
-            let partition_tier = job
-                .spec
-                .partition
-                .as_ref()
-                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
-                .map(|p| p.priority_tier)
-                .unwrap_or(1);
+            let partition_tier =
+                spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions);
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-            job.priority = spur_sched::priority::effective_priority(
+            job.priority = compute_effective_priority(
                 job.priority,
                 fair_share,
                 age_minutes,
                 partition_tier,
+                &qos_by_job[&job.job_id],
             );
         }
         drop(partitions);
 
+        // QoS floors priority at 1, making ties more likely; break on job_id
+        // for deterministic ordering.
         pending.sort_by(|a, b| {
             let a_res = reservation::job_has_active_reservation(a, &reservations, now);
             let b_res = reservation::job_has_active_reservation(b, &reservations, now);
-            b_res.cmp(&a_res).then(b.priority.cmp(&a.priority))
+            b_res
+                .cmp(&a_res)
+                .then(b.priority.cmp(&a.priority))
+                .then(a.job_id.cmp(&b.job_id))
         });
 
         // License reservation, in priority order. `remaining` starts from current
@@ -2686,11 +2694,31 @@ impl ClusterManager {
     }
 
     /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
-    fn resolve_qos(&self, job: &Job) -> Qos {
+    pub(crate) fn resolve_qos(&self, job: &Job) -> Qos {
         match job.spec.qos.as_deref() {
             Some(name) => self.qos_cache.get(name).unwrap_or_default(),
             None => Qos::default(),
         }
+    }
+
+    /// Recompute a job's live effective priority (a running job's stored
+    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
+    /// and `partitions` so callers iterating over multiple jobs don't pay
+    /// for a separate lock acquisition per call.
+    pub(crate) fn current_effective_priority_with_qos(
+        &self,
+        job: &Job,
+        qos: &Qos,
+        partitions: &[Partition],
+    ) -> u32 {
+        let now = Utc::now();
+        let age_minutes = (now - job.submit_time).num_minutes().max(0);
+        let partition_tier =
+            spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), partitions);
+        let fair_share = self
+            .fairshare_cache
+            .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
+        compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier, qos)
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -3769,6 +3797,24 @@ fn reservation_block(
         }
         _ => Some(PendingReason::Reservation),
     }
+}
+
+/// QoS is added on top of the fairshare/age/tier product rather than fed
+/// into it, so it's a constant offset instead of an amplified/diluted one.
+fn compute_effective_priority(
+    base_priority: u32,
+    fair_share: f64,
+    age_minutes: i64,
+    partition_tier: u32,
+    qos: &Qos,
+) -> u32 {
+    let raw = spur_sched::priority::effective_priority(
+        base_priority,
+        fair_share,
+        age_minutes,
+        partition_tier,
+    );
+    qos_adjusted_priority(raw, qos)
 }
 
 /// Reason a job is ineligible because currently-available licenses cannot satisfy
@@ -6623,6 +6669,139 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_applies_qos_priority_adjustment() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: -500,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority}) \
+             despite identical base priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_qos_ordering_holds_with_nonneutral_fairshare_and_age() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Non-neutral fairshare/age on the low-QoS job would previously let
+        // that unrelated boost amplify its QoS delta and outrank the high-QoS job.
+        cm.fairshare_cache().set_for_test("low-user", "", 3.0);
+
+        let mut low = basic_spec("low");
+        low.user = "low-user".into();
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&low_id).unwrap().submit_time = Utc::now() - chrono::Duration::days(6);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should still outrank low-QoS job ({low_priority}) \
+             once fairshare/age no longer amplify the QoS delta"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_effective_priority_multi_partition_uses_highest_priority_tier() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        {
+            let mut partitions = cm.partitions.write();
+            partitions.push(Partition {
+                name: "low".into(),
+                priority_tier: 1,
+                ..Default::default()
+            });
+            partitions.push(Partition {
+                name: "high".into(),
+                priority_tier: 9,
+                ..Default::default()
+            });
+        }
+
+        // Built directly (not submitted) to isolate priority resolution from
+        // unrelated eligibility filters like partition_block().
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("low,high".into()),
+                priority: Some(1000),
+                ..basic_spec("multi")
+            },
+        );
+
+        let priority =
+            cm.current_effective_priority_with_qos(&job, &Qos::default(), &cm.get_partitions());
+        assert_eq!(
+            priority, 9000,
+            "multi-partition job should use the highest matched priority_tier (9), \
+             not fall back to 1 because \"low,high\" isn't an exact partition name"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resv_overrun_grace_delays_cancel() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -6733,6 +6912,90 @@ mod tests {
 
         crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_triggers_when_qos_priority_differentiates_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Same base priority on both jobs; only the QoS adjustment differentiates them.
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        submit_and_wait(&cm, high);
+
+        // pending_jobs() applies the QoS adjustment, unlike a synthetic Job.
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+
+        settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_uses_candidate_qos_preempt_mode_over_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        // Partition says Cancel; the candidate's QoS overrides it to Suspend.
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "suspend-me".into(),
+            preempt_mode: spur_core::accounting::QosPreemptMode::Suspend,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.qos = Some("suspend-me".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+
+        // Suspended, not Cancelled: proves the QoS override reached the real
+        // preemption action, not just the pure job_preempt_mode() decision.
+        settle(&cm, low_id, JobState::Suspended);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,8 +5,29 @@
 //!
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
-use crate::accounting::{Qos, TresRecord, TresType};
+use crate::accounting::{Qos, QosPreemptMode, TresRecord, TresType};
 use crate::job::{Job, PendingReason};
+use crate::partition::PreemptMode;
+
+impl From<QosPreemptMode> for PreemptMode {
+    fn from(mode: QosPreemptMode) -> Self {
+        match mode {
+            QosPreemptMode::Off => PreemptMode::Off,
+            QosPreemptMode::Cancel => PreemptMode::Cancel,
+            QosPreemptMode::Requeue => PreemptMode::Requeue,
+            QosPreemptMode::Suspend => PreemptMode::Suspend,
+        }
+    }
+}
+
+/// A QOS-level preempt mode override, or `None` if unset. `Off` can't be
+/// told apart from "unset" on the wire, so it's treated as no override.
+pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
+    match qos.preempt_mode {
+        QosPreemptMode::Off => None,
+        other => Some(other.into()),
+    }
+}
 
 /// Result of QOS limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,10 +136,11 @@ pub fn check_qos_limits(
     QosCheckResult::Allowed
 }
 
-/// Calculate effective priority including QOS priority adjustment.
+/// Add a QOS's flat priority delta on top of an already fairshare/age/tier
+/// weighted priority; applying it earlier would let those factors amplify it.
 pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
     let adjusted = base_priority as i64 + qos.priority as i64;
-    adjusted.max(1) as u32
+    adjusted.clamp(1, u32::MAX as i64) as u32
 }
 
 #[cfg(test)]
@@ -385,5 +407,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1); // Floor at 1
+    }
+
+    #[test]
+    fn test_qos_priority_saturation() {
+        let qos = Qos {
+            priority: i32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(qos_adjusted_priority(u32::MAX, &qos), u32::MAX); // Saturates instead of wrapping
+    }
+
+    #[test]
+    fn test_qos_preempt_override_off_is_none() {
+        let qos = Qos {
+            preempt_mode: QosPreemptMode::Off,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&qos), None);
+    }
+
+    #[test]
+    fn test_qos_preempt_override_maps_variants() {
+        let requeue = Qos {
+            preempt_mode: QosPreemptMode::Requeue,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&requeue), Some(PreemptMode::Requeue));
+
+        let cancel = Qos {
+            preempt_mode: QosPreemptMode::Cancel,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&cancel), Some(PreemptMode::Cancel));
+
+        let suspend = Qos {
+            preempt_mode: QosPreemptMode::Suspend,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&suspend), Some(PreemptMode::Suspend));
     }
 }
