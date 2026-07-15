@@ -62,6 +62,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -71,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "spurctld starting");
+    info!(version = %spur_core::version::version_string(), "spurctld starting");
 
     // Load config if it exists, otherwise use defaults
     let mut config = if args.config.exists() {
