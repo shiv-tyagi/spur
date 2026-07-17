@@ -194,6 +194,8 @@ pub struct ClusterManager {
     /// `available_bb_with`), so it cannot drift from config.
     burst_buffer_total_gb: RwLock<u64>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
+    /// Native k0s cluster state (phase, control-plane node, join-token metadata).
+    k0s: RwLock<spur_core::k0s::K0sClusterState>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -225,6 +227,7 @@ impl ClusterManager {
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
+            k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -1166,6 +1169,24 @@ impl ClusterManager {
         }
     }
 
+    /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
+    /// came up after registration, or `spur0` was recreated). In-memory like `update_heartbeat` —
+    /// the mesh reconcile loop reads live inventory, so this is enough to include the node in
+    /// ApplyMesh without a spurd restart. Returns true if the stored key changed.
+    pub fn update_node_wg_pubkey(&self, name: &str, pubkey: &str) -> bool {
+        if pubkey.is_empty() {
+            return false;
+        }
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.get_mut(name) {
+            if node.wg_pubkey.as_deref() != Some(pubkey) {
+                node.wg_pubkey = Some(pubkey.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create an admission token and persist via Raft.
     pub fn create_token(
         &self,
@@ -1476,6 +1497,52 @@ impl ClusterManager {
         })?;
         info!(node = %name, "node labels updated");
         Ok(())
+    }
+
+    /// assign a k0s role + allocated mesh IP + pod /24 to a node (replicated via Raft).
+    /// Callers never touch `self.nodes`/`self.k0s` directly — that would bypass Raft.
+    pub fn assign_node_k0s(
+        &self,
+        name: &str,
+        role: spur_core::k0s::K0sRole,
+        mesh_ip: &str,
+        pod_cidr: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sAssign {
+            name: name.to_string(),
+            role,
+            mesh_ip: mesh_ip.to_string(),
+            pod_cidr: pod_cidr.to_string(),
+        })?;
+        info!(node = %name, ?role, "node k0s role assigned");
+        Ok(())
+    }
+
+    /// set the cluster-wide k0s phase (+ optional control-plane node / reset flag).
+    pub fn set_k0s_phase(
+        &self,
+        phase: spur_core::k0s::K0sPhase,
+        control_plane_node: Option<String>,
+        reset_requested: bool,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sSetPhase {
+            phase,
+            control_plane_node,
+            reset_requested,
+        })?;
+        info!(?phase, "k0s cluster phase set");
+        Ok(())
+    }
+
+    /// snapshot of the current cluster-wide k0s state.
+    pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
+        self.k0s.read().clone()
     }
 
     /// Reconcile node liveness state with heartbeat data.
@@ -3617,6 +3684,34 @@ impl ClusterManager {
                     }
                 }
             }
+
+            // Native k0s cluster operations. All idempotent/replay-safe: NodeK0sAssign is
+            // keyed by node name, token insert/revoke are keyed by id, phase is a last-write set.
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                // Reuses the `nodes` write guard from the top of this fn.
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = Some(*role);
+                    node.k0s_mesh_ip = Some(mesh_ip.clone());
+                    node.k0s_pod_cidr = Some(pod_cidr.clone());
+                }
+            }
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                reset_requested,
+            } => {
+                let mut k0s = self.k0s.write();
+                k0s.phase = *phase;
+                if control_plane_node.is_some() {
+                    k0s.control_plane_node = control_plane_node.clone();
+                }
+                k0s.reset_requested = *reset_requested;
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -3639,6 +3734,11 @@ struct ClusterSnapshot {
     /// staging phase rides along on each `Job`.
     #[serde(default)]
     burst_buffer_total_gb: u64,
+    /// cluster-wide k0s state (phase, control-plane node, join-token metadata). Unlike
+    /// license_pool/burst_buffer this is runtime-authoritative allocated state and MUST be
+    /// restored (see restore_from_snapshot).
+    #[serde(default)]
+    k0s: spur_core::k0s::K0sClusterState,
 }
 
 impl ClusterManager {
@@ -3696,6 +3796,7 @@ impl StateMachineApply for ClusterManager {
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
+            k0s: self.k0s.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -3736,6 +3837,10 @@ impl StateMachineApply for ClusterManager {
         for token in snap.tokens {
             tokens.insert(token.id.clone(), token);
         }
+
+        // k0s phase + join-token metadata are runtime-authoritative allocated state
+        // (NOT config-derived like license_pool/burst_buffer) — restore them.
+        *self.k0s.write() = snap.k0s;
 
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
@@ -4418,6 +4523,7 @@ mod tests {
             network: Default::default(),
             logging: Default::default(),
             kubernetes: Default::default(),
+            cluster: Default::default(),
             notifications: Default::default(),
             power: Default::default(),
             federation: Default::default(),
@@ -8813,6 +8919,165 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_state_survives_snapshot() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), false)
+            .unwrap();
+        wait_for("k0s state applied", || {
+            cm.k0s_state().phase == K0sPhase::Ready
+                && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // snapshot -> restore into a fresh cluster (log-compaction / HA follower path)
+        let data = cm.snapshot_state().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        // Cluster-wide k0s state must be restored (it is runtime-authoritative).
+        let st = cm2.k0s_state();
+        assert_eq!(st.phase, K0sPhase::Ready);
+        assert_eq!(st.control_plane_node.as_deref(), Some("head-node"));
+        // Per-node k0s fields ride snap.nodes.
+        let n1 = cm2.get_node("n1").unwrap();
+        assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
+        assert_eq!(n1.k0s_mesh_ip.as_deref(), Some("10.44.0.2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_reassigns_a_readded_node() {
+        // The Ready-phase self-heal: a spurd restart deregisters on SIGTERM (the node is REMOVED),
+        // then re-registers as a fresh node with no k0s role. Re-running provisioning (which the
+        // reconcile loop now does in Ready, not only Provisioning) must re-assign the un-roled node
+        // its role + mesh IP + pod CIDR so it rejoins the mesh — without disturbing the others.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b_role = cm.get_node("node-b").unwrap().k0s_role;
+        let b_ip = cm.get_node("node-b").unwrap().k0s_mesh_ip.clone();
+        let b_cidr = cm.get_node("node-b").unwrap().k0s_pod_cidr.clone();
+        assert!(b_ip.is_some() && b_cidr.is_some());
+
+        // spurd restart: deregister (remove) then re-register as a fresh, un-roled node.
+        cm.remove_node("node-b", true, Some("test restart".into()))
+            .unwrap();
+        wait_for("node-b removed", || cm.get_node("node-b").is_none());
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("node-b re-registered without a role", || {
+            cm.get_node("node-b")
+                .map(|n| n.k0s_role.is_none())
+                .unwrap_or(false)
+        });
+
+        // The Ready-phase reconcile re-runs provisioning and heals the un-roled node.
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("node-b re-assigned", || {
+            cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(b.k0s_role, b_role, "same role after re-add");
+        assert_eq!(b.k0s_mesh_ip, b_ip, "same mesh IP reclaimed after re-add");
+        assert_eq!(b.k0s_pod_cidr, b_cidr, "same pod CIDR after re-add");
+        // The untouched node keeps its assignment (provisioning is idempotent).
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_phase_reconcile_assigns_unroled_node() {
+        // The loop wiring: reconcile_phase must run provisioning in the Ready phase, not only
+        // Provisioning. An un-roled node present while Ready (e.g. re-added after a spurd restart)
+        // must be assigned by a Ready-phase reconcile tick. If Ready were a no-op it would stay
+        // un-roled forever (out of the mesh) — the bug this fixes.
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
+        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), false)
+            .unwrap();
+        wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: Some("node-a".into()),
+        };
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens).await;
+
+        wait_for("un-roled node assigned by a Ready-phase tick", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+        });
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_mesh_ip).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_controller_and_worker_for_two_nodes() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both nodes registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both nodes assigned k0s roles", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // Two nodes -> the deterministic control-plane (lexically-first, node-a) is a Controller
+        // (NOT Single, which would never exercise the worker token-mint/join path); node-b is a
+        // Worker. Each gets a distinct mesh IP + pod /24, and the control-plane choice is recorded.
+        let a = cm.get_node("node-a").unwrap();
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(a.k0s_role, Some(K0sRole::Controller));
+        assert_eq!(b.k0s_role, Some(K0sRole::Worker));
+        assert!(a.k0s_mesh_ip.is_some() && b.k0s_mesh_ip.is_some());
+        assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
+        assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
+        assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_rejects_corrupt_data() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -10488,6 +10753,7 @@ mod tests {
             license_pool: HashMap::new(),
             tokens: Vec::new(),
             burst_buffer_total_gb: 0,
+            k0s: spur_core::k0s::K0sClusterState::default(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

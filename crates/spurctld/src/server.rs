@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::reservation::Reservation;
@@ -999,6 +999,14 @@ impl SlurmController for ControllerService {
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
         {
+            // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
+            // without a restart. Only meaningful once the node is known (heartbeat accepted).
+            if self
+                .cluster
+                .update_node_wg_pubkey(&req.hostname, &req.wg_pubkey)
+            {
+                info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
+            }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
@@ -1470,6 +1478,123 @@ impl SlurmController for ControllerService {
             stderr: agent_resp.stderr,
             node: node_name,
         }))
+    }
+
+    // -- Native cluster (k0s) lifecycle. Leader-gated; record intent in the
+    //    replicated k0s state and let the reconcile loop (cluster_k8s.rs) converge in 5b/5c. --
+    async fn cluster_up(
+        &self,
+        request: Request<ClusterUpRequest>,
+    ) -> Result<Response<ClusterUpResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_up(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_up to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        // Reject a control-plane change once roles are assigned: provisioning skips already-assigned
+        // nodes, so moving the control plane here would only rewrite the recorded CP and leave the
+        // old controller a Controller and the new node a Worker (inconsistent topology). Tear the
+        // cluster down (`spur k8s down --reset`) to re-elect a control plane.
+        if let Some(new_cp) = req.control_plane_node.as_deref() {
+            let state = self.cluster.k0s_state();
+            let assigned = self
+                .cluster
+                .get_nodes()
+                .iter()
+                .any(|n| n.k0s_role.is_some());
+            if assigned && state.control_plane_node.as_deref() != Some(new_cp) {
+                return Err(Status::failed_precondition(format!(
+                    "control-plane node is already assigned ({}); tear the cluster down \
+                     (spur k8s down --reset) before changing it to {new_cp}",
+                    state.control_plane_node.as_deref().unwrap_or("<none>"),
+                )));
+            }
+        }
+        self.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                req.control_plane_node.clone(),
+                false,
+            )
+            .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        Ok(Response::new(ClusterUpResponse {
+            accepted: true,
+            message: "k0s cluster provisioning requested".to_string(),
+            nodes: crate::cluster_k8s::node_statuses(&self.cluster),
+        }))
+    }
+
+    async fn cluster_down(
+        &self,
+        request: Request<ClusterDownRequest>,
+    ) -> Result<Response<ClusterDownResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_down(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_down to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        self.cluster
+            .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, req.reset)
+            .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        Ok(Response::new(ClusterDownResponse {
+            accepted: true,
+            message: "k0s cluster teardown requested".to_string(),
+        }))
+    }
+
+    async fn cluster_status(
+        &self,
+        request: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let mut fwd = Request::new(request.into_inner());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.cluster_status(fwd).await;
+        }
+        let state = self.cluster.k0s_state();
+        Ok(Response::new(ClusterStatusResponse {
+            phase: crate::cluster_k8s::phase_str(state.phase),
+            control_plane_node: state.control_plane_node.unwrap_or_default(),
+            nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
+        }))
+    }
+
+    async fn cluster_kubeconfig(
+        &self,
+        request: Request<ClusterKubeconfigRequest>,
+    ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let mut fwd = Request::new(request.into_inner());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.cluster_kubeconfig(fwd).await;
+        }
+        // Ask the control-plane node's agent to run `k0s kubeconfig admin`.
+        match crate::cluster_k8s::fetch_admin_kubeconfig(&self.cluster).await {
+            Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
+            Err(e) => Err(Status::unavailable(format!(
+                "could not fetch admin kubeconfig from the control-plane agent: {e}"
+            ))),
+        }
     }
 }
 
