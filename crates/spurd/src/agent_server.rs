@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
@@ -31,7 +31,6 @@ use crate::reporter::NodeReporter;
 struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
-    allocation: Option<AllocationResult>,
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
@@ -50,7 +49,6 @@ struct CompletedJob {
     exit_code: i32,
     signal: i32,
     rootfs_mode: crate::container::RootfsMode,
-    allocation: Option<AllocationResult>,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
     uid: u32,
@@ -177,7 +175,6 @@ impl AgentService {
                                 exit_code,
                                 signal,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
-                                allocation: tracked.allocation.take(),
                                 cgroup,
                                 work_dir: tracked.work_dir.clone(),
                                 uid: tracked.uid,
@@ -203,13 +200,17 @@ impl AgentService {
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
-                    if let Some(ref alloc) = c.allocation {
-                        allocation.lock().await.release(alloc);
-                    }
+                    allocation.lock().await.release_job(c.job_id);
                     if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
                         pmi.cleanup();
                     }
                 }
+
+                // Self-heal backstop: reclaim allocations with no tracked,
+                // non-launching job. `jobs` is held so the live set is a
+                // consistent snapshot that can't race a committing launch
+                // (commit_job takes the running lock first).
+                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
 
                 // Release lock BEFORE network I/O — holding the lock during
                 // report_completion blocks new job launches and can lose
@@ -293,6 +294,24 @@ impl AgentService {
 
 struct DrainRequest {
     reason: String,
+}
+
+/// Reclaim allocations whose job is no longer tracked and is not mid-launch,
+/// using the running set as ground truth. Callers hold the `running` lock
+/// across building `running` and this call so the live set is a consistent
+/// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
+fn reconcile_orphaned_allocations(
+    running: &HashMap<u32, TrackedJob>,
+    allocation: &mut NodeAllocation,
+) {
+    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+    let reclaimed = allocation.reconcile(&live);
+    if !reclaimed.is_empty() {
+        warn!(
+            ?reclaimed,
+            "reconciled orphaned resource allocations with no tracked job"
+        );
+    }
 }
 
 fn completion_report_retryable(status: &tonic::Status) -> bool {
@@ -765,16 +784,26 @@ impl SlurmAgent for AgentService {
         };
 
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(&spec, req.allocated.as_ref())
+            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        let (host_device_plan, container_device_plan) = {
+        // Any failure before commit must release the reservation, or the GPUs
+        // stay in-use with no tracked job while the controller sees the node
+        // IDLE. Reconcile is a backstop; releasing eagerly reclaims at once.
+        let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
-                .map_err(|e| {
-                    error!(job_id, error = %e, "device registry resolution failed");
-                    Status::failed_precondition(format!("device resolution failed: {}", e))
-                })?
+        };
+        let (host_device_plan, container_device_plan) = match injection {
+            Ok(plans) => plans,
+            Err(e) => {
+                error!(job_id, error = %e, "device registry resolution failed");
+                self.allocation.lock().await.release_job(job_id);
+                return Err(Status::failed_precondition(format!(
+                    "device resolution failed: {}",
+                    e
+                )));
+            }
         };
 
         // Wire allocated device IDs and injection plan into container config.
@@ -783,17 +812,22 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
-        let cpu_ids: Vec<u32> = alloc_result
-            .as_ref()
-            .map(|a| a.cpu_ids.clone())
-            .unwrap_or_default();
+        let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
-        // Build container launch config if this is a containerized job
+        // Guard rather than unwrap: these are always Some when the image is
+        // set, but an early exit before commit must release the reservation.
         let container_launch = if !spec.container_image.is_empty() {
-            Some(executor::ContainerLaunchConfig {
-                config: container_config.take().unwrap(),
-                rootfs: rootfs_path.take().unwrap(),
-            })
+            match (container_config.take(), rootfs_path.take()) {
+                (Some(config), Some(rootfs)) => {
+                    Some(executor::ContainerLaunchConfig { config, rootfs })
+                }
+                _ => {
+                    self.allocation.lock().await.release_job(job_id);
+                    return Err(Status::internal(
+                        "internal error: container config missing after setup",
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -828,13 +862,17 @@ impl SlurmAgent for AgentService {
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(result) => {
                 let mut jobs = self.running.lock().await;
+                // Commit the reservation: the job now has a tracked process, so
+                // it is no longer exempt from reconcile. Take the running lock
+                // first so a job is never briefly absent from BOTH `running` and
+                // `launching` (which would let reconcile reclaim it).
+                self.allocation.lock().await.commit_job(job_id);
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 jobs.insert(
                     job_id,
                     TrackedJob {
                         job: result.job,
                         rootfs_mode: rootfs_mode.clone(),
-                        allocation: alloc_result,
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
                         has_pid_namespace: nix::unistd::geteuid().is_root(),
@@ -854,10 +892,7 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                // Release allocation on launch failure
-                if let Some(ref alloc) = alloc_result {
-                    self.allocation.lock().await.release(alloc);
-                }
+                self.allocation.lock().await.release_job(job_id);
 
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
@@ -1413,9 +1448,10 @@ impl AgentService {
     /// Record controller-allocated GPUs and allocate local CPU/memory resources.
     async fn allocate_local_resources(
         &self,
+        job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(Option<AllocationResult>, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), Status> {
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -1433,26 +1469,48 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        if !controller_gpu_ids.is_empty() && !alloc.record_gpus(&controller_gpu_ids) {
-            return Err(Status::resource_exhausted(
-                "controller-allocated GPUs unavailable on this node",
-            ));
-        }
-
-        let cpu_alloc = if spec.cpus_per_task > 0 {
-            alloc.try_allocate(spec.cpus_per_task.max(1), spec.memory_per_node_mb, 0, None)
+        let cpus = if spec.cpus_per_task > 0 {
+            spec.cpus_per_task
         } else {
-            None
+            0
+        };
+        let result = match alloc.allocate_for_job(
+            job_id,
+            cpus,
+            spec.memory_per_node_mb,
+            &controller_gpu_ids,
+        ) {
+            Ok(result) => result,
+            Err(AllocError::GpusUnavailable) => {
+                warn!(
+                    job_id,
+                    requested = ?controller_gpu_ids,
+                    already_allocated = ?alloc.allocated_gpu_ids(),
+                    "rejecting dispatch: controller-allocated GPUs already in use in the local \
+                     allocation table (stale allocation from a prior job would strand this node)"
+                );
+                return Err(Status::resource_exhausted(
+                    "controller-allocated GPUs unavailable on this node",
+                ));
+            }
+            Err(AllocError::DuplicateJob) => {
+                // A launch is already in flight for this job id (reserved, not
+                // yet committed or released). This is a concurrent duplicate,
+                // not resource exhaustion. A stale reservation from a prior,
+                // already-torn-down run is superseded inside allocate_for_job
+                // and does not reach here.
+                warn!(
+                    job_id,
+                    "rejecting duplicate launch: a launch is already in flight for this job"
+                );
+                return Err(Status::already_exists(format!(
+                    "job {job_id} already has a launch in flight on this node"
+                )));
+            }
         };
 
-        let gpu_ids = controller_gpu_ids.clone();
-        let result = AllocationResult {
-            cpu_ids: cpu_alloc.map(|a| a.cpu_ids).unwrap_or_default(),
-            gpu_ids: controller_gpu_ids,
-            memory_mb: spec.memory_per_node_mb,
-        };
-
-        Ok((Some(result), gpu_ids))
+        let gpu_ids = controller_gpu_ids;
+        Ok((result, gpu_ids))
     }
 
     fn parse_gpu_gres(gres: &[String]) -> (u32, Option<String>) {
@@ -1554,7 +1612,6 @@ impl TrackedJob {
                 cgroup_path: None,
             },
             rootfs_mode: crate::container::RootfsMode::Extracted,
-            allocation: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -1574,6 +1631,10 @@ impl TrackedJob {
 impl AgentService {
     async fn insert_test_job(&self, job_id: u32, job: TrackedJob) {
         self.running.lock().await.insert(job_id, job);
+    }
+
+    async fn free_gpu_count(&self) -> u32 {
+        self.allocation.lock().await.free_gpus(None)
     }
 }
 
@@ -1888,6 +1949,135 @@ mod tests {
         assert_eq!(observed_canonical, tmp_canonical);
     }
 
+    fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let gpus = device_ids
+            .iter()
+            .map(|&device_id| GpuResource {
+                device_id,
+                gpu_type: "mi300x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+            })
+            .collect();
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                gpus,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+        ))
+    }
+
+    // A dispatch that records GPUs but fails before the job is
+    // tracked (here: device-registry resolution fails) must release those GPUs.
+    // Otherwise the node keeps rejecting every future dispatch ("controller-
+    // allocated GPUs unavailable") while the controller still sees it IDLE,
+    // stranding the node until spurd restart -> JobHoldMaxRequeue.
+    #[tokio::test]
+    async fn launch_failure_after_gpu_record_releases_allocation() {
+        // Reporter advertises GPU device_id 0 so allocate_for_job succeeds, but the
+        // device registry is empty so build_job_injection_plans fails.
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        assert_eq!(svc.free_gpu_count().await, 1);
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 65,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                gres: vec!["gpu:1".into()],
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+            }),
+            ..Default::default()
+        });
+
+        let result = svc.launch_job(req).await;
+        assert!(
+            result.is_err(),
+            "expected launch to fail on registry resolution"
+        );
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "GPU allocation must be released after a post-record launch failure"
+        );
+    }
+
+    // The monitor loop's reconcile step must reclaim an
+    // allocation whose job is no longer tracked, while sparing a job that is
+    // still in `running`. Exercises the real reconcile_orphaned_allocations
+    // wiring the monitor loop calls, without driving the timed loop.
+    #[tokio::test]
+    async fn reconcile_reclaims_orphan_but_spares_tracked_job() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // job 1: tracked (live) and committed.
+        svc.insert_test_job(1, TrackedJob::dummy(0)).await;
+        // job 2: orphan — committed allocation but never entered `running`
+        // (simulating a teardown path that dropped the job without releasing).
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(1, 2, 0, &[0]).unwrap();
+            alloc.commit_job(1);
+            alloc.allocate_for_job(2, 2, 0, &[1]).unwrap();
+            alloc.commit_job(2);
+        }
+        assert_eq!(svc.free_gpu_count().await, 0);
+
+        {
+            let jobs = svc.running.lock().await;
+            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        }
+
+        // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
+        );
+    }
+
     #[tokio::test]
     async fn run_command_injects_gpu_env_from_tracked_job() {
         let svc = AgentService::new(
@@ -1991,7 +2181,6 @@ mod tests {
                 cgroup_path: None,
             },
             rootfs_mode: crate::container::RootfsMode::Extracted,
-            allocation: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
