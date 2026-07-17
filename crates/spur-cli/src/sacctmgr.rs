@@ -689,8 +689,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let has_name_filter = p.contains_key("name");
             if let Some(name_filter) = p.get("name") {
-                let names: Vec<&str> = name_filter.split(',').map(str::trim).collect();
-                qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+                filter_qos_by_name(&mut qos_list, name_filter);
             }
 
             format_engine::print_header(&fields);
@@ -743,6 +742,11 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             other
         ),
     }
+}
+
+fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
+    let names: Vec<&str> = filter.split(',').map(str::trim).collect();
+    qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
 }
 
 const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
@@ -1176,9 +1180,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let filter = "alpha, gamma";
-        let names: Vec<&str> = filter.split(',').map(str::trim).collect();
-        list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+        filter_qos_by_name(&mut list, "alpha, gamma");
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "alpha");
         assert_eq!(list[1].name, "gamma");
