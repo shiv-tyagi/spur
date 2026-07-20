@@ -832,6 +832,8 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         shm_size: spec.shm_size.clone().unwrap_or_default(),
         extra_resources: spec.extra_resources.clone(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
+        pty: spec.pty,
+        initial_winsize: None,
     }
 }
 

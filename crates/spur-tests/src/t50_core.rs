@@ -967,27 +967,6 @@ address = "http://peer-a:6817"
         assert_eq!(req.command.len(), 2);
     }
 
-    // ── Issue #45: sattach interactive attach ─────────────────────
-
-    #[test]
-    fn t50_92_attach_job_proto_messages_exist() {
-        // Issue #45: AttachJob bidirectional streaming RPC should exist
-        // with AttachJobInput and AttachJobOutput messages.
-        let input = spur_proto::proto::AttachJobInput {
-            job_id: 10,
-            data: b"ls\n".to_vec(),
-        };
-        assert_eq!(input.job_id, 10);
-        assert_eq!(input.data, b"ls\n");
-
-        let output = spur_proto::proto::AttachJobOutput {
-            data: b"hello\n".to_vec(),
-            eof: false,
-        };
-        assert!(!output.eof);
-        assert_eq!(output.data, b"hello\n");
-    }
-
     // ── Issue #46: CLI reads config file for controller port ──────
 
     #[test]
@@ -1159,27 +1138,6 @@ address = "http://peer-a:6817"
                 assert!(expected.to_str().unwrap().contains(".spur/images"));
             }
         }
-    }
-
-    // ── Issue #54 (reopen): sattach buffer sizes ─────────────────
-
-    #[test]
-    fn t50_99_attach_job_messages_support_raw_bytes() {
-        // Issue #54: AttachJobInput should carry raw bytes (not just
-        // newline-terminated lines) for interactive use.
-        let input = spur_proto::proto::AttachJobInput {
-            job_id: 42,
-            data: vec![0x1b, 0x5b, 0x41], // ESC [ A (arrow up)
-        };
-        assert_eq!(input.data.len(), 3);
-        assert_eq!(input.data[0], 0x1b); // ESC byte
-
-        let output = spur_proto::proto::AttachJobOutput {
-            data: vec![0x1b, 0x5b, 0x48], // ESC [ H (cursor home)
-            eof: false,
-        };
-        assert_eq!(output.data.len(), 3);
-        assert!(!output.eof);
     }
 
     // ── Issue #53: CLI show dispatch ─────────────────────────────

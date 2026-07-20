@@ -475,6 +475,9 @@ pub struct JobSpec {
     // Output mode
     /// How to open stdout/stderr files: "truncate" (default) or "append".
     pub open_mode: Option<String>,
+
+    // Interactive PTY
+    pub pty: bool,
 }
 
 impl Default for JobSpec {
@@ -546,6 +549,7 @@ impl Default for JobSpec {
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
             open_mode: None,
+            pty: false,
         }
     }
 }

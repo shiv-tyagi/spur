@@ -745,6 +745,8 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         shm_size: s.shm_size.clone().unwrap_or_default(),
         extra_resources: s.extra_resources.clone(),
         open_mode: s.open_mode.clone().unwrap_or_default(),
+        pty: s.pty,
+        initial_winsize: None,
     }
 }
 
@@ -845,6 +847,8 @@ async fn dispatch_to_agent(
         shm_size: spec.shm_size.clone().unwrap_or_default(),
         extra_resources: spec.extra_resources.clone(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
+        pty: spec.pty,
+        initial_winsize: None,
     };
 
     let response = client
@@ -1935,7 +1939,8 @@ mod tests {
         impl spur_proto::proto::slurm_agent_server::SlurmAgent for MockAgent {
             type StreamJobOutputStream =
                 tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
-            type AttachJobStream = tonic::codegen::BoxStream<spur_proto::proto::AttachJobOutput>;
+            type InteractiveSessionStream =
+                tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
 
             async fn launch_job(
                 &self,
@@ -2004,10 +2009,11 @@ mod tests {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
 
-            async fn attach_job(
+            async fn interactive_session(
                 &self,
-                _request: tonic::Request<tonic::Streaming<spur_proto::proto::AttachJobInput>>,
-            ) -> Result<tonic::Response<Self::AttachJobStream>, tonic::Status> {
+                _request: tonic::Request<tonic::Streaming<spur_proto::proto::InteractiveInput>>,
+            ) -> Result<tonic::Response<Self::InteractiveSessionStream>, tonic::Status>
+            {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
 

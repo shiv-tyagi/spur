@@ -848,6 +848,8 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         extra_resources: std::collections::HashMap::new(),
         open_mode: args.open_mode.unwrap_or_default(),
         srun_job: false,
+        pty: false,
+        initial_winsize: None,
     };
 
     // Submit to controller
