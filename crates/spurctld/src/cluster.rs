@@ -249,6 +249,17 @@ pub struct ClusterManager {
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
 }
 
+struct PendingJobClassification {
+    jobs: Vec<Job>,
+    blocked: Vec<(JobId, PendingReason)>,
+}
+
+struct PendingJobCandidate {
+    job: Job,
+    scheduling_eligible: bool,
+    tag_reason: bool,
+}
+
 impl ClusterManager {
     pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
@@ -1839,24 +1850,64 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
+    /// Get pending jobs sorted by priority, filtering out blocked jobs.
     /// Recomputes effective priority using QoS, age, and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
-        let jobs = self.jobs.read();
-        let mut pending: Vec<Job> = jobs
-            .values()
-            .filter(|j| j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold())
-            .cloned()
-            .collect();
+        self.classify_pending_jobs().jobs
+    }
 
-        // Drop jobs blocked by partition state/config (shares partition_block()
-        // with tag_blocked_pending_reasons() so drop and shown reason agree).
+    /// Classify pending jobs once, apply displayed block reasons, and return the
+    /// jobs eligible for scheduling.
+    pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
+        let classification = self.classify_pending_jobs();
+        self.apply_blocked_pending_reasons(classification.blocked);
+        classification.jobs
+    }
+
+    fn classify_pending_jobs(&self) -> PendingJobClassification {
+        let jobs = self.jobs.read();
+        let now = Utc::now();
+        let running_array_counts: HashMap<JobId, u32> = jobs
+            .values()
+            .filter(|job| job.state == JobState::Running)
+            .filter_map(|job| job.spec.array_job_id)
+            .fold(HashMap::new(), |mut counts, array_id| {
+                *counts.entry(array_id).or_insert(0) += 1;
+                counts
+            });
+        let mut candidates: Vec<PendingJobCandidate> = jobs
+            .values()
+            .filter(|job| job.state == JobState::Pending)
+            .filter(|job| !job.pending_reason.is_scheduling_hold())
+            .filter_map(|job| {
+                let active_begin_hold = job.pending_reason == PendingReason::BeginTime
+                    && job.spec.begin_time.is_some_and(|begin| now < begin);
+                if active_begin_hold {
+                    return None;
+                }
+                let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
+                let array_throttled = match (job.spec.array_job_id, job.spec.array_max_concurrent) {
+                    (Some(array_id), Some(max)) => {
+                        running_array_counts.get(&array_id).copied().unwrap_or(0) >= max
+                    }
+                    _ => false,
+                };
+                Some(PendingJobCandidate {
+                    job: job.clone(),
+                    scheduling_eligible: !before_begin_time && !array_throttled,
+                    tag_reason: job.pending_reason != PendingReason::DeadLine,
+                })
+            })
+            .collect();
+        let mut blocked = Vec::new();
+
         {
             let partitions = self.partitions.read();
-            pending.retain(|job| partition_block(job, &partitions).is_none());
+            retain_unblocked(&mut candidates, &mut blocked, |job| {
+                partition_block(job, &partitions)
+            });
         }
 
-        // Check dependencies
         let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
         let get_array_tasks = |id: JobId| -> Vec<Job> {
             jobs.values()
@@ -1871,89 +1922,39 @@ impl ClusterManager {
                 .collect()
         };
 
-        pending.retain(|job| {
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
             if job.spec.dependency.is_empty() {
-                return true;
+                return None;
             }
             use spur_core::dependency::{check_dependencies, DependencyResult};
             match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
-                DependencyResult::Satisfied => true,
-                // Waiting and Failed are both filtered out of scheduling here.
-                // Failed jobs are separately cancelled by
-                // cancel_unsatisfiable_dependency_jobs() in the scheduler loop,
-                // which can take the write lock this read-locked scan cannot.
-                DependencyResult::Waiting | DependencyResult::Failed => false,
+                DependencyResult::Satisfied => None,
+                DependencyResult::Waiting | DependencyResult::Failed => {
+                    Some(PendingReason::Dependency)
+                }
             }
         });
 
-        // Filter out jobs whose begin_time is in the future (not yet eligible)
-        {
-            let now = Utc::now();
-            pending.retain(|job| {
-                if let Some(begin) = job.spec.begin_time {
-                    if now < begin {
-                        return false; // Not yet eligible
-                    }
-                }
-                true
-            });
-        }
-
-        // Enforce array max_concurrent: suppress tasks if too many siblings already running
-        let running_array_counts: std::collections::HashMap<JobId, u32> = {
-            let mut counts = std::collections::HashMap::new();
-            for j in jobs.values() {
-                if j.state == JobState::Running {
-                    if let Some(aid) = j.spec.array_job_id {
-                        *counts.entry(aid).or_insert(0) += 1;
-                    }
-                }
-            }
-            counts
-        };
-        pending.retain(|job| {
-            if let (Some(aid), Some(max)) = (job.spec.array_job_id, job.spec.array_max_concurrent) {
-                let running = running_array_counts.get(&aid).copied().unwrap_or(0);
-                if running >= max {
-                    return false; // Throttled — too many siblings running
-                }
-            }
-            true
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
+            account_block_for(job, &self.association_cache, &jobs)
         });
 
-        // Account/association enforcement: check per-user-per-account limits.
-        // Shares the eligibility logic with tag_blocked_pending_reasons() via
-        // account_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| account_block_for(job, &self.association_cache, &jobs).is_none());
+        let mut qos_by_job = HashMap::new();
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
+            let qos = self.resolve_qos(job);
+            let reason = qos_block_for(job, &qos, &jobs);
+            qos_by_job.insert(job.job_id, qos);
+            reason
+        });
 
-        // Resolve once, reuse for both the QoS-limit check and the priority
-        // adjustment below, instead of looking it up twice per job.
-        let qos_by_job: HashMap<JobId, Qos> = pending
-            .iter()
-            .map(|job| (job.job_id, self.resolve_qos(job)))
-            .collect();
-
-        // QoS enforcement: check per-user limits for jobs with a QoS. Shares
-        // the eligibility logic with tag_blocked_pending_reasons() via
-        // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_none());
-
-        // License enforcement is applied after the priority sort below, so scarce
-        // licenses are reserved highest-priority-first and a single pass cannot
-        // over-subscribe the pool.
-
-        // Reservation validation: reject jobs targeting expired/nonexistent reservations
-        {
-            let reservations = self.get_reservations();
-            let now = Utc::now();
-            pending.retain(|job| reservation_block(job, &reservations, now).is_none());
-        }
-
-        // Recompute effective priority with age + partition tier
-        let now = Utc::now();
-        let partitions = self.partitions.read();
         let reservations = self.get_reservations();
-        for job in &mut pending {
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
+            reservation_block(job, &reservations, now)
+        });
+
+        let partitions = self.partitions.read();
+        for candidate in &mut candidates {
+            let job = &mut candidate.job;
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
             let partition_tier =
                 spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions);
@@ -1970,26 +1971,27 @@ impl ClusterManager {
         }
         drop(partitions);
 
-        // QoS floors priority at 1, making ties more likely; break on job_id
-        // for deterministic ordering.
-        pending.sort_by(|a, b| {
-            let a_res = reservation::job_has_active_reservation(a, &reservations, now);
-            let b_res = reservation::job_has_active_reservation(b, &reservations, now);
+        candidates.sort_by(|a, b| {
+            let a_res = reservation::job_has_active_reservation(&a.job, &reservations, now);
+            let b_res = reservation::job_has_active_reservation(&b.job, &reservations, now);
             b_res
                 .cmp(&a_res)
-                .then(b.priority.cmp(&a.priority))
-                .then(a.job_id.cmp(&b.job_id))
+                .then(b.job.priority.cmp(&a.job.priority))
+                .then(a.job.job_id.cmp(&b.job.job_id))
         });
 
-        // License reservation, in priority order. `remaining` starts from current
-        // availability (config total minus licenses held by running jobs) and each
-        // kept job reserves its licenses so lower-priority jobs in the same pass see
-        // the reduced availability — preventing a single pass from over-subscribing.
-        // An absolute shortage is also reported as `Licenses` by
-        // tag_blocked_pending_reasons() via license_block().
         {
-            let mut remaining = self.available_licenses_with(&jobs);
-            pending.retain(|job| {
+            let available = self.available_licenses_with(&jobs);
+            let mut remaining = available.clone();
+            candidates.retain(|candidate| {
+                let job = &candidate.job;
+                if let Some(reason) = license_block(job, &available) {
+                    record_blocked(&mut blocked, candidate, reason);
+                    return false;
+                }
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
                 let req = extract_license_requirements(&job.spec);
                 if req
                     .iter()
@@ -2006,24 +2008,27 @@ impl ClusterManager {
             });
         }
 
-        // Burst-buffer gate, after licenses (the most downstream consumable;
-        // staging happens last, just before dispatch). Two holds:
-        //   - capacity shortage: a job needing more BB than is free is dropped
-        //     (also reported `BurstBufferResources` by tag_blocked...).
-        //   - mid-stage-in: a job whose capacity is reserved but whose stage-in
-        //     has not completed (`Staging`) is NOT dispatchable yet; only a
-        //     `Ready` (or no-BB) job passes. `remaining` reserves capacity
-        //     highest-priority-first so one pass can't over-subscribe the pool.
         {
-            let mut remaining = self.available_bb_with(&jobs);
-            pending.retain(|job| {
+            let available = self.available_bb_with(&jobs);
+            let mut remaining = available;
+            candidates.retain(|candidate| {
+                let job = &candidate.job;
+                if job.bb_stage_state == BbStageState::Staging {
+                    record_blocked(&mut blocked, candidate, PendingReason::BurstBufferStageIn);
+                    return false;
+                }
+                if let Some(reason) = burst_buffer_block(job, available) {
+                    record_blocked(&mut blocked, candidate, reason);
+                    return false;
+                }
+                if !candidate.scheduling_eligible {
+                    return false;
+                }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
-                    return true; // no BB -> unaffected by the gate
+                    return true;
                 }
                 match job.bb_stage_state {
-                    // Capacity already reserved in bb_capacity_in_use(), so
-                    // don't double-count `remaining`.
                     BbStageState::Ready => true,
                     BbStageState::Staging => false,
                     BbStageState::None => {
@@ -2037,7 +2042,13 @@ impl ClusterManager {
             });
         }
 
-        pending
+        PendingJobClassification {
+            jobs: candidates
+                .into_iter()
+                .map(|candidate| candidate.job)
+                .collect(),
+            blocked,
+        }
     }
 
     /// Licenses held by jobs actively occupying resources
@@ -2304,86 +2315,13 @@ impl ClusterManager {
         cancelled
     }
 
-    /// Set `pending_reason` for jobs `pending_jobs()` drops from scheduling
-    /// (dependency/QoS/license/reservation), which never reach
-    /// `update_pending_reasons()` and would otherwise show a stale reason.
-    /// Leader-only; mirrors `cancel_unsatisfiable_dependency_jobs()`.
+    /// Reclassify pending jobs and apply their displayed block reasons.
     pub fn tag_blocked_pending_reasons(&self) {
-        use spur_core::job::PendingReason;
+        let blocked = self.classify_pending_jobs().blocked;
+        self.apply_blocked_pending_reasons(blocked);
+    }
 
-        // Evaluate under read locks; release before taking the write lock.
-        let blocked: Vec<(JobId, PendingReason)> = {
-            let jobs = self.jobs.read();
-            let reservations = self.get_reservations();
-            let now = Utc::now();
-            let available = self.available_licenses_with(&jobs);
-            let partitions = self.partitions.read();
-            let bb_free = self.available_bb_with(&jobs);
-
-            // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
-            // is tagged just before this pass, so re-check it first (same closures).
-            use spur_core::dependency::{check_dependencies, DependencyResult};
-            let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
-            let get_array_tasks = |id: JobId| -> Vec<Job> {
-                jobs.values()
-                    .filter(|j| j.spec.array_job_id == Some(id))
-                    .cloned()
-                    .collect()
-            };
-            let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
-                jobs.values()
-                    .filter(|j| j.spec.name == name && j.spec.user == user)
-                    .cloned()
-                    .collect()
-            };
-            let dependency_block = |job: &Job| -> Option<PendingReason> {
-                if job.spec.dependency.is_empty() {
-                    return None;
-                }
-                match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
-                    DependencyResult::Waiting | DependencyResult::Failed => {
-                        Some(PendingReason::Dependency)
-                    }
-                    DependencyResult::Satisfied => None,
-                }
-            };
-
-            // A BB job mid-stage-in displays `BurstBufferStageIn`; one short of
-            // free capacity displays `BurstBufferResources`. Staging is checked
-            // first so a job that already reserved capacity isn't mislabeled as
-            // a resource shortage.
-            let bb_block = |job: &Job| -> Option<PendingReason> {
-                if job.bb_stage_state == BbStageState::Staging {
-                    return Some(PendingReason::BurstBufferStageIn);
-                }
-                burst_buffer_block(job, bb_free)
-            };
-
-            jobs.values()
-                .filter(|job| {
-                    let begin_held = job.pending_reason == PendingReason::BeginTime
-                        && job.spec.begin_time.is_some_and(|b| now < b);
-                    job.state == JobState::Pending
-                        && !job.pending_reason.is_scheduling_hold()
-                        && job.pending_reason != PendingReason::DeadLine
-                        && !begin_held
-                })
-                .filter_map(|job| {
-                    // Same drop order as pending_jobs(): Part -> Dep -> Assoc ->
-                    // QoS -> Resv -> Lic -> BB (partition block is permanent, so
-                    // first; BB is last because staging runs just before dispatch).
-                    partition_block(job, &partitions)
-                        .or_else(|| dependency_block(job))
-                        .or_else(|| account_block_for(job, &self.association_cache, &jobs))
-                        .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
-                        .or_else(|| reservation_block(job, &reservations, now))
-                        .or_else(|| license_block(job, &available))
-                        .or_else(|| bb_block(job))
-                        .map(|reason| (job.job_id, reason))
-                })
-                .collect()
-        };
-
+    fn apply_blocked_pending_reasons(&self, blocked: Vec<(JobId, PendingReason)>) {
         if blocked.is_empty() {
             return;
         }
@@ -4121,9 +4059,32 @@ fn reservation_fence_reason(
     }
 }
 
+fn retain_unblocked(
+    candidates: &mut Vec<PendingJobCandidate>,
+    blocked: &mut Vec<(JobId, PendingReason)>,
+    mut block: impl FnMut(&Job) -> Option<PendingReason>,
+) {
+    candidates.retain(|candidate| {
+        let Some(reason) = block(&candidate.job) else {
+            return true;
+        };
+        record_blocked(blocked, candidate, reason);
+        false
+    });
+}
+
+fn record_blocked(
+    blocked: &mut Vec<(JobId, PendingReason)>,
+    candidate: &PendingJobCandidate,
+    reason: PendingReason,
+) {
+    if candidate.tag_reason {
+        blocked.push((candidate.job.job_id, reason));
+    }
+}
+
 /// `Reservation` if the job's `--reservation` is absent/inactive/expired or
-/// denies it, else `None`. Shared by `pending_jobs()` (drop) and
-/// `tag_blocked_pending_reasons()` (displayed reason) so the two agree.
+/// denies it, else `None`.
 fn reservation_block(
     job: &Job,
     reservations: &[Reservation],
@@ -4176,8 +4137,7 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
-/// decision and displayed reason always agree. Caller resolves the `Qos`.
+/// Caller resolves the `Qos`.
 fn qos_block_for(
     job: &Job,
     qos: &Qos,
@@ -4223,10 +4183,9 @@ fn qos_block_for(
     }
 }
 
-/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
-/// decision and displayed reason always agree. Looks up the job's (user,
-/// account) association limits from `AssociationCache`; a job with no account
-/// (or an association the cache has no limits for) is unconstrained.
+/// Looks up the job's (user, account) association limits from
+/// `AssociationCache`; a job with no account (or an association the cache has
+/// no limits for) is unconstrained.
 fn account_block_for(
     job: &Job,
     assoc_cache: &AssociationCache,
@@ -4359,8 +4318,7 @@ fn extract_bb_requirement(spec: &JobSpec) -> u64 {
 /// `BurstBufferResources` if the job needs more BB capacity than is currently
 /// free, else `None`. Reported when an absolute shortage means the job can
 /// never stage in the current cluster state. `free_gb` is the configured total
-/// minus capacity reserved by staging/active jobs. Shared by `pending_jobs()`
-/// (drop) and `tag_blocked_pending_reasons()` (displayed reason) so they agree.
+/// minus capacity reserved by staging/active jobs.
 fn burst_buffer_block(job: &Job, free_gb: u64) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     // A job that already reserved capacity (Staging/Ready) is not blocked on
@@ -8886,8 +8844,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_does_not_overallocate_licenses_within_one_pass() {
         // Two pending jobs each request fluent:1 but the pool holds only 1.
-        // A single pending_jobs() pass must not return both — otherwise the
-        // scheduler would allocate both and over-subscribe the license.
+        // A single classification must not return both or label the greedy
+        // contention drop as an absolute license shortage.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -8900,12 +8858,22 @@ mod tests {
         s2.gres = vec!["license:fluent:1".into()];
         let b = submit_and_wait(&cm, s2);
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
         let granted = [a, b].iter().filter(|id| pending.contains(id)).count();
         assert_eq!(
             granted, 1,
             "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
         );
+        for id in [a, b] {
+            assert_ne!(
+                cm.get_job(id).unwrap().pending_reason,
+                PendingReason::Licenses
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9087,9 +9055,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_blocked_dependency_takes_precedence_over_reservation() {
+    async fn pending_classification_uses_first_block_reason() {
         // Blocked by both a dependency and an absent reservation -> Dependency
-        // wins (pending_jobs() drops at the dependency filter, ahead of reservation).
+        // wins and the same classification excludes the job from scheduling.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -9114,7 +9082,8 @@ mod tests {
             spec: Box::new(child),
         });
 
-        cm.tag_blocked_pending_reasons();
+        let pending = cm.pending_jobs_and_tag_reasons();
+        assert!(!pending.iter().any(|job| job.job_id == 2));
         assert_eq!(
             cm.get_job(2).unwrap().pending_reason,
             PendingReason::Dependency

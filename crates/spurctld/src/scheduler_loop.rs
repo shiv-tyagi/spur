@@ -113,14 +113,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
 
-        // Tag jobs pending_jobs() will drop (QoS/license/reservation/BB) with
-        // their real reason, since they never reach update_pending_reasons().
-        // Runs after BB staging so BurstBufferStageIn reasons reflect the
-        // up-to-date staging state set in this cycle. Before the empty-check so
-        // reasons stay fresh even with nothing schedulable.
-        cluster.tag_blocked_pending_reasons();
-
-        let pending = cluster.pending_jobs();
+        // Classify after BB staging so BurstBufferStageIn reasons reflect the
+        // up-to-date staging state set in this cycle.
+        let pending = cluster.pending_jobs_and_tag_reasons();
         if pending.is_empty() {
             continue;
         }
