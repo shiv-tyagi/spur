@@ -98,6 +98,24 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
     }
 }
 
+impl ImageRef {
+    /// Canonical `registry/repository:tag` form.
+    ///
+    /// Equivalent references (`busybox`, `busybox:latest`, `docker://busybox`,
+    /// `docker.io/library/busybox:latest`) all normalize to the same string.
+    pub fn canonical(&self) -> String {
+        format!("{}/{}:{}", self.registry, self.repository, self.tag)
+    }
+}
+
+/// Canonical filename stem for an image reference.
+///
+/// Derives the on-disk name from the normalized `ImageRef` rather than the raw
+/// input string, so all equivalent references map to a single stored image.
+pub fn image_file_stem(image: &str) -> String {
+    sanitize_name(&parse_image_ref(image).canonical())
+}
+
 /// Pull an image from a registry and create a squashfs file.
 ///
 /// Returns the path to the squashfs file.
@@ -110,7 +128,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
         "pulling image"
     );
 
-    let sanitized = sanitize_name(image);
+    let sanitized = image_file_stem(image);
     let sqsh_path = output_dir.join(format!("{}.sqsh", sanitized));
 
     if sqsh_path.exists() {
@@ -748,6 +766,40 @@ mod tests {
         );
         assert_eq!(registry_base_url("ghcr.io"), "https://ghcr.io");
         assert_eq!(registry_base_url("localhost:5000"), "http://localhost:5000");
+    }
+
+    #[test]
+    fn test_canonical_equivalent_refs_collapse() {
+        // All of these reference the same Docker Hub official image and must
+        // resolve to a single canonical name / filename stem.
+        let expected = "docker.io/library/busybox:latest";
+        for r in [
+            "busybox",
+            "busybox:latest",
+            "docker://busybox",
+            "docker://busybox:latest",
+            "docker.io/library/busybox:latest",
+        ] {
+            assert_eq!(parse_image_ref(r).canonical(), expected, "ref: {}", r);
+            assert_eq!(
+                image_file_stem(r),
+                "docker.io+library+busybox+latest",
+                "ref: {}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_custom_registry() {
+        assert_eq!(
+            parse_image_ref("nvcr.io/nvidia/pytorch:24.01").canonical(),
+            "nvcr.io/nvidia/pytorch:24.01"
+        );
+        assert_eq!(
+            image_file_stem("nvcr.io/nvidia/pytorch:24.01"),
+            "nvcr.io+nvidia+pytorch+24.01"
+        );
     }
 
     #[test]
