@@ -6,6 +6,7 @@ mod exec;
 mod exit_fmt;
 mod format_engine;
 mod image;
+mod interactive;
 mod k8s;
 mod net;
 mod node;

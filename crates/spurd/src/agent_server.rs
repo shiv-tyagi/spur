@@ -35,6 +35,9 @@ struct TrackedJob {
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
+    has_user_namespace: bool,
+    has_mount_namespace: bool,
+    _pty_master: Option<std::os::fd::OwnedFd>,
     work_dir: String,
     uid: u32,
     gid: u32,
@@ -551,7 +554,7 @@ async fn report_completion(
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
-    type AttachJobStream = ReceiverStream<Result<AttachJobOutput, Status>>;
+    type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
 
     async fn launch_job(
         &self,
@@ -909,6 +912,11 @@ impl SlurmAgent for AgentService {
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
             memlock: self.memlock,
+            io_mode: if spec.pty {
+                executor::LaunchIo::Pty
+            } else {
+                executor::LaunchIo::File
+            },
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
@@ -920,6 +928,8 @@ impl SlurmAgent for AgentService {
                 // `launching` (which would let reconcile reclaim it).
                 self.allocation.lock().await.commit_job(job_id);
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
+                let is_root = nix::unistd::geteuid().is_root();
+                let is_container = launch_cfg.container.is_some();
                 let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
@@ -927,7 +937,10 @@ impl SlurmAgent for AgentService {
                         rootfs_mode: rootfs_mode.clone(),
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
-                        has_pid_namespace: nix::unistd::geteuid().is_root(),
+                        has_pid_namespace: is_root || is_container,
+                        has_user_namespace: is_container && !is_root,
+                        has_mount_namespace: is_root || is_container,
+                        _pty_master: result.pty_master,
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
                         gid: launch_cfg.gid,
@@ -1036,16 +1049,7 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
 
-        let (pid, has_pid_ns) = {
-            let jobs = self.running.lock().await;
-            let tracked = jobs.get(&req.job_id).ok_or_else(|| {
-                Status::not_found(format!("job {} not running on this node", req.job_id))
-            })?;
-            let pid = tracked.job.pid().ok_or_else(|| {
-                Status::failed_precondition(format!("job {} has no tracked PID", req.job_id))
-            })?;
-            (pid, tracked.has_pid_namespace)
-        };
+        let entry = self.job_entry(req.job_id).await?;
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -1053,22 +1057,46 @@ impl SlurmAgent for AgentService {
 
         info!(
             job_id = req.job_id,
-            pid,
+            pid = entry.pid,
             command = ?req.command,
             "exec into running job"
         );
 
-        // Use nsenter to enter the job's namespace(s) and run the command
-        let mut cmd = tokio::process::Command::new("nsenter");
-        cmd.arg("--target").arg(pid.to_string()).arg("--mount");
-        if has_pid_ns {
-            cmd.arg("--pid");
-        }
-        cmd.arg("--");
-        cmd.arg(&req.command[0]);
-        for arg in &req.command[1..] {
-            cmd.arg(arg);
-        }
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
+
+        let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
+            let mut c = tokio::process::Command::new("nsenter");
+            for arg in entry.nsenter_args() {
+                c.arg(arg);
+            }
+            if let Some(ref pd) = priv_drop {
+                for arg in pd.nsenter_args() {
+                    c.arg(arg);
+                }
+            }
+            c.arg("--");
+            c.arg(&req.command[0]);
+            for arg in &req.command[1..] {
+                c.arg(arg);
+            }
+            c
+        } else {
+            let mut c = tokio::process::Command::new(&req.command[0]);
+            for arg in &req.command[1..] {
+                c.arg(arg);
+            }
+            c.current_dir(&entry.work_dir);
+            if let Some(pd) = priv_drop {
+                unsafe {
+                    c.pre_exec(move || {
+                        pd.apply()
+                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                        Ok(())
+                    });
+                }
+            }
+            c
+        };
 
         let output = cmd
             .output()
@@ -1152,7 +1180,10 @@ impl SlurmAgent for AgentService {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 has_pid_namespace: false,
-                work_dir: String::new(),
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: req.work_dir.clone(),
                 uid: req.uid,
                 gid: req.gid,
                 partition: req.partition,
@@ -1357,17 +1388,13 @@ impl SlurmAgent for AgentService {
         }
 
         let memlock = self.memlock;
-        let drop_privilege = req.uid > 0 && nix::unistd::geteuid().is_root();
-        let target_uid = req.uid;
-        let target_gid = req.gid;
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
                 crate::executor::apply_memlock(memlock);
-                if drop_privilege {
-                    nix::unistd::setgid(nix::unistd::Gid::from_raw(target_gid))
-                        .map_err(std::io::Error::other)?;
-                    nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid))
-                        .map_err(std::io::Error::other)?;
+                if let Some(ref pd) = priv_drop {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
                 }
                 Ok(())
             });
@@ -1518,198 +1545,55 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn attach_job(
+    async fn interactive_session(
         &self,
-        request: Request<tonic::Streaming<AttachJobInput>>,
-    ) -> Result<Response<Self::AttachJobStream>, Status> {
-        let mut in_stream = request.into_inner();
+        request: Request<tonic::Streaming<InteractiveInput>>,
+    ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
+        use crate::pty::WindowSize as PtyWinSize;
 
-        // Read the first message to get the job_id
-        let first_msg = in_stream
+        let mut inbound = request.into_inner();
+
+        let first = inbound
             .message()
             .await
-            .map_err(|e| Status::internal(format!("failed to read first message: {}", e)))?
-            .ok_or_else(|| {
-                Status::invalid_argument("empty stream — expected job_id in first message")
-            })?;
+            .map_err(|e| Status::internal(format!("stream recv error: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("empty stream: expected InitSession"))?;
 
-        let job_id = first_msg.job_id;
-
-        // Check the job is running and get its PID for namespace entry
-        let (pid, env_vars) = {
-            let jobs = self.running.lock().await;
-            match jobs.get(&job_id) {
-                Some(tracked) => {
-                    let pid = tracked.job.pid().ok_or_else(|| {
-                        Status::failed_precondition(format!("job {} has no PID", job_id))
-                    })?;
-                    // Read a few env vars from /proc to replicate the job's environment
-                    let env = Self::read_proc_env(pid);
-                    (pid, env)
-                }
-                None => {
-                    return Err(Status::not_found(format!(
-                        "job {} not running on this node",
-                        job_id
-                    )));
-                }
+        let init = match first.msg {
+            Some(interactive_input::Msg::Init(init)) => init,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first message must be InitSession",
+                ));
             }
         };
 
-        // Issue #54: Use a larger buffer to prevent deadlock when stdout+stderr
-        // produce high-volume output concurrently.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AttachJobOutput, Status>>(256);
+        let entry = self.job_entry(init.job_id).await?;
 
-        tokio::spawn(async move {
-            // Spawn an interactive shell inside the job's cgroup/namespace
-            use std::process::Stdio;
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            use tokio::process::Command;
-
-            // Use nsenter to enter the job process's namespaces if possible,
-            // otherwise just spawn a shell with the same environment.
-            let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-i")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            // Set the job's environment variables
-            for (k, v) in &env_vars {
-                cmd.env(k, v);
-            }
-            cmd.env("SPUR_JOB_ID", job_id.to_string());
-            cmd.env("SLURM_JOB_ID", job_id.to_string());
-
-            // Try nsenter for namespace isolation (if running as root)
-            let mut child = if nix::unistd::geteuid().is_root() {
-                let mut ns_cmd = Command::new("nsenter");
-                ns_cmd
-                    .args(["-t", &pid.to_string(), "--mount", "--pid", "--"])
-                    .args(["/bin/sh", "-i"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                for (k, v) in &env_vars {
-                    ns_cmd.env(k, v);
-                }
-                ns_cmd.env("SPUR_JOB_ID", job_id.to_string());
-                ns_cmd.env("SLURM_JOB_ID", job_id.to_string());
-                match ns_cmd.spawn() {
-                    Ok(c) => c,
-                    Err(_) => match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(Status::internal(format!(
-                                    "failed to spawn shell: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
-                        }
-                    },
-                }
-            } else {
-                match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "failed to spawn shell: {}",
-                                e
-                            ))))
-                            .await;
-                        return;
-                    }
-                }
-            };
-
-            let mut child_stdin = child.stdin.take().unwrap();
-            let mut child_stdout = child.stdout.take().unwrap();
-            let mut child_stderr = child.stderr.take().unwrap();
-
-            // Forward initial data from first message (if any)
-            if !first_msg.data.is_empty() {
-                let _ = child_stdin.write_all(&first_msg.data).await;
-            }
-
-            let tx_clone = tx.clone();
-
-            // Task: read from client stream → child stdin
-            let stdin_task = tokio::spawn(async move {
-                while let Ok(Some(msg)) = in_stream.message().await {
-                    if !msg.data.is_empty() && child_stdin.write_all(&msg.data).await.is_err() {
-                        break;
-                    }
-                }
-                drop(child_stdin); // EOF to child
-            });
-
-            // Task: read child stderr → merge into output
-            let tx_stderr = tx.clone();
-            let stderr_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    match child_stderr.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx_stderr
-                                .send(Ok(AttachJobOutput {
-                                    data: buf[..n].to_vec(),
-                                    eof: false,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            // Main: read child stdout → output stream
-            let mut buf = vec![0u8; 4096];
-            loop {
-                match child_stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx_clone
-                            .send(Ok(AttachJobOutput {
-                                data: buf[..n].to_vec(),
-                                eof: false,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // Wait for child to exit, then let I/O tasks drain gracefully
-            // before sending EOF. Aborting immediately loses buffered data
-            // (issue #54).
-            let _ = child.wait().await;
-            // Give tasks a moment to flush remaining data
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let _ = stderr_task.await;
-            })
-            .await;
-            stdin_task.abort();
-
-            // Send EOF
-            let _ = tx_clone
-                .send(Ok(AttachJobOutput {
-                    data: Vec::new(),
-                    eof: true,
-                }))
-                .await;
+        let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
+            rows: ws.rows as u16,
+            cols: ws.cols as u16,
+            xpixel: ws.xpixel as u16,
+            ypixel: ws.ypixel as u16,
         });
+
+        let argv: Vec<String> = init.argv.clone();
+
+        let (master_fd, child, child_pid) =
+            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+
+        info!(
+            job_id = init.job_id,
+            child_pid,
+            overlap = init.overlap,
+            "interactive session started"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
+
+        tokio::spawn(Self::run_pty_bridge(
+            master_fd, child, child_pid, inbound, tx,
+        ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -2044,20 +1928,331 @@ impl AgentService {
         });
     }
 
-    /// Read environment variables from a running process via /proc.
-    fn read_proc_env(pid: u32) -> Vec<(String, String)> {
-        let path = format!("/proc/{}/environ", pid);
-        match std::fs::read(&path) {
-            Ok(data) => data
-                .split(|&b| b == 0)
-                .filter_map(|entry| {
-                    let s = std::str::from_utf8(entry).ok()?;
-                    let (k, v) = s.split_once('=')?;
-                    Some((k.to_string(), v.to_string()))
-                })
-                .collect(),
-            Err(_) => Vec::new(),
+    /// Extract a `JobEntry` from a tracked running job for namespace entry.
+    async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
+        let jobs = self.running.lock().await;
+        let tracked = jobs
+            .get(&job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
+
+        let pid = tracked.job.pid().unwrap_or(0);
+
+        Ok(crate::job_entry::JobEntry {
+            pid: pid as i32,
+            has_pid_namespace: tracked.has_pid_namespace,
+            has_user_namespace: tracked.has_user_namespace,
+            has_mount_namespace: tracked.has_mount_namespace,
+            uid: tracked.uid,
+            gid: tracked.gid,
+            work_dir: tracked.work_dir.clone(),
+        })
+    }
+
+    /// Bidirectional PTY bridge: reads master fd, forwards inbound messages
+    /// (stdin, resize, signal), and drains remaining output after child exit.
+    async fn run_pty_bridge<S>(
+        master: std::os::fd::OwnedFd,
+        mut child: tokio::process::Child,
+        child_pid: i32,
+        mut inbound: S,
+        tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
+    ) where
+        S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
+    {
+        use crate::pty::WindowSize as PtyWinSize;
+        use std::os::fd::AsRawFd;
+        use tokio::io::unix::AsyncFd;
+        use tokio_stream::StreamExt;
+
+        let master_raw = master.as_raw_fd();
+        let async_fd = match AsyncFd::new(master) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(Status::internal(format!("AsyncFd setup: {e}"))))
+                    .await;
+                return;
+            }
+        };
+
+        let mut read_buf = vec![0u8; 4096];
+        let mut child_exited = false;
+        let mut exit_code: i32 = 128;
+
+        loop {
+            tokio::select! {
+                readable = async_fd.readable() => {
+                    match readable {
+                        Ok(mut guard) => {
+                            match Self::try_read_pty(&mut guard, &mut read_buf) {
+                                Ok(None) => break,
+                                Ok(Some(0)) => continue,
+                                Ok(Some(n)) => {
+                                    let msg = InteractiveOutput {
+                                        msg: Some(interactive_output::Msg::Data(
+                                            read_buf[..n].to_vec(),
+                                        )),
+                                    };
+                                    if tx.send(Ok(msg)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "PTY read error");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "AsyncFd readable error");
+                            break;
+                        }
+                    }
+                }
+
+                item = inbound.next(), if !child_exited => {
+                    match item {
+                        Some(Ok(input)) => {
+                            match input.msg {
+                                Some(interactive_input::Msg::Stdin(data)) => {
+                                    if Self::async_write_pty(&async_fd, &data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(interactive_input::Msg::Resize(ws)) => {
+                                    let _ = crate::pty::resize(master_raw, &PtyWinSize {
+                                        rows: ws.rows as u16,
+                                        cols: ws.cols as u16,
+                                        xpixel: ws.xpixel as u16,
+                                        ypixel: ws.ypixel as u16,
+                                    });
+                                }
+                                Some(interactive_input::Msg::Signal(sig)) => {
+                                    let _ = crate::pty::signal_foreground(
+                                        master_raw, child_pid, sig,
+                                    );
+                                }
+                                Some(interactive_input::Msg::Init(_)) | None => {}
+                            }
+                        }
+                        Some(Err(_)) | None => {
+                            let _ = crate::pty::signal_foreground(
+                                master_raw, child_pid, libc::SIGHUP,
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                status = child.wait(), if !child_exited => {
+                    exit_code = match status {
+                        Ok(s) => s.code().unwrap_or(128),
+                        Err(_) => 128,
+                    };
+                    child_exited = true;
+                }
+            }
         }
+
+        if !child_exited {
+            exit_code = match child.wait().await {
+                Ok(s) => s.code().unwrap_or(128),
+                Err(_) => 128,
+            };
+        }
+
+        let _ = tx
+            .send(Ok(InteractiveOutput {
+                msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
+            }))
+            .await;
+    }
+
+    /// Non-blocking read from a PTY master via an AsyncFd ready guard.
+    /// Returns `Ok(Some(n))` on data, `Ok(None)` on EOF/EIO, `Err` on
+    /// fatal error. `Some(0)` means WouldBlock (caller should continue).
+    fn try_read_pty(
+        guard: &mut tokio::io::unix::AsyncFdReadyGuard<'_, std::os::fd::OwnedFd>,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, std::io::Error> {
+        use std::os::fd::AsRawFd;
+        match guard.try_io(|fd| {
+            let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }) {
+            Ok(Ok(0)) => Ok(None),
+            Ok(Ok(n)) => Ok(Some(n)),
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => Ok(None),
+            Ok(Err(e)) => Err(e),
+            Err(_would_block) => Ok(Some(0)),
+        }
+    }
+
+    /// Non-blocking write to a PTY master via AsyncFd.
+    async fn async_write_pty(
+        async_fd: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+        data: &[u8],
+    ) -> Result<(), std::io::Error> {
+        use std::os::fd::AsRawFd;
+        let mut written = 0;
+        while written < data.len() {
+            let mut guard = async_fd.writable().await?;
+            match guard.try_io(|fd| {
+                let n = unsafe {
+                    libc::write(
+                        fd.as_raw_fd(),
+                        data[written..].as_ptr() as *const _,
+                        data.len() - written,
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(n)) => written += n,
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_pty_in_job(
+        entry: &crate::job_entry::JobEntry,
+        argv: &[String],
+        job_id: u32,
+        winsize: Option<&crate::pty::WindowSize>,
+    ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
+        use std::os::fd::AsRawFd;
+        use std::process::Stdio;
+
+        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
+            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
+
+        let shell = if argv.is_empty() {
+            let bash_exists = if entry.pid > 0 && entry.has_mount_namespace {
+                std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
+            } else {
+                std::path::Path::new("/bin/bash").exists()
+            };
+            if bash_exists {
+                vec!["/bin/bash".to_string()]
+            } else {
+                vec!["/bin/sh".to_string()]
+            }
+        } else {
+            argv.to_vec()
+        };
+
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
+
+        let use_nsenter = entry.has_namespaces() && entry.pid > 0;
+        let (launch_cmd, launch_args, apply_priv_in_child) = if use_nsenter {
+            let mut args = entry.nsenter_args();
+            if let Some(ref pd) = priv_drop {
+                args.extend(pd.nsenter_args());
+            }
+            args.push("--".into());
+            args.extend(shell);
+            ("nsenter".to_string(), args, false)
+        } else {
+            (shell[0].clone(), shell[1..].to_vec(), true)
+        };
+
+        let mut cmd = tokio::process::Command::new(&launch_cmd);
+        let work_dir = if entry.work_dir.is_empty() {
+            "/tmp"
+        } else {
+            &entry.work_dir
+        };
+        cmd.args(&launch_args)
+            .current_dir(work_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if entry.pid > 0 {
+            for (k, v) in Self::read_proc_environ(entry.pid as u32) {
+                cmd.env(k, v);
+            }
+        }
+        for (k, v) in entry.env_vars(job_id) {
+            cmd.env(k, v);
+        }
+        if entry.uid > 0 {
+            if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
+                .ok()
+                .flatten()
+            {
+                cmd.env("HOME", user.dir.to_string_lossy().as_ref());
+                cmd.env("USER", &user.name);
+                cmd.env("LOGNAME", &user.name);
+                cmd.env("SHELL", user.shell.to_string_lossy().as_ref());
+            }
+        }
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: master.as_raw_fd(),
+            slave: slave.as_raw_fd(),
+        };
+        let priv_drop_for_child = if apply_priv_in_child { priv_drop } else { None };
+        unsafe {
+            cmd.pre_exec(move || {
+                raw.wire()?;
+                if let Some(ref pd) = priv_drop_for_child {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| Status::internal(format!("spawn PTY shell: {e}")))?;
+        let child_pid = child
+            .id()
+            .ok_or_else(|| Status::internal("spawned PTY child exited before pid could be read"))?
+            as i32;
+
+        drop(slave);
+
+        // Set non-blocking so AsyncFd reads/writes are correct.
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
+
+        Ok((master, child, child_pid))
+    }
+
+    /// Read environment variables from a running process via /proc.
+    fn read_proc_environ(pid: u32) -> Vec<(String, String)> {
+        const MAX_ENVIRON: usize = 1 << 20; // 1 MiB
+        let path = format!("/proc/{}/environ", pid);
+        let mut buf = vec![0u8; MAX_ENVIRON];
+        let n = match std::fs::File::open(&path).and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        }) {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        buf.truncate(n);
+        buf.split(|&b| b == 0)
+            .filter_map(|entry| {
+                let s = std::str::from_utf8(entry).ok()?;
+                let (k, v) = s.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -2080,6 +2275,9 @@ impl TrackedJob {
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            _pty_master: None,
             work_dir: "/tmp".into(),
             uid: 0,
             gid: 0,
@@ -2661,6 +2859,9 @@ mod tests {
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            _pty_master: None,
             work_dir: "/tmp".into(),
             uid: 0,
             gid: 0,
@@ -2685,7 +2886,7 @@ mod tests {
 
     // The grace-period SIGKILL must not fire if job_id was reused by a newer
     // run (epoch bumped) after a requeue. Guards the preempt-requeue race.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn graceful_cancel_skips_sigkill_for_reused_job_id() {
         let svc = AgentService::new(
             test_reporter(),
@@ -2717,6 +2918,9 @@ mod tests {
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
                 has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
                 work_dir: "/tmp".into(),
                 uid: 0,
                 gid: 0,
@@ -2741,11 +2945,12 @@ mod tests {
         let (run2, pid2) = spawn_trap(2);
         svc.insert_test_job(job_id, run2).await;
 
-        // Wait past the 5s grace period; the guard must skip the SIGKILL, so the
+        // Advance past the 5s grace period; the guard must skip the SIGKILL, so the
         // epoch-2 process stays alive. Assert a live state ('S'/'R'), not mere
         // /proc existence — a wrongly-killed unreaped child would be a zombie
         // ('Z'), which still has /proc and would false-pass an existence check.
-        tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
         let state = proc_state(pid2);
         assert!(
             matches!(state, 'S' | 'R' | 'D'),
@@ -2872,5 +3077,109 @@ mod tests {
             wait_job_reaped(&svc, job_id, 5_000).await,
             "monitor should reap SIGKILL'd job within 5s"
         );
+    }
+
+    #[tokio::test]
+    async fn job_entry_from_tracked_job() {
+        let (svc, job_id) = run_command_test_setup().await;
+
+        let entry = svc
+            .job_entry(job_id)
+            .await
+            .expect("job_entry should succeed");
+        assert!(entry.pid > 0);
+        assert_eq!(entry.uid, 0);
+        assert_eq!(entry.gid, 0);
+        assert!(!entry.has_namespaces());
+    }
+
+    #[tokio::test]
+    async fn job_entry_not_found() {
+        let (svc, _) = run_command_test_setup().await;
+
+        let err = svc.job_entry(9999).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn run_pty_bridge_echo_and_exit() {
+        use spur_proto::proto::{interactive_input, interactive_output, InteractiveInput};
+
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK");
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new("cat");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let child = cmd.spawn().expect("spawn cat");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        let (in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<InteractiveInput, tonic::Status>>(64);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<
+            Result<spur_proto::proto::InteractiveOutput, tonic::Status>,
+        >(64);
+
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        tokio::spawn(AgentService::run_pty_bridge(
+            master, child, child_pid, inbound, out_tx,
+        ));
+
+        in_tx
+            .send(Ok(InteractiveInput {
+                msg: Some(interactive_input::Msg::Stdin(b"hello\n".to_vec())),
+            }))
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        for _ in 0..1000 {
+            match out_rx.recv().await {
+                Some(Ok(msg)) => match msg.msg {
+                    Some(interactive_output::Msg::Data(d)) => {
+                        collected.extend_from_slice(&d);
+                        if collected.windows(5).any(|w| w == b"hello") {
+                            break;
+                        }
+                    }
+                    Some(interactive_output::Msg::ExitStatus(_)) => break,
+                    None => {}
+                },
+                _ => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("hello"),
+            "expected echoed 'hello', got: {text}"
+        );
+
+        drop(in_tx);
+
+        for _ in 0..1000 {
+            match out_rx.recv().await {
+                Some(Ok(msg)) => {
+                    if let Some(interactive_output::Msg::ExitStatus(_code)) = msg.msg {
+                        return;
+                    }
+                }
+                _ => break,
+            }
+        }
+        panic!("did not receive exit status from bridge");
     }
 }

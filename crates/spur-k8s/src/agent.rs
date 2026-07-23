@@ -85,7 +85,8 @@ impl VirtualAgent {
 impl SlurmAgent for VirtualAgent {
     type StreamJobOutputStream =
         tokio_stream::wrappers::ReceiverStream<Result<StreamJobOutputChunk, Status>>;
-    type AttachJobStream = tokio_stream::wrappers::ReceiverStream<Result<AttachJobOutput, Status>>;
+    type InteractiveSessionStream =
+        tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
     async fn launch_job(
         &self,
@@ -675,12 +676,12 @@ impl SlurmAgent for VirtualAgent {
         )))
     }
 
-    async fn attach_job(
+    async fn interactive_session(
         &self,
-        _request: Request<tonic::Streaming<AttachJobInput>>,
-    ) -> Result<Response<Self::AttachJobStream>, Status> {
+        _request: Request<tonic::Streaming<InteractiveInput>>,
+    ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
         Err(Status::unimplemented(
-            "interactive attach not supported for K8s agent",
+            "interactive session not supported for K8s agent",
         ))
     }
 

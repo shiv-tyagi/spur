@@ -1247,7 +1247,17 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        Ok(Response::new(CreateJobStepResponse { step_id }))
+        let node_addr = job
+            .allocated_nodes
+            .first()
+            .and_then(|name| self.cluster.get_node(name))
+            .map(|n| {
+                let host = n.address.as_deref().unwrap_or(&n.name);
+                format!("{}:{}", host, n.port)
+            })
+            .unwrap_or_default();
+
+        Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
     }
 
     async fn create_reservation(
@@ -2026,6 +2036,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.open_mode)
         },
+        pty: spec.pty,
     })
 }
 

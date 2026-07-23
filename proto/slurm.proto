@@ -164,6 +164,10 @@ message JobSpec {
   // Standalone srun: reserve an allocation without launching a batch script;
   // the user command runs as a job step after nodes are registered.
   bool srun_job = 82;
+
+  // Interactive PTY session (srun --pty)
+  bool pty = 83;
+  WindowSize initial_winsize = 84;
 }
 
 message JobInfo {
@@ -361,8 +365,8 @@ service SlurmAgent {
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
-  // Interactive attach: bidirectional streaming for stdin/stdout forwarding
-  rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
+  // PTY-backed interactive session (srun --pty, sattach, srun --overlap --pty)
+  rpc InteractiveSession(stream InteractiveInput) returns (stream InteractiveOutput);
 
   // -- Native cluster component control: the controller drives each node's
   //    spurd-owned k0s systemd unit through these. --
@@ -855,6 +859,7 @@ message RegisterJobAllocationRequest {
   repeated string gpu_devices = 8;
   ResourceAllocations allocated = 9;
   string mpi = 10;
+  string work_dir = 11;
 }
 
 message RegisterJobAllocationResponse {}
@@ -875,14 +880,39 @@ message StreamJobOutputChunk {
   bool eof = 2;
 }
 
-message AttachJobInput {
-  uint32 job_id = 1;   // set on first message; ignored after
-  bytes data = 2;       // stdin data to forward to the job
+// -- Interactive PTY session (srun --pty, sattach, srun --overlap --pty) --
+
+message WindowSize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+  uint32 xpixel = 3;
+  uint32 ypixel = 4;
 }
 
-message AttachJobOutput {
-  bytes data = 1;       // stdout+stderr from the job
-  bool eof = 2;
+message InitSession {
+  uint32 job_id = 1;
+  uint32 step_id = 2;        // 0 = primary job session
+  bool overlap = 3;          // Enter running job's namespaces (--overlap)
+  bool pty = 4;              // Always true for now
+  WindowSize winsize = 5;    // Initial terminal dimensions
+  repeated string argv = 6;  // Command to run (empty = default shell)
+  map<string, string> env = 7;
+}
+
+message InteractiveInput {
+  oneof msg {
+    InitSession init = 1;    // First message: session setup
+    bytes stdin = 2;         // Raw stdin bytes
+    WindowSize resize = 3;   // Terminal resize (SIGWINCH)
+    int32 signal = 4;        // Out-of-band signal to foreground pgrp
+  }
+}
+
+message InteractiveOutput {
+  oneof msg {
+    bytes data = 1;          // PTY master output (stdout+stderr merged)
+    int32 exit_status = 2;   // Final exit code; terminates the stream
+  }
 }
 
 // -- Accounting --
@@ -1116,10 +1146,14 @@ message CreateJobStepRequest {
   repeated string command = 2;
   uint32 num_tasks = 3;
   uint32 cpus_per_task = 4;
+  bool overlap = 5;           // Share resources with existing step (--overlap)
+  bool pty = 6;               // Allocate a PTY for the step
+  WindowSize winsize = 7;     // Initial terminal dimensions
 }
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
+  string node_addr = 2;        // Address of the first allocated node (host:port for agent)
 }
 
 // ============================================================
