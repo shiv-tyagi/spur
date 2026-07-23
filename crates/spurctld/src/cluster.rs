@@ -2022,25 +2022,24 @@ impl ClusterManager {
                     return false;
                 }
                 if !candidate.scheduling_eligible {
-                    return false;
+                    return true;
                 }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
                     return true;
                 }
-                match job.bb_stage_state {
-                    BbStageState::Ready => true,
-                    BbStageState::Staging => false,
-                    BbStageState::None => {
-                        if req > remaining {
-                            return false;
-                        }
-                        remaining = remaining.saturating_sub(req);
-                        false
-                    }
+                if job.bb_stage_state == BbStageState::Ready {
+                    return true;
                 }
+                if req > remaining {
+                    return false;
+                }
+                remaining = remaining.saturating_sub(req);
+                false
             });
         }
+
+        candidates.retain(|candidate| candidate.scheduling_eligible);
 
         PendingJobClassification {
             jobs: candidates
@@ -2316,6 +2315,8 @@ impl ClusterManager {
     }
 
     /// Reclassify pending jobs and apply their displayed block reasons.
+    /// Leader-only; enforced by the scheduler-loop caller, not this function
+    /// itself (mirrors `cancel_unsatisfiable_dependency_jobs()`).
     pub fn tag_blocked_pending_reasons(&self) {
         let blocked = self.classify_pending_jobs().blocked;
         self.apply_blocked_pending_reasons(blocked);
@@ -8838,6 +8839,142 @@ mod tests {
             *cm.license_pool.read().get("fluent").unwrap(),
             2,
             "configured total must never be mutated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_excludes_task_from_pending_classification() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("arr-throttle");
+        spec.array_spec = Some("0-2%1".into());
+        let parent_id = cm.submit_job(spec).unwrap();
+        let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
+        for id in &task_ids {
+            wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
+        }
+
+        start_job_on(&cm, task_ids[0], "n1");
+        settle(&cm, task_ids[0], JobState::Running);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        for id in &task_ids[1..] {
+            assert!(
+                !pending.contains(id),
+                "array-throttled task {id} must be excluded from scheduling"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_does_not_consume_scarce_license_pool() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 2);
+
+        let mut spec = basic_spec("arr-lic");
+        spec.array_spec = Some("0-1%1".into());
+        spec.gres = vec!["license:fluent:1".into()];
+        let parent_id = cm.submit_job(spec).unwrap();
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array license tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            t1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, t1, JobState::Running);
+
+        let solo = submit_and_wait(&cm, {
+            let mut s = basic_spec("solo-lic");
+            s.gres = vec!["license:fluent:1".into()];
+            s
+        });
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            !pending.contains(&t2),
+            "array-throttled task must not enter the scheduling set"
+        );
+        assert!(
+            pending.contains(&solo),
+            "the eligible job must still receive the remaining license slot"
+        );
+        assert_ne!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::Licenses
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_does_not_consume_scarce_bb_pool() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 160;
+
+        let mut spec = basic_spec("arr-bb");
+        spec.array_spec = Some("0-1%1".into());
+        spec.burst_buffer = Some("capacity=60".into());
+        let parent_id = cm.submit_job(spec).unwrap();
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array bb tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+
+        start_job_on(&cm, t1, "n1");
+        settle(&cm, t1, JobState::Running);
+
+        let solo = submit_and_wait(&cm, {
+            let mut s = basic_spec("solo-bb");
+            s.burst_buffer = Some("capacity=60".into());
+            s
+        });
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            !pending.contains(&t2),
+            "array-throttled task must not enter the scheduling set"
+        );
+        assert_eq!(
+            cm.available_bb(),
+            100,
+            "throttled task must not reserve BB capacity during classification"
+        );
+        assert_ne!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::BurstBufferResources
+        );
+        assert_eq!(
+            cm.get_job(t2).unwrap().bb_stage_state,
+            BbStageState::None
+        );
+        assert_eq!(
+            cm.get_job(solo).unwrap().bb_stage_state,
+            BbStageState::None
         );
     }
 
