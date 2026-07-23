@@ -555,7 +555,10 @@ async fn wait_for_job_running(
             .into_inner();
 
         match JobState::try_from(job.state) {
-            Ok(JobState::JobRunning) => return Ok(job.nodelist),
+            Ok(JobState::JobRunning) if !job.nodelist.is_empty() => {
+                return Ok(job.nodelist);
+            }
+            Ok(JobState::JobRunning) => {}
             Ok(
                 JobState::JobCompleted
                 | JobState::JobFailed
@@ -1064,43 +1067,50 @@ async fn run_interactive_pty(controller: &str, job_id: u32, command: Vec<String>
     let winsize = crate::interactive::get_terminal_size();
 
     let mut last_err: Option<anyhow::Error> = None;
+    let mut cached_step: Option<(u32, String)> = None;
+
     for attempt in 0..5 {
         if attempt > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        let step_resp = match ctrl
-            .create_job_step(CreateJobStepRequest {
-                job_id,
-                command: command.clone(),
-                num_tasks: 1,
-                cpus_per_task: 1,
-                overlap: true,
-                pty: true,
-                winsize: Some(winsize),
-            })
-            .await
-        {
-            Ok(resp) => resp.into_inner(),
-            Err(status) if is_retryable_status(&status) && attempt < 4 => {
-                last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
-                continue;
-            }
-            Err(status) => {
-                return Err(anyhow::anyhow!(
-                    "CreateJobStep failed: {}",
-                    status.message()
-                ))
-            }
-        };
-
-        let node_addr = if step_resp.node_addr.is_empty() {
-            anyhow::bail!(
-                "controller did not return a node address for job {}",
-                job_id
-            );
+        let (step_id, node_addr) = if let Some(ref cached) = cached_step {
+            cached.clone()
         } else {
-            format!("http://{}", step_resp.node_addr)
+            let step_resp = match ctrl
+                .create_job_step(CreateJobStepRequest {
+                    job_id,
+                    command: command.clone(),
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty: true,
+                    winsize: Some(winsize),
+                })
+                .await
+            {
+                Ok(resp) => resp.into_inner(),
+                Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                    last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                    continue;
+                }
+                Err(status) => {
+                    return Err(anyhow::anyhow!(
+                        "CreateJobStep failed: {}",
+                        status.message()
+                    ))
+                }
+            };
+
+            if step_resp.node_addr.is_empty() {
+                anyhow::bail!(
+                    "controller did not return a node address for job {}",
+                    job_id
+                );
+            }
+            let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
+            cached_step = Some(pair.clone());
+            pair
         };
 
         let mut agent = crate::interactive::connect_agent(&node_addr).await?;
@@ -1108,7 +1118,7 @@ async fn run_interactive_pty(controller: &str, job_id: u32, command: Vec<String>
         match crate::interactive::open_interactive_session(
             &mut agent,
             job_id,
-            step_resp.step_id,
+            step_id,
             command.clone(),
             winsize,
             true,

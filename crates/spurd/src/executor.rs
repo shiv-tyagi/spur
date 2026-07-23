@@ -638,37 +638,27 @@ async fn spawn_job_process(
     }
 
     // Issue #99, #107: Run job as the submitting user (not root).
-    // Must set supplementary groups (video, render) via initgroups()
-    // so the process can access GPU device nodes.
+    // Must set supplementary groups (video, render) so the process can
+    // access GPU device nodes.
     //
     // Issue #128: when use_namespaces is true, the wrapper handles the priv
     // drop *after* unshare runs (via setpriv). Dropping priv here would cause
     // unshare(2) to fail with EPERM since the unprivileged user lacks
     // CAP_SYS_ADMIN.
-    if uid > 0 && nix::unistd::geteuid().is_root() && !use_namespaces {
-        let target_uid = uid;
-        let target_gid = gid;
-        unsafe {
-            cmd.pre_exec(move || {
-                // Set supplementary groups from /etc/group for this user.
-                // This is critical for GPU access — /dev/dri and /dev/kfd
-                // are typically owned by root:video or root:render.
-                let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(target_uid))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.name)
-                    .unwrap_or_else(|| format!("{}", target_uid));
-                let c_name = std::ffi::CString::new(username).unwrap_or_default();
-                libc::initgroups(c_name.as_ptr(), target_gid);
-                Ok(())
-            });
+    if !use_namespaces {
+        if let Some(pd) = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid) {
+            unsafe {
+                cmd.pre_exec(move || {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                    Ok(())
+                });
+            }
+            debug!(
+                job_id,
+                uid, gid, "job will run as non-root user with supplementary groups"
+            );
         }
-        cmd.uid(uid);
-        cmd.gid(gid);
-        debug!(
-            job_id,
-            uid, gid, "job will run as non-root user with supplementary groups"
-        );
     }
 
     // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
@@ -894,40 +884,10 @@ fn should_run_as_user(uid: u32) -> bool {
     uid > 0 && nix::unistd::geteuid().is_root()
 }
 
-/// A user's credentials with the supplementary group list already resolved.
-struct UserCreds {
-    uid: nix::unistd::Uid,
-    gid: nix::unistd::Gid,
-    groups: Vec<nix::unistd::Gid>,
-}
-
-/// Resolve the user's supplementary groups in the parent, before any fork:
-/// `getpwuid_r`/`getgrouplist` allocate and lock, so they're unsafe between fork
-/// and exec in a multithreaded process. Leaves the child only async-signal-safe
-/// syscalls (`apply_user_creds`). Falls back to the primary gid if unresolved.
-fn resolve_user_creds(uid: u32, gid: u32) -> UserCreds {
-    let gid = nix::unistd::Gid::from_raw(gid);
-    let groups = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .and_then(|u| std::ffi::CString::new(u.name).ok())
-        .and_then(|name| nix::unistd::getgrouplist(&name, gid).ok())
-        .unwrap_or_else(|| vec![gid]);
-    UserCreds {
-        uid: nix::unistd::Uid::from_raw(uid),
-        gid,
-        groups,
-    }
-}
-
-/// Drop to the submitting user in a forked child using pre-resolved credentials.
-/// Groups before gid before uid, since each drop removes the privilege the prior
-/// step needs. Only setgroups/setgid/setuid run here — all async-signal-safe.
-fn apply_user_creds(creds: &UserCreds) -> nix::Result<()> {
-    nix::unistd::setgroups(&creds.groups)?;
-    nix::unistd::setgid(creds.gid)?;
-    nix::unistd::setuid(creds.uid)?;
-    Ok(())
+/// Resolve and apply user credentials for container fork children.
+/// Delegates to the centralized `PrivDrop` implementation.
+fn resolve_user_creds(uid: u32, gid: u32) -> Option<crate::privdrop::PrivDrop> {
+    crate::privdrop::PrivDrop::resolve_if_needed(uid, gid)
 }
 
 /// Open a single output file, creating parent directories. Runs in whatever
@@ -1027,8 +987,10 @@ fn open_job_output(
             // Exit codes distinguish failure stages.
             drop(parent_sock);
             let code = 'open: {
-                if apply_user_creds(&creds).is_err() {
-                    break 'open 1;
+                if let Some(ref pd) = creds {
+                    if pd.apply().is_err() {
+                        break 'open 1;
+                    }
                 }
                 let Ok(out) = open_output_file(stdout_path, use_append) else {
                     break 'open 2;
@@ -1083,12 +1045,13 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
     if !should_run_as_user(uid) {
         return std::fs::create_dir_all(dir).is_ok();
     }
-    // Resolve credentials before the fork; see resolve_user_creds.
+    // Resolve credentials before the fork.
     let creds = resolve_user_creds(uid, gid);
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
             // _exit skips atexit/stdio flushing, unsafe in a post-fork child.
-            let ok = apply_user_creds(&creds).is_ok() && std::fs::create_dir_all(dir).is_ok();
+            let ok = creds.as_ref().map(|c| c.apply().is_ok()).unwrap_or(true)
+                && std::fs::create_dir_all(dir).is_ok();
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         Ok(nix::unistd::ForkResult::Parent { child }) => {

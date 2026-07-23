@@ -1062,10 +1062,17 @@ impl SlurmAgent for AgentService {
             "exec into running job"
         );
 
-        let mut cmd = if entry.has_namespaces() {
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
+
+        let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
             let mut c = tokio::process::Command::new("nsenter");
-            for arg in entry.nsenter_args_with_priv_drop() {
+            for arg in entry.nsenter_args() {
                 c.arg(arg);
+            }
+            if let Some(ref pd) = priv_drop {
+                for arg in pd.nsenter_args() {
+                    c.arg(arg);
+                }
             }
             c.arg("--");
             c.arg(&req.command[0]);
@@ -1079,10 +1086,17 @@ impl SlurmAgent for AgentService {
                 c.arg(arg);
             }
             c.current_dir(&entry.work_dir);
+            if let Some(pd) = priv_drop {
+                unsafe {
+                    c.pre_exec(move || {
+                        pd.apply()
+                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                        Ok(())
+                    });
+                }
+            }
             c
         };
-
-        entry.apply_privilege_drop(&mut cmd);
 
         let output = cmd
             .output()
@@ -1374,17 +1388,13 @@ impl SlurmAgent for AgentService {
         }
 
         let memlock = self.memlock;
-        let drop_privilege = req.uid > 0 && nix::unistd::geteuid().is_root();
-        let target_uid = req.uid;
-        let target_gid = req.gid;
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
                 crate::executor::apply_memlock(memlock);
-                if drop_privilege {
-                    nix::unistd::setgid(nix::unistd::Gid::from_raw(target_gid))
-                        .map_err(std::io::Error::other)?;
-                    nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid))
-                        .map_err(std::io::Error::other)?;
+                if let Some(ref pd) = priv_drop {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
                 }
                 Ok(())
             });
@@ -2140,13 +2150,19 @@ impl AgentService {
             argv.to_vec()
         };
 
-        let (launch_cmd, launch_args) = if entry.has_namespaces() {
-            let mut args = entry.nsenter_args_with_priv_drop();
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
+
+        let use_nsenter = entry.has_namespaces() && entry.pid > 0;
+        let (launch_cmd, launch_args, apply_priv_in_child) = if use_nsenter {
+            let mut args = entry.nsenter_args();
+            if let Some(ref pd) = priv_drop {
+                args.extend(pd.nsenter_args());
+            }
             args.push("--".into());
             args.extend(shell);
-            ("nsenter".to_string(), args)
+            ("nsenter".to_string(), args, false)
         } else {
-            (shell[0].clone(), shell[1..].to_vec())
+            (shell[0].clone(), shell[1..].to_vec(), true)
         };
 
         let mut cmd = tokio::process::Command::new(&launch_cmd);
@@ -2161,8 +2177,6 @@ impl AgentService {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        entry.apply_privilege_drop(&mut cmd);
-
         if entry.pid > 0 {
             for (k, v) in Self::read_proc_environ(entry.pid as u32) {
                 cmd.env(k, v);
@@ -2171,13 +2185,32 @@ impl AgentService {
         for (k, v) in entry.env_vars(job_id) {
             cmd.env(k, v);
         }
+        if entry.uid > 0 {
+            if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
+                .ok()
+                .flatten()
+            {
+                cmd.env("HOME", user.dir.to_string_lossy().as_ref());
+                cmd.env("USER", &user.name);
+                cmd.env("LOGNAME", &user.name);
+                cmd.env("SHELL", user.shell.to_string_lossy().as_ref());
+            }
+        }
 
         let raw = crate::executor::JobIoRaw::Pty {
             master: master.as_raw_fd(),
             slave: slave.as_raw_fd(),
         };
+        let priv_drop_for_child = if apply_priv_in_child { priv_drop } else { None };
         unsafe {
-            cmd.pre_exec(move || raw.wire());
+            cmd.pre_exec(move || {
+                raw.wire()?;
+                if let Some(ref pd) = priv_drop_for_child {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                }
+                Ok(())
+            });
         }
 
         let child = cmd
@@ -2853,7 +2886,7 @@ mod tests {
 
     // The grace-period SIGKILL must not fire if job_id was reused by a newer
     // run (epoch bumped) after a requeue. Guards the preempt-requeue race.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn graceful_cancel_skips_sigkill_for_reused_job_id() {
         let svc = AgentService::new(
             test_reporter(),
@@ -2912,11 +2945,12 @@ mod tests {
         let (run2, pid2) = spawn_trap(2);
         svc.insert_test_job(job_id, run2).await;
 
-        // Wait past the 5s grace period; the guard must skip the SIGKILL, so the
+        // Advance past the 5s grace period; the guard must skip the SIGKILL, so the
         // epoch-2 process stays alive. Assert a live state ('S'/'R'), not mere
         // /proc existence — a wrongly-killed unreaped child would be a zombie
         // ('Z'), which still has /proc and would false-pass an existence check.
-        tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
         let state = proc_state(pid2);
         assert!(
             matches!(state, 'S' | 'R' | 'D'),

@@ -77,6 +77,12 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
         mut out_stream,
     } = handle;
 
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        prev_hook(info);
+    }));
+
     let _raw_guard = match RawModeGuard::enter() {
         Ok(g) => Some(g),
         Err(_) => {
@@ -151,6 +157,7 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
     };
 
     drop(_raw_guard);
+    let _ = std::panic::take_hook(); // remove our raw-mode panic hook
 
     Ok(exit_code)
 }
