@@ -8,6 +8,14 @@
 # (tests/conftest.py --shard-count/--shard-id). The per-shard native-host jobs
 # aggregate into the single `E2E / native-host` status; k8s into `E2E / k8s`.
 #
+# Commit-status lifecycle for the two contexts (`E2E / native-host`, `E2E / k8s`):
+#   1. pending "Waiting for CI to complete..."  -> set-e2e-pending.yml, on PRs.
+#   2. pending "Running E2E tests..."           -> mark-running (this file, CI ok).
+#   3. success/failure                          -> report-* (this file, per pool).
+#   If CI does not succeed, mark-skipped sets a terminal state instead of (2)/(3):
+#   failure for a real CI failure, error for cancelled/other (e.g. superseded).
+# For direct pushes to main (no PR), the first status appears at step 2/skip.
+#
 # Trigger migration to pull_request_target is deferred to a follow-up PR.
 name: E2E
 
@@ -51,37 +59,50 @@ jobs:
 
             const sha = '${{ github.event.workflow_run.head_sha }}';
             const conclusion = '${{ github.event.workflow_run.conclusion }}';
+            // A genuine CI failure is a failure; anything else (cancelled,
+            // timed_out, skipped, e.g. a superseded run) means E2E could not
+            // run and is reported as error so it is distinguishable.
+            const state = conclusion === 'failure' ? 'failure' : 'error';
             const desc = conclusion === 'failure'
-              ? 'Skipped: CI did not pass'
-              : `Skipped: CI ${conclusion}`;
+              ? 'E2E skipped: CI failed'
+              : `E2E skipped: CI ${conclusion}`;
 
             for (const ctx of contexts) {
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner, repo: context.repo.repo, sha,
-                state: 'failure',
+                state,
                 context: ctx,
                 description: desc,
                 target_url: '${{ github.event.workflow_run.html_url }}'
               });
             }
 
-  set-pending:
-    name: Set E2E pending
+  mark-running:
+    name: Mark E2E running
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success'
     steps:
-      - name: Mark contexts pending
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/workflows/e2e.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Mark contexts running
         uses: actions/github-script@v9
         with:
           script: |
-            const contexts = ["E2E / native-host", "E2E / k8s"];
+            const fs = require('fs');
+            const text = fs.readFileSync('.github/workflows/e2e.yml', 'utf8');
+            const matches = [...text.matchAll(/^\s*STATUS_CONTEXT:\s*["']([^"']+)["']\s*$/gm)];
+            const contexts = [...new Set(matches.map((m) => m[1]))];
             for (const ctx of contexts) {
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner, repo: context.repo.repo,
                 sha: '${{ github.event.workflow_run.head_sha }}',
                 state: 'pending',
                 target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-                context: ctx
+                context: ctx,
+                description: 'Running E2E tests...'
               });
             }
 
@@ -471,13 +492,16 @@ jobs:
         with:
           script: |
             const result = '${{ needs.native-host.result }}';
+            const state = result === 'success'
+              ? 'success'
+              : (result === 'cancelled' ? 'error' : 'failure');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
               sha: '${{ github.event.workflow_run.head_sha }}',
-              state: result === 'success' ? 'success' : 'failure',
+              state,
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
               context: '${{ env.STATUS_CONTEXT }}',
-              description: result
+              description: result === 'success' ? 'passed' : result
             });
 
   report-k8s:
@@ -493,11 +517,14 @@ jobs:
         with:
           script: |
             const result = '${{ needs.k8s.result }}';
+            const state = result === 'success'
+              ? 'success'
+              : (result === 'cancelled' ? 'error' : 'failure');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
               sha: '${{ github.event.workflow_run.head_sha }}',
-              state: result === 'success' ? 'success' : 'failure',
+              state,
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
               context: '${{ env.STATUS_CONTEXT }}',
-              description: result
+              description: result === 'success' ? 'passed' : result
             });

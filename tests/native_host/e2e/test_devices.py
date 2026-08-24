@@ -573,6 +573,10 @@ class TestMultiNodeSpread:
 
 
 class TestConfigModes:
+    # Uses the generic unstarted_cluster fixture but asserts a real GPU device
+    # registry, so it must run on a GPU node. The fixture-based auto-marking in
+    # conftest.py cannot detect this, so mark it explicitly.
+    @pytest.mark.gpu
     def test_config_autodetect_default(self, unstarted_cluster):
         cluster = unstarted_cluster
         cluster.gpu_preflight(1)
