@@ -1,6 +1,10 @@
 # Slot {{ item.key }} on {{ inventory_hostname }}
 SPUR_CI_SLOT={{ item.key }}
-SPUR_CI_GPU_VFS={{ item.value.gpu_vfs }}
+SPUR_CI_SLOT_TYPE={{ item.value.type | default('gpu') }}
+SPUR_CI_CLUSTER_COUNT={{ item.value.node_count | default(4) }}
+SPUR_CI_GPUS_PER_VM={{ item.value.gpus_per_vm | default('0') }}
+SPUR_CI_GPU_VFS={{ item.value.gpu_vfs | default('') }}
+SPUR_CI_RUNNER_LABELS={{ item.value.labels | default(runner_labels) }}
 SPUR_CI_NETWORK={{ item.value.network_name }}
 SPUR_CI_INSTANCE_DIR={{ spur_ci_mount }}/instances/{{ item.key }}
 SPUR_CI_LOCK_DIR={{ spur_ci_mount }}/locks/{{ item.key }}

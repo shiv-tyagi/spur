@@ -8,7 +8,7 @@
 - name: Register GitHub Actions runners
   hosts: gpu_hosts
   vars:
-    repo: shiv-tyagi/spur
+    repo: "{{ spur_repo }}"
 
   tasks:
     - name: Get registration token from GitHub API
@@ -32,6 +32,8 @@
         cmd: /opt/spur-ci/bin/register-runner.sh {{ item.item.key }} {{ reg_token.stdout }}
       become: true
       become_user: "{{ ci_user }}"
+      environment:
+        SPUR_CI_REPO_URL: "https://github.com/{{ repo }}"
       loop: "{{ slot_status.results }}"
       loop_control:
         label: "{{ item.item.key }}"

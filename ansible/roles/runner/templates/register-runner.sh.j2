@@ -11,13 +11,21 @@ SLOT="${1:-}"
 TOKEN="${2:-}"
 RUNNER_DIR="{{ runner_install_dir }}/${SLOT}"
 RUNNER_NAME="spur-{{ inventory_hostname }}-${SLOT}"
-LABELS="{{ runner_labels }}"
 REPO_URL="${SPUR_CI_REPO_URL:-https://github.com/ROCm/spur}"
 
 if [[ -z "$SLOT" ]]; then
     echo "Usage: $0 <slot> [token]" >&2
     echo "Available slots: {{ ci_slots.keys() | join(', ') }}" >&2
     exit 1
+fi
+
+# Labels are per-slot: sourced from the slot env, falling back to the global default.
+SLOT_ENV="/etc/spur-ci/slots/${SLOT}.env"
+LABELS="{{ runner_labels }}"
+if [[ -f "$SLOT_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$SLOT_ENV"
+    LABELS="${SPUR_CI_RUNNER_LABELS:-$LABELS}"
 fi
 
 if [[ ! -d "$RUNNER_DIR" ]]; then
