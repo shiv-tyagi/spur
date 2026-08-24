@@ -22,8 +22,11 @@ Options:
   --prefix NAME        VM name prefix (required)
   --count N            Number of VMs (default: 3)
   --image PATH         Base qcow2 image path (required)
-  --gpus-per-vm N      GPUs per VM via VFIO passthrough (default: 0)
-  --skip-gpu-for IDX   Skip GPU passthrough for VM at index IDX (repeatable)
+  --gpus-per-vm SPEC   GPUs per VM via VFIO passthrough (default: 0). Either a
+                       scalar (uniform, e.g. 2) or a comma list of length --count
+                       (per-VM, e.g. 0,2,1,1). A 0 entry means that VM gets no GPU.
+  --skip-gpu-for IDX   Force 0 GPUs for VM at index IDX (repeatable; back-compat,
+                       equivalent to a 0 in the --gpus-per-vm list)
   --cpus N             vCPUs per VM (default: 4)
   --memory MiB         RAM per VM in MiB (default: 16384)
   --ssh-pubkey PATH    SSH public key to inject (default: ~/.ssh/id_ed25519.pub)
@@ -74,38 +77,44 @@ SSH_KEY_CONTENT=$(cat "$SSH_PUBKEY")
 RUN_DIR="$INSTANCE_DIR/$PREFIX"
 mkdir -p "$RUN_DIR"
 
-should_skip_gpu() {
-    local idx="$1"
-    for skip_idx in "${SKIP_GPU_FOR[@]}"; do
-        [[ "$skip_idx" == "$idx" ]] && return 0
-    done
-    return 1
-}
+# Build a per-VM GPU count array from --gpus-per-vm (scalar or comma list).
+GPU_COUNTS=()
+if [[ "$GPUS_PER_VM" == *,* ]]; then
+    IFS=',' read -ra GPU_COUNTS <<< "$GPUS_PER_VM"
+    if (( ${#GPU_COUNTS[@]} != COUNT )); then
+        echo "ERROR: --gpus-per-vm list has ${#GPU_COUNTS[@]} entries but --count is $COUNT" >&2
+        exit 1
+    fi
+else
+    for (( i=0; i<COUNT; i++ )); do GPU_COUNTS+=("$GPUS_PER_VM"); done
+fi
+
+# --skip-gpu-for zeroes those VMs (back-compat; subsumed by a 0 in the list).
+for skip_idx in "${SKIP_GPU_FOR[@]}"; do
+    (( skip_idx >= 0 && skip_idx < COUNT )) && GPU_COUNTS[$skip_idx]=0
+done
+
+TOTAL_GPUS=0
+for c in "${GPU_COUNTS[@]}"; do
+    [[ "$c" =~ ^[0-9]+$ ]] || { echo "ERROR: --gpus-per-vm entries must be non-negative integers, got '$c'" >&2; exit 1; }
+    TOTAL_GPUS=$(( TOTAL_GPUS + c ))
+done
 
 # Acquire GPUs if needed (libvirt managed mode handles driver bind/unbind)
 LEASE_FILE=""
 GPU_PCI_ARRAY=()
-if (( GPUS_PER_VM > 0 )); then
-    total_gpus=0
-    for (( i=0; i<COUNT; i++ )); do
-        if ! should_skip_gpu "$i"; then
-            total_gpus=$(( total_gpus + GPUS_PER_VM ))
+if (( TOTAL_GPUS > 0 )); then
+    if [[ -n "$STATIC_GPU_VFS" ]]; then
+        IFS=',' read -ra GPU_PCI_ARRAY <<< "$STATIC_GPU_VFS"
+        if (( ${#GPU_PCI_ARRAY[@]} < TOTAL_GPUS )); then
+            echo "ERROR: --gpu-vfs provides ${#GPU_PCI_ARRAY[@]} VFs but need $TOTAL_GPUS" >&2
+            exit 1
         fi
-    done
-
-    if (( total_gpus > 0 )); then
-        if [[ -n "$STATIC_GPU_VFS" ]]; then
-            IFS=',' read -ra GPU_PCI_ARRAY <<< "$STATIC_GPU_VFS"
-            if (( ${#GPU_PCI_ARRAY[@]} < total_gpus )); then
-                echo "ERROR: --gpu-vfs provides ${#GPU_PCI_ARRAY[@]} VFs but need $total_gpus" >&2
-                exit 1
-            fi
-            echo "Using static VF list: ${STATIC_GPU_VFS}" >&2
-        else
-            eval "$("$SCRIPT_DIR/gpu-partition.sh" acquire --count "$total_gpus")"
-            IFS=',' read -ra GPU_PCI_ARRAY <<< "$GPU_PCI_ADDRS"
-            echo "Acquired ${#GPU_PCI_ARRAY[@]} GPUs via lease: ${GPU_PCI_ADDRS}" >&2
-        fi
+        echo "Using static VF list: ${STATIC_GPU_VFS}" >&2
+    else
+        eval "$("$SCRIPT_DIR/gpu-partition.sh" acquire --count "$TOTAL_GPUS")"
+        IFS=',' read -ra GPU_PCI_ARRAY <<< "$GPU_PCI_ADDRS"
+        echo "Acquired ${#GPU_PCI_ARRAY[@]} GPUs via lease: ${GPU_PCI_ADDRS}" >&2
     fi
 fi
 
@@ -176,15 +185,14 @@ UDEOF
     )
 
     # Add GPU passthrough devices
-    if (( GPUS_PER_VM > 0 )) && ! should_skip_gpu "$i"; then
-        for (( g=0; g<GPUS_PER_VM; g++ )); do
-            if (( gpu_idx < ${#GPU_PCI_ARRAY[@]} )); then
-                pci="${GPU_PCI_ARRAY[$gpu_idx]}"
-                virt_args+=(--hostdev "$pci,type=pci")
-                gpu_idx=$((gpu_idx + 1))
-            fi
-        done
-    fi
+    n_gpus="${GPU_COUNTS[$i]}"
+    for (( g=0; g<n_gpus; g++ )); do
+        if (( gpu_idx < ${#GPU_PCI_ARRAY[@]} )); then
+            pci="${GPU_PCI_ARRAY[$gpu_idx]}"
+            virt_args+=(--hostdev "$pci,type=pci")
+            gpu_idx=$((gpu_idx + 1))
+        fi
+    done
 
     sudo "${virt_args[@]}" >/dev/null
 

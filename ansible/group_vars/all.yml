@@ -8,23 +8,173 @@ spur_ci_mount: /var/lib/spur-ci
 provision_disk: false
 
 # --- Slot definitions ---
-# Each slot is a static resource partition: fixed GPU VFs, isolated network, own instance dir.
-# Any slot can run any E2E type (native or k8s).
+# Each slot is a static resource partition: an isolated network, own instance dir,
+# and (for GPU slots) pinned GPU VFs. There are two shapes:
+#   gpu    - cluster: 4 VMs, GPUs laid out 0,1,1,1 (driver + 3 nodes x 1 GPU) = 3 VFs.
+#            One GPU per node: only single-VF passthrough, which avoids the large-BAR
+#            (2x256 GiB) firmware hang seen when two VFs share one VM.
+#   non-gpu - default cluster: 4 VMs, no GPUs (runs the bulk of the suite + k8s).
+# Fields:
+#   type         gpu | cpu
+#   node_count   VMs in the cluster (driver + compute nodes)
+#   gpus_per_vm  passed to cluster-up.sh --gpus-per-vm (scalar or per-VM comma list)
+#   labels       GitHub Actions runner labels
+#   gpu_vfs      pinned VF PCI addresses (GPU slots only; from host_vars)
 ci_slots:
-  a:
-    gpu_vfs: "{{ ci_slot_vfs.a }}"
-    network_name: spurci-a
+  gpu-1:
+    type: gpu
+    node_count: 4
+    gpus_per_vm: "0,1,1,1"
+    labels: "self-hosted,spur-e2e,gpu"
+    gpu_vfs: "{{ ci_slot_vfs['gpu-1'] }}"
+    network_name: spurci-gpu-1
     network_subnet: 10.44.1.0/24
     network_gateway: 10.44.1.1
     network_dhcp_start: 10.44.1.10
     network_dhcp_end: 10.44.1.50
-  b:
-    gpu_vfs: "{{ ci_slot_vfs.b }}"
-    network_name: spurci-b
+  gpu-2:
+    type: gpu
+    node_count: 4
+    gpus_per_vm: "0,1,1,1"
+    labels: "self-hosted,spur-e2e,gpu"
+    gpu_vfs: "{{ ci_slot_vfs['gpu-2'] }}"
+    network_name: spurci-gpu-2
     network_subnet: 10.44.2.0/24
     network_gateway: 10.44.2.1
     network_dhcp_start: 10.44.2.10
     network_dhcp_end: 10.44.2.50
+  nogpu-01:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-01
+    network_subnet: 10.44.3.0/24
+    network_gateway: 10.44.3.1
+    network_dhcp_start: 10.44.3.10
+    network_dhcp_end: 10.44.3.50
+  nogpu-02:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-02
+    network_subnet: 10.44.4.0/24
+    network_gateway: 10.44.4.1
+    network_dhcp_start: 10.44.4.10
+    network_dhcp_end: 10.44.4.50
+  nogpu-03:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-03
+    network_subnet: 10.44.5.0/24
+    network_gateway: 10.44.5.1
+    network_dhcp_start: 10.44.5.10
+    network_dhcp_end: 10.44.5.50
+  nogpu-04:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-04
+    network_subnet: 10.44.6.0/24
+    network_gateway: 10.44.6.1
+    network_dhcp_start: 10.44.6.10
+    network_dhcp_end: 10.44.6.50
+  nogpu-05:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-05
+    network_subnet: 10.44.7.0/24
+    network_gateway: 10.44.7.1
+    network_dhcp_start: 10.44.7.10
+    network_dhcp_end: 10.44.7.50
+  nogpu-06:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-06
+    network_subnet: 10.44.8.0/24
+    network_gateway: 10.44.8.1
+    network_dhcp_start: 10.44.8.10
+    network_dhcp_end: 10.44.8.50
+  nogpu-07:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-07
+    network_subnet: 10.44.9.0/24
+    network_gateway: 10.44.9.1
+    network_dhcp_start: 10.44.9.10
+    network_dhcp_end: 10.44.9.50
+  nogpu-08:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-08
+    network_subnet: 10.44.10.0/24
+    network_gateway: 10.44.10.1
+    network_dhcp_start: 10.44.10.10
+    network_dhcp_end: 10.44.10.50
+  nogpu-09:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-09
+    network_subnet: 10.44.11.0/24
+    network_gateway: 10.44.11.1
+    network_dhcp_start: 10.44.11.10
+    network_dhcp_end: 10.44.11.50
+  nogpu-10:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-10
+    network_subnet: 10.44.12.0/24
+    network_gateway: 10.44.12.1
+    network_dhcp_start: 10.44.12.10
+    network_dhcp_end: 10.44.12.50
+  nogpu-11:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-11
+    network_subnet: 10.44.13.0/24
+    network_gateway: 10.44.13.1
+    network_dhcp_start: 10.44.13.10
+    network_dhcp_end: 10.44.13.50
+  nogpu-12:
+    type: cpu
+    node_count: 4
+    gpus_per_vm: "0"
+    labels: "self-hosted,spur-e2e,non-gpu"
+    gpu_vfs: ""
+    network_name: spurci-nogpu-12
+    network_subnet: 10.44.14.0/24
+    network_gateway: 10.44.14.1
+    network_dhcp_start: 10.44.14.10
+    network_dhcp_end: 10.44.14.50
 
 # --- GIM driver ---
 gim_repo_url: https://github.com/amd/MxGPU-Virtualization.git
@@ -48,6 +198,9 @@ ci_sudoers_commands:
 runner_version: "2.321.0"
 runner_labels: "self-hosted,spur-e2e,gpu"
 runner_install_dir: /opt/actions-runner
+# Repo the runners register against. Defaults to the prod repo; override for
+# fork validation, e.g. -e spur_repo=shiv-tyagi/spur.
+spur_repo: ROCm/spur
 
 # --- Egress allowlist (FQDNs) ---
 egress_allowed_hosts:

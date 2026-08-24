@@ -1,0 +1,15 @@
+---
+# Focused provisioning for the CI slot runners only.
+# Applies the slot-dependent roles (isolated networks, orchestration scripts,
+# per-slot runner install/env/units) without re-running host bring-up roles
+# (storage, kernel_iommu, gim_driver, amdgpu_blacklist) that are already in place.
+#
+# Usage:
+#   ansible-playbook provision-runners.yml -l server1 -u shiv
+- name: Provision CI slot runners
+  hosts: gpu_hosts
+  become: true
+  roles:
+    - libvirt_networks
+    - scripts_deploy
+    - runner

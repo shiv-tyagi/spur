@@ -13,27 +13,35 @@
   tasks:
     - name: List all GPU VFs by BDF (sorted)
       ansible.builtin.shell:
-        cmd: lspci -D | grep -i 'Virtual Function' | grep -i 'amd\|radeon' | awk '{print $1}' | sort
+        cmd: lspci -D | grep -i 'VF\|Virtual Function' | grep -i 'amd\|radeon' | awk '{print $1}' | sort
       register: discovered_vfs
       changed_when: false
 
-    - name: Compute VFs per slot
+    - name: Compute total VFs required by GPU slots
       ansible.builtin.set_fact:
-        vfs_per_slot: "{{ (discovered_vfs.stdout_lines | length) // (ci_slots | length) }}"
+        vfs_required: >-
+          {%- set ns = namespace(t=0) -%}
+          {%- for cfg in ci_slots.values() if cfg.type == 'gpu' -%}
+          {%- for n in cfg.gpus_per_vm.split(',') -%}{%- set ns.t = ns.t + (n | int) -%}{%- endfor -%}
+          {%- endfor -%}
+          {{ ns.t }}
 
-    - name: Assert enough VFs for all slots
+    - name: Assert enough VFs for all GPU slots
       ansible.builtin.assert:
         that:
-          - discovered_vfs.stdout_lines | length >= (ci_slots | length) * (vfs_per_slot | int)
+          - discovered_vfs.stdout_lines | length >= (vfs_required | int)
         fail_msg: >
-          Found {{ discovered_vfs.stdout_lines | length }} VFs but need
-          {{ (ci_slots | length) * (vfs_per_slot | int) }} for {{ ci_slots | length }} slots.
+          Found {{ discovered_vfs.stdout_lines | length }} VFs but GPU slots need
+          {{ vfs_required }}.
 
     - name: Print VF assignment for host_vars
       ansible.builtin.debug:
         msg: |-
           # Paste into host_vars/{{ inventory_hostname }}.yml:
           ci_slot_vfs:
-          {% for slot in ci_slots.keys() | sort %}
-            {{ slot }}: "{{ discovered_vfs.stdout_lines[(loop.index0 * (vfs_per_slot | int)):((loop.index0 + 1) * (vfs_per_slot | int))] | join(',') }}"
+          {% set ns = namespace(offset=0) %}
+          {% for slot, cfg in ci_slots.items() if cfg.type == 'gpu' %}
+          {% set need = cfg.gpus_per_vm.split(',') | map('int') | sum %}
+            {{ slot }}: "{{ discovered_vfs.stdout_lines[ns.offset:ns.offset + need] | join(',') }}"
+          {% set ns.offset = ns.offset + need %}
           {% endfor %}
