@@ -18,6 +18,13 @@ from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_d
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
+# Fixtures that require GPU hardware on the compute nodes. A test that requests
+# any of these (directly or transitively) is a GPU test and gets auto-marked
+# `gpu`, so CI can route it to a GPU-backed runner via `-m gpu` / `-m "not gpu"`
+# without any per-test decoration.
+_GPU_FIXTURES = frozenset({"gpu_cluster", "gpu_container_cluster"})
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
@@ -27,6 +34,22 @@ def pytest_configure(config):
         "markers",
         "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
     )
+    config.addinivalue_line(
+        "markers",
+        "gpu: requires GPU hardware on the nodes (auto-applied to tests using GPU fixtures)",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    """Auto-mark tests that use a GPU fixture with `gpu`.
+
+    Runs first so the marker is in place before pytest's built-in `-m`
+    deselection evaluates the marker expression.
+    """
+    for item in items:
+        if _GPU_FIXTURES.intersection(getattr(item, "fixturenames", ())):
+            item.add_marker("gpu")
 
 
 def _get_nodes_config() -> list[str]:
