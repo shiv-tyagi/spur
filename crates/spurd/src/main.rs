@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// ci-cache-warm-test: temporary marker to force a source-only rebuild
 mod agent_server;
 mod auth_middleware;
 mod cluster;
