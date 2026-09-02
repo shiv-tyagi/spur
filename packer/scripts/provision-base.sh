@@ -15,8 +15,12 @@ sudo apt-get install -y -qq \
     ca-certificates \
     util-linux \
     iproute2 iputils-ping \
+    wireguard-tools \
     squashfs-tools \
     crun podman
+
+echo "=== Enabling WireGuard kernel module (in-tree on noble) ==="
+echo wireguard | sudo tee /etc/modules-load.d/wireguard.conf > /dev/null
 
 echo "=== Installing Docker CE ==="
 sudo install -m 0755 -d /etc/apt/keyrings
