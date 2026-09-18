@@ -194,7 +194,22 @@ UDEOF
         fi
     done
 
-    sudo "${virt_args[@]}" >/dev/null
+    # Retry the transient libvirt node-device race; fail fast otherwise.
+    for attempt in 1 2 3 4 5; do
+        if err=$(sudo "${virt_args[@]}" 2>&1 >/dev/null); then
+            break
+        fi
+        if [[ "$err" != *"Node device not found"* || "$attempt" -eq 5 ]]; then
+            echo "$err" >&2
+            echo "ERROR: virt-install failed for $vm_name" >&2
+            exit 1
+        fi
+        backoff=$(( 2 ** (attempt - 1) ))
+        echo "  $vm_name: transient node-device error, retry $attempt/5 in ${backoff}s..." >&2
+        sudo virsh destroy "$vm_name" &>/dev/null || true
+        sudo virsh undefine "$vm_name" --nvram &>/dev/null || true
+        sleep "$backoff"
+    done
 
 done
 
