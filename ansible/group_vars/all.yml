@@ -212,6 +212,8 @@ egress_allowed_hosts:
   - ghcr.io
   - production.cloudflare.docker.com
   - registry-1.docker.io
+  - mirror.gcr.io
+  - storage.googleapis.com
   - repo.radeon.com
   - archive.ubuntu.com
   - security.ubuntu.com

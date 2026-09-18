@@ -13,6 +13,18 @@ sudo apt-get install -y -qq containerd conntrack ebtables socat
 sudo mkdir -p /etc/containerd
 containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Mirror docker.io pulls via mirror.gcr.io to avoid Docker Hub's anonymous 429s under parallel CI;
+# registry-1.docker.io stays as fallback. Node-level so it also covers the dynamic local-path helper pod.
+sudo sed -i "/\.registry\]/{n;s#config_path = ''#config_path = '/etc/containerd/certs.d'#;s#config_path = \"\"#config_path = '/etc/containerd/certs.d'#}" /etc/containerd/config.toml
+sudo mkdir -p /etc/containerd/certs.d/docker.io
+cat <<'EOF' | sudo tee /etc/containerd/certs.d/docker.io/hosts.toml > /dev/null
+server = "https://registry-1.docker.io"
+
+[host."https://mirror.gcr.io"]
+  capabilities = ["pull", "resolve"]
+EOF
+
 sudo systemctl enable containerd
 
 echo "=== Configuring kernel modules and sysctl for Kubernetes ==="
