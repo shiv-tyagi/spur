@@ -8,6 +8,7 @@ set -euo pipefail
 MAX_AGE_MINUTES="${SPUR_CI_REAPER_MAX_AGE:-60}"
 INSTANCE_DIR="${SPUR_CI_MOUNT:-/var/lib/spur-ci}/instances"
 LOCK_DIR="${SPUR_CI_MOUNT:-/var/lib/spur-ci}/locks"
+QEMU_LOG_DIR="/var/log/libvirt/qemu"
 
 echo "[reaper] Scanning for orphaned VMs older than ${MAX_AGE_MINUTES}m..."
 
@@ -61,6 +62,21 @@ fi
 # Clean up stale lease files
 if [[ -d "$LOCK_DIR" ]]; then
     find "$LOCK_DIR" -name "lease-*" -mmin "+${MAX_AGE_MINUTES}" -type f -delete
+fi
+
+# libvirt never deletes a domain's per-VM log on undefine, and ephemeral CI VM
+# names are unique per run, so these logs accumulate forever. Reap old ones
+# whose domain is no longer defined.
+if [[ -d "$QEMU_LOG_DIR" ]]; then
+    mapfile -t live_domains < <(virsh list --all --name 2>/dev/null | grep -v '^$')
+    find "$QEMU_LOG_DIR" -maxdepth 1 -name '*.log' -mmin "+${MAX_AGE_MINUTES}" -type f | while read -r logf; do
+        dom=$(basename "$logf" .log)
+        for d in "${live_domains[@]}"; do
+            [[ "$dom" == "$d" ]] && continue 2
+        done
+        echo "[reaper] Removing orphaned qemu log: $logf"
+        rm -f "$logf"
+    done
 fi
 
 echo "[reaper] Done."
